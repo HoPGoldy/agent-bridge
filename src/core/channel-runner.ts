@@ -1,14 +1,15 @@
-import { FeishuIMAdapter } from '../adapters/im/feishu-im-adapter.js';
-import { PiRpcAgentAdapter } from '../adapters/agent/pi-rpc-agent-adapter.js';
-import { GatewayCore } from './gateway-core.js';
+import type { ChannelRunner, RunChannelOptions } from "../types";
+import { PiRpcAgentAdapter } from "../adapters/agent/pi-rpc-agent-adapter";
+import { FeishuIMAdapter } from "../adapters/im/feishu-im-adapter";
+import { GatewayCore } from "./gateway-core";
 
-export async function runChannel({ channelName, channelConfig, defaults }) {
-  if (channelConfig.type !== 'feishu') {
+export async function runChannel({ channelName, channelConfig, defaults }: RunChannelOptions): Promise<ChannelRunner> {
+  if (channelConfig.type !== "feishu") {
     throw new Error(`Unsupported channel type: ${channelConfig.type}`);
   }
 
   const imAdapter = new FeishuIMAdapter(channelConfig);
-  const rpcEndpoint = process.env.PI_RPC_ENDPOINT ?? 'http://127.0.0.1:8787';
+  const rpcEndpoint = process.env.PI_RPC_ENDPOINT ?? "http://127.0.0.1:8787";
 
   const core = new GatewayCore({
     imAdapter,
@@ -26,7 +27,7 @@ export async function runChannel({ channelName, channelConfig, defaults }) {
 
   await core.start();
   console.log(`[runner] channel ${channelName} started`);
-  console.log('[runner] press Ctrl+C to stop');
+  console.log("[runner] press Ctrl+C to stop");
 
   return {
     async stop() {

@@ -2,19 +2,49 @@
   "name": "agent-bridge",
   "version": "0.1.0",
   "private": true,
-  "type": "module",
   "description": "IM to Pi bridge with dual-adapter architecture",
+  "keywords": [
+    "im",
+    "bridge",
+    "feishu",
+    "pi",
+    "cli"
+  ],
+  "license": "MIT",
+  "type": "module",
   "bin": {
-    "agent-bridge": "./src/cli.js"
+    "agent-bridge": "./dist/agent-bridge.js"
   },
+  "main": "./dist/cli.js",
+  "exports": {
+    ".": {
+      "import": "./dist/index.js",
+      "types": "./dist/index.d.ts"
+    }
+  },
+  "types": "./dist/index.d.ts",
   "scripts": {
-    "start": "node ./src/cli.js",
-    "lint": "node --check ./src/cli.js"
+    "build": "tsup",
+    "dev": "tsx bin/agent-bridge.ts",
+    "test": "vitest run --passWithNoTests",
+    "test:coverage": "vitest run --coverage",
+    "start": "node ./dist/agent-bridge.js",
+    "release": "commit-and-tag-version && git push --follow-tags origin main"
   },
   "engines": {
     "node": ">=22"
   },
   "dependencies": {
-    "@larksuiteoapi/node-sdk": "^1.64.0"
+    "@larksuiteoapi/node-sdk": "^1.64.0",
+    "commander": "^12.1.0"
+  },
+  "devDependencies": {
+    "@types/node": "^24.3.0",
+    "@vitest/coverage-v8": "^3.2.7",
+    "commit-and-tag-version": "^12.7.3",
+    "tsup": "^8.5.1",
+    "tsx": "^4.20.4",
+    "typescript": "^5.9.2",
+    "vitest": "^3.2.4"
   }
 }

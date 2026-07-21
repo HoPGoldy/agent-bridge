@@ -1,6 +1,18 @@
 # agent-bridge
 
-MVP scaffold for an IM ↔ Pi bridge following the dual-adapter design in `ADAPTER_INTERFACE_DESIGN.md`.
+IM ↔ Pi bridge following the dual-adapter design in `ADAPTER_INTERFACE_DESIGN.md`.
+
+## Engineering setup
+
+This project now follows the same general engineering pattern as `review-pilot`:
+
+- TypeScript source in `src/` and `bin/`
+- `tsup` build output in `dist/`
+- dedicated CLI bootstrap in `bin/agent-bridge.ts`
+- command implementation in `src/cli.ts`
+- shared types in `src/types.ts`
+- `vitest` for tests
+- GitHub Actions CI for build + test
 
 ## Current scope
 
@@ -19,12 +31,13 @@ MVP scaffold for an IM ↔ Pi bridge following the dual-adapter design in `ADAPT
 - Feishu IM adapter: minimal WebSocket long-connection implementation using official Lark SDK
 - Pi agent adapter: scaffold only, target runtime is RPC mode
 
-## Usage
+## Development
 
 ```bash
-node ./src/cli.js add
-node ./src/cli.js ls
-node ./src/cli.js start <channel-name>
+npm install
+npm run build
+npm test
+npm run dev -- --help
 ```
 
 ## Notes

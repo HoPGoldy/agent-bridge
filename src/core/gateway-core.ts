@@ -1,20 +1,27 @@
-function createQueue() {
+import type { AgentAdapter, AgentEgressEvent, AgentFactory, AgentIngressEvent, GatewayCoreOptions } from "../types";
+
+type AgentEntry = {
+  adapter: AgentAdapter;
+  lastActiveAt: number;
+};
+
+function createQueue<T>(): T[] {
   return [];
 }
 
 export class GatewayCore {
-  #imAdapter;
-  #agentFactory;
-  #pollIntervalMs;
-  #maxQueueSize;
-  #agentIdleTimeoutMs;
-  #ingressQueues = new Map();
-  #egressQueue = createQueue();
-  #agentEntries = new Map();
-  #pollTimer = null;
+  readonly #imAdapter: GatewayCoreOptions["imAdapter"];
+  readonly #agentFactory: AgentFactory;
+  readonly #pollIntervalMs: number;
+  readonly #maxQueueSize: number;
+  readonly #agentIdleTimeoutMs: number;
+  readonly #ingressQueues = new Map<string, AgentIngressEvent[]>();
+  readonly #egressQueue = createQueue<AgentEgressEvent>();
+  readonly #agentEntries = new Map<string, AgentEntry>();
+  #pollTimer: NodeJS.Timeout | null = null;
   #started = false;
 
-  constructor({ imAdapter, agentFactory, pollIntervalMs, maxQueueSize, agentIdleTimeoutMs }) {
+  constructor({ imAdapter, agentFactory, pollIntervalMs, maxQueueSize, agentIdleTimeoutMs }: GatewayCoreOptions) {
     this.#imAdapter = imAdapter;
     this.#agentFactory = agentFactory;
     this.#pollIntervalMs = pollIntervalMs;
@@ -22,7 +29,7 @@ export class GatewayCore {
     this.#agentIdleTimeoutMs = agentIdleTimeoutMs;
   }
 
-  async start() {
+  async start(): Promise<void> {
     if (this.#started) return;
     this.#started = true;
 
@@ -35,7 +42,7 @@ export class GatewayCore {
     }, this.#pollIntervalMs);
   }
 
-  async stop() {
+  async stop(): Promise<void> {
     if (!this.#started) return;
     this.#started = false;
 
@@ -52,14 +59,14 @@ export class GatewayCore {
     await this.#imAdapter.stop();
   }
 
-  async #tick() {
+  async #tick(): Promise<void> {
     await this.#flushIngress();
     await this.#flushEgress();
     await this.#collectIdleAgents();
   }
 
-  #enqueueIngress(event) {
-    const queue = this.#ingressQueues.get(event.sessionId) ?? createQueue();
+  #enqueueIngress(event: AgentIngressEvent): void {
+    const queue = this.#ingressQueues.get(event.sessionId) ?? createQueue<AgentIngressEvent>();
     if (queue.length >= this.#maxQueueSize) {
       throw new Error(`Ingress queue overflow for session ${event.sessionId}`);
     }
@@ -67,14 +74,14 @@ export class GatewayCore {
     this.#ingressQueues.set(event.sessionId, queue);
   }
 
-  #enqueueEgress(event) {
+  #enqueueEgress(event: AgentEgressEvent): void {
     if (this.#egressQueue.length >= this.#maxQueueSize) {
-      throw new Error('Egress queue overflow');
+      throw new Error("Egress queue overflow");
     }
     this.#egressQueue.push(event);
   }
 
-  async #flushIngress() {
+  async #flushIngress(): Promise<void> {
     for (const [sessionId, queue] of this.#ingressQueues) {
       if (queue.length === 0) {
         this.#ingressQueues.delete(sessionId);
@@ -88,6 +95,7 @@ export class GatewayCore {
 
       const event = queue.shift();
       if (!event) continue;
+
       try {
         await entry.adapter.input(event);
       } catch (error) {
@@ -101,20 +109,21 @@ export class GatewayCore {
     }
   }
 
-  async #flushEgress() {
+  async #flushEgress(): Promise<void> {
     if (this.#egressQueue.length === 0) return;
     if (await this.#imAdapter.isBusy()) return;
 
     const event = this.#egressQueue.shift();
     if (!event) return;
+
     try {
       await this.#imAdapter.input(event);
     } catch (error) {
-      console.error('[core] failed to deliver egress event:', error);
+      console.error("[core] failed to deliver egress event:", error);
     }
   }
 
-  async #getOrCreateAgent(sessionId) {
+  async #getOrCreateAgent(sessionId: string): Promise<AgentEntry> {
     const existing = this.#agentEntries.get(sessionId);
     if (existing) return existing;
 
@@ -122,7 +131,7 @@ export class GatewayCore {
       this.#enqueueEgress(event);
     });
 
-    const entry = {
+    const entry: AgentEntry = {
       adapter,
       lastActiveAt: Date.now(),
     };
@@ -130,7 +139,7 @@ export class GatewayCore {
     return entry;
   }
 
-  async #collectIdleAgents() {
+  async #collectIdleAgents(): Promise<void> {
     const now = Date.now();
     for (const [sessionId, entry] of this.#agentEntries) {
       const hasPendingIngress = (this.#ingressQueues.get(sessionId)?.length ?? 0) > 0;
