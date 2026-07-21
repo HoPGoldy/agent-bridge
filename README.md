@@ -69,7 +69,6 @@ npm run dev -- --help
 }
 ```
 
-- Older single-layer Feishu channel configs are migrated automatically on load.
 - Feishu receive/send text path is implemented for the MVP event pair.
 - `PiRpcAgentAdapter` now spawns a real Pi RPC subprocess per session and emits a single final `assistant.message` for each input turn.
 - Pi sessions are persisted by exact `--session-id` under the bridge-owned session directory, so adapter recreation can resume the same conversation.
