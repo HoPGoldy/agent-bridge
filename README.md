@@ -16,7 +16,7 @@ MVP scaffold for an IM ↔ Pi bridge following the dual-adapter design in `ADAPT
 - Core queues:
   - ingress FIFO
   - egress FIFO
-- Feishu IM adapter: scaffold only, target implementation mode follows Hermes WebSocket adapter
+- Feishu IM adapter: minimal WebSocket long-connection implementation using official Lark SDK
 - Pi agent adapter: scaffold only, target runtime is RPC mode
 
 ## Usage
@@ -29,5 +29,6 @@ node ./src/cli.js start <channel-name>
 
 ## Notes
 
-- Feishu and Pi RPC integrations are not fully implemented yet.
+- Feishu receive/send text path is implemented for the MVP event pair.
 - `PiRpcAgentAdapter` currently emits a placeholder response so the core pipeline can be exercised.
+- Rich Feishu behaviors from Hermes/pi-feishu (cards, reactions, media, mention gating) are intentionally not included in the MVP yet.

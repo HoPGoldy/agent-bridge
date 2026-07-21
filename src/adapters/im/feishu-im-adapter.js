@@ -1,7 +1,11 @@
+import { FeishuClient } from './feishu-client.js';
+import { buildFeishuSessionId, parseFeishuSessionId } from './feishu-session.js';
+
 export class FeishuIMAdapter {
   #config;
   #onOutput = null;
   #busy = false;
+  #client = null;
 
   constructor(config) {
     this.#config = config;
@@ -9,22 +13,41 @@ export class FeishuIMAdapter {
 
   async start(onOutput) {
     this.#onOutput = onOutput;
-    console.log(
-      `[feishu] start requested (domain=${this.#config.domain ?? 'feishu'}) - implementation pending, target mode will follow Hermes WebSocket adapter.`,
-    );
+    this.#client = new FeishuClient(this.#config);
+    this.#client.setOnMessage(async ({ chatId, chatType, text }) => {
+      if (!this.#onOutput) {
+        return;
+      }
+
+      await this.#onOutput({
+        type: 'user.message',
+        sessionId: buildFeishuSessionId(chatType, chatId),
+        text,
+      });
+    });
+
+    await this.#client.connect();
+    console.log(`[feishu] adapter started (domain=${this.#config.domain ?? 'feishu'})`);
   }
 
   async stop() {
-    console.log('[feishu] stop requested');
+    if (this.#client) {
+      await this.#client.disconnect();
+      this.#client = null;
+    }
     this.#onOutput = null;
+    console.log('[feishu] adapter stopped');
   }
 
   async input(event) {
+    if (!this.#client) {
+      throw new Error('FeishuIMAdapter is not started');
+    }
+
     this.#busy = true;
     try {
-      const target = this.#parseSessionId(event.sessionId);
-      console.log(`[feishu] send text -> ${target.chatType}:${target.chatId}`);
-      console.log(event.text);
+      const target = parseFeishuSessionId(event.sessionId);
+      await this.#client.sendText(target.chatId, event.text);
     } finally {
       this.#busy = false;
     }
@@ -32,26 +55,5 @@ export class FeishuIMAdapter {
 
   async isBusy() {
     return this.#busy;
-  }
-
-  async emitUserMessage(text, sessionId) {
-    if (!this.#onOutput) {
-      throw new Error('FeishuIMAdapter is not started');
-    }
-    await this.#onOutput({
-      type: 'user.message',
-      sessionId,
-      text,
-    });
-  }
-
-  #parseSessionId(sessionId) {
-    if (sessionId.startsWith('feishu:dm:')) {
-      return { chatType: 'dm', chatId: sessionId.slice('feishu:dm:'.length) };
-    }
-    if (sessionId.startsWith('feishu:group:')) {
-      return { chatType: 'group', chatId: sessionId.slice('feishu:group:'.length) };
-    }
-    throw new Error(`Unsupported sessionId: ${sessionId}`);
   }
 }
