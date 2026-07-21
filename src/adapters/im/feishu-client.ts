@@ -1,5 +1,5 @@
 import * as Lark from "@larksuiteoapi/node-sdk";
-import type { FeishuChannelConfig, FeishuInboundMessage } from "../../types";
+import type { FeishuClientConfig, FeishuInboundMessage } from "../../types";
 
 const DEDUP_TTL_MS = 12 * 60 * 60 * 1000;
 const DEDUP_MAX_ENTRIES = 5000;
@@ -93,14 +93,14 @@ function parseTextContent(
 }
 
 export class FeishuClient {
-  readonly #config: FeishuChannelConfig;
+  readonly #config: FeishuClientConfig;
   readonly #client: Lark.Client;
   #wsClient: Lark.WSClient | null = null;
   #onMessage: ((message: FeishuInboundMessage) => Promise<void> | void) | null = null;
   #dedup = new Map<string, number>();
   #dedupTimer: NodeJS.Timeout | null = null;
 
-  constructor(config: FeishuChannelConfig) {
+  constructor(config: FeishuClientConfig) {
     this.#config = config;
     const domain = config.domain === "lark" ? Lark.Domain.Lark : Lark.Domain.Feishu;
 

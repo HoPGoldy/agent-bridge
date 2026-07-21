@@ -1,14 +1,14 @@
-import type { AgentEgressEvent, AgentIngressEvent, FeishuChannelConfig, IMAdapter } from "../../types";
+import type { AgentEgressEvent, AgentIngressEvent, FeishuClientConfig, IMAdapter } from "../../types";
 import { FeishuClient } from "./feishu-client";
 import { buildFeishuSessionId, parseFeishuSessionId } from "./feishu-session";
 
 export class FeishuIMAdapter implements IMAdapter {
-  readonly #config: FeishuChannelConfig;
+  readonly #config: FeishuClientConfig;
   #onOutput: ((event: AgentIngressEvent) => Promise<void> | void) | null = null;
   #busy = false;
   #client: FeishuClient | null = null;
 
-  constructor(config: FeishuChannelConfig) {
+  constructor(config: FeishuClientConfig) {
     this.#config = config;
   }
 

@@ -44,14 +44,24 @@ export interface ConfigCollectContext {
 }
 
 export interface ConfigAdapter<TConfig = unknown> {
-  readonly type: string;
   collect(ctx: ConfigCollectContext): Promise<TConfig>;
   validate(config: TConfig): Promise<void> | void;
   summarize?(config: TConfig): string;
 }
 
-export interface FeishuChannelConfig {
-  type: "feishu";
+export interface ClientModule<TConfig = unknown> {
+  readonly type: string;
+  createConfigCollector?: () => ConfigAdapter<TConfig>;
+  createClientAdapter(config: TConfig): IMAdapter;
+}
+
+export interface AgentModule<TConfig = unknown> {
+  readonly type: string;
+  createConfigCollector?: () => ConfigAdapter<TConfig>;
+  createAgentAdapter(config: TConfig): AgentAdapter;
+}
+
+export interface FeishuClientConfig {
   appId: string;
   appSecret: string;
   domain?: "feishu" | "lark";
@@ -59,7 +69,26 @@ export interface FeishuChannelConfig {
   verificationToken?: string;
 }
 
-export type ChannelConfig = FeishuChannelConfig;
+export interface PiRpcAgentConfig {
+  bin?: string;
+  sessionDir?: string;
+  extraArgs?: string[];
+}
+
+export type ClientConfig = {
+  type: "feishu";
+  config: FeishuClientConfig;
+};
+
+export type AgentConfig = {
+  type: "pi-rpc";
+  config: PiRpcAgentConfig;
+};
+
+export interface ChannelConfig {
+  client: ClientConfig;
+  agent: AgentConfig;
+}
 
 export interface AppDefaults {
   pollIntervalMs: number;

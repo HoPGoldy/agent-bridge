@@ -16,6 +16,10 @@ This project now follows the same general engineering pattern as `review-pilot`:
 
 ## Current scope
 
+- One channel = one client side + one agent side
+- Module layer:
+  - `ClientModule<TConfig>`
+  - `AgentModule<TConfig>`
 - CLI commands:
   - `agent-bridge add`
   - `agent-bridge ls`
@@ -42,6 +46,30 @@ npm run dev -- --help
 
 ## Notes
 
+- Channel config is stored as:
+
+```json
+{
+  "channels": {
+    "my-channel": {
+      "client": {
+        "type": "feishu",
+        "config": {
+          "appId": "cli_xxx",
+          "appSecret": "xxx",
+          "domain": "feishu"
+        }
+      },
+      "agent": {
+        "type": "pi-rpc",
+        "config": {}
+      }
+    }
+  }
+}
+```
+
+- Older single-layer Feishu channel configs are migrated automatically on load.
 - Feishu receive/send text path is implemented for the MVP event pair.
 - `PiRpcAgentAdapter` now spawns a real Pi RPC subprocess per session and emits a single final `assistant.message` for each input turn.
 - Pi sessions are persisted by exact `--session-id` under the bridge-owned session directory, so adapter recreation can resume the same conversation.

@@ -1,11 +1,12 @@
 import { describe, expect, it } from "vitest";
-import { feishuConfigAdapter } from "./feishu";
+import { feishuClientModule } from "./feishu";
 
-describe("feishuConfigAdapter.validate", () => {
+describe("feishuClientModule config collector", () => {
   it("accepts a valid config", () => {
+    const collector = feishuClientModule.createConfigCollector?.();
+    expect(collector).toBeDefined();
     expect(() =>
-      feishuConfigAdapter.validate({
-        type: "feishu",
+      collector!.validate({
         appId: "cli_xxx",
         appSecret: "secret",
         domain: "feishu",
@@ -14,9 +15,9 @@ describe("feishuConfigAdapter.validate", () => {
   });
 
   it("rejects invalid domain", () => {
+    const collector = feishuClientModule.createConfigCollector?.();
     expect(() =>
-      feishuConfigAdapter.validate({
-        type: "feishu",
+      collector!.validate({
         appId: "cli_xxx",
         appSecret: "secret",
         domain: "bad" as "feishu",

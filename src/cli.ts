@@ -1,22 +1,49 @@
 import process from "node:process";
 import { Command } from "commander";
-import type { AppConfig, ChannelConfig } from "./types";
-import { getConfigAdapter, listConfigAdapters } from "./config/adapters";
+import type { AgentConfig, AgentModule, AppConfig, ChannelConfig, ClientConfig, ClientModule, ConfigAdapter } from "./types";
 import { createPromptContext } from "./config/prompt";
 import { getConfigPath, loadConfig, saveConfig } from "./config/store";
 import { runChannel } from "./core/channel-runner";
+import { getAgentModule, listAgentModules } from "./modules/agent";
+import { getClientModule, listClientModules } from "./modules/client";
+
+async function selectModuleType<T extends { type: string }>(
+  label: string,
+  modules: T[],
+  ctx: ReturnType<typeof createPromptContext>,
+): Promise<string> {
+  if (modules.length === 0) {
+    throw new Error(`No modules available for ${label}`);
+  }
+  if (modules.length === 1) {
+    return modules[0]!.type;
+  }
+  return ctx.select(
+    label,
+    modules.map((module) => ({
+      label: module.type,
+      value: module.type,
+    })),
+  );
+}
+
+async function collectModuleConfig<TConfig>(
+  module: { createConfigCollector?: () => ConfigAdapter<TConfig> },
+  ctx: ReturnType<typeof createPromptContext>,
+): Promise<TConfig> {
+  const collector = module.createConfigCollector?.();
+  if (!collector) {
+    return {} as TConfig;
+  }
+
+  const config = await collector.collect(ctx);
+  await collector.validate(config);
+  return config;
+}
 
 async function addChannel(config: AppConfig): Promise<void> {
   const ctx = createPromptContext();
   try {
-    const type = await ctx.select(
-      "Select IM adapter",
-      listConfigAdapters().map((adapter) => ({
-        label: adapter.type,
-        value: adapter.type,
-      })),
-    );
-
     const name = await ctx.input("Channel name", {
       required: true,
       validate: (value) => {
@@ -26,20 +53,45 @@ async function addChannel(config: AppConfig): Promise<void> {
       },
     });
 
-    const adapter = getConfigAdapter(type);
-    if (!adapter) {
-      throw new Error(`No config adapter for type: ${type}`);
+    const clientType = await selectModuleType("Select client module", listClientModules(), ctx);
+    const clientModule = getClientModule(clientType);
+    if (!clientModule) {
+      throw new Error(`No client module for type: ${clientType}`);
     }
+    const clientConfig = await collectModuleConfig(clientModule, ctx);
 
-    const channelConfig = await adapter.collect(ctx);
-    await adapter.validate(channelConfig);
+    const agentType = await selectModuleType("Select agent module", listAgentModules(), ctx);
+    const agentModule = getAgentModule(agentType);
+    if (!agentModule) {
+      throw new Error(`No agent module for type: ${agentType}`);
+    }
+    const agentConfig = await collectModuleConfig(agentModule, ctx);
 
-    config.channels[name] = channelConfig as ChannelConfig;
+    config.channels[name] = {
+      client: {
+        type: clientType as ClientConfig["type"],
+        config: clientConfig as ClientConfig["config"],
+      },
+      agent: {
+        type: agentType as AgentConfig["type"],
+        config: agentConfig as AgentConfig["config"],
+      },
+    } satisfies ChannelConfig;
     await saveConfig(config);
     console.log(`Saved channel ${name} to ${getConfigPath()}`);
   } finally {
     ctx.close();
   }
+}
+
+function summarizeClient(module: ClientModule<any> | undefined, channel: ChannelConfig): string {
+  const summary = module?.createConfigCollector?.()?.summarize?.(channel.client.config);
+  return summary ?? `type=${channel.client.type}`;
+}
+
+function summarizeAgent(module: AgentModule<any> | undefined, channel: ChannelConfig): string {
+  const summary = module?.createConfigCollector?.()?.summarize?.(channel.agent.config);
+  return summary ?? `type=${channel.agent.type}`;
 }
 
 async function listChannels(): Promise<void> {
@@ -52,9 +104,11 @@ async function listChannels(): Promise<void> {
 
   for (const name of names) {
     const channel = config.channels[name]!;
-    const adapter = getConfigAdapter(channel.type);
-    const summary = adapter?.summarize?.(channel) ?? `type=${channel.type}`;
-    console.log(`${name}\t${summary}`);
+    const clientModule = getClientModule(channel.client.type);
+    const agentModule = getAgentModule(channel.agent.type);
+    const clientSummary = summarizeClient(clientModule, channel);
+    const agentSummary = summarizeAgent(agentModule, channel);
+    console.log(`${name}\tclient(${clientSummary})\tagent(${agentSummary})`);
   }
 }
 
