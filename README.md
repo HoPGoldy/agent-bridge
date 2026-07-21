@@ -29,7 +29,7 @@ This project now follows the same general engineering pattern as `review-pilot`:
   - ingress FIFO
   - egress FIFO
 - Feishu IM adapter: minimal WebSocket long-connection implementation using official Lark SDK
-- Pi agent adapter: scaffold only, target runtime is RPC mode
+- Pi agent adapter: subprocess integration via `pi --mode rpc`
 
 ## Development
 
@@ -43,5 +43,10 @@ npm run dev -- --help
 ## Notes
 
 - Feishu receive/send text path is implemented for the MVP event pair.
-- `PiRpcAgentAdapter` currently emits a placeholder response so the core pipeline can be exercised.
+- `PiRpcAgentAdapter` now spawns a real Pi RPC subprocess per session and emits a single final `assistant.message` for each input turn.
+- Pi sessions are persisted by exact `--session-id` under the bridge-owned session directory, so adapter recreation can resume the same conversation.
+- Optional runtime overrides:
+  - `PI_BIN` (default: `pi`)
+  - `PI_SESSION_DIR` (default: `~/.config/agent-bridge/pi-sessions`)
+  - `PI_RPC_EXTRA_ARGS` (space-separated extra CLI args, for example `--approve`)
 - Rich Feishu behaviors from Hermes/pi-feishu (cards, reactions, media, mention gating) are intentionally not included in the MVP yet.

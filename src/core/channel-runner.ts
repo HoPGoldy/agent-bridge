@@ -1,7 +1,17 @@
+import os from "node:os";
+import path from "node:path";
 import type { ChannelRunner, RunChannelOptions } from "../types";
 import { PiRpcAgentAdapter } from "../adapters/agent/pi-rpc-agent-adapter";
 import { FeishuIMAdapter } from "../adapters/im/feishu-im-adapter";
 import { GatewayCore } from "./gateway-core";
+
+function parseExtraArgs(raw: string | undefined): string[] {
+  if (!raw) return [];
+  return raw
+    .split(" ")
+    .map((part) => part.trim())
+    .filter(Boolean);
+}
 
 export async function runChannel({ channelName, channelConfig, defaults }: RunChannelOptions): Promise<ChannelRunner> {
   if (channelConfig.type !== "feishu") {
@@ -9,7 +19,9 @@ export async function runChannel({ channelName, channelConfig, defaults }: RunCh
   }
 
   const imAdapter = new FeishuIMAdapter(channelConfig);
-  const rpcEndpoint = process.env.PI_RPC_ENDPOINT ?? "http://127.0.0.1:8787";
+  const piBin = process.env.PI_BIN ?? "pi";
+  const piSessionDir = process.env.PI_SESSION_DIR ?? path.join(os.homedir(), ".config", "agent-bridge", "pi-sessions");
+  const piExtraArgs = parseExtraArgs(process.env.PI_RPC_EXTRA_ARGS);
 
   const core = new GatewayCore({
     imAdapter,
@@ -18,7 +30,13 @@ export async function runChannel({ channelName, channelConfig, defaults }: RunCh
     agentIdleTimeoutMs: defaults.agentIdleTimeoutMs,
     agentFactory: {
       async create(sessionId, onOutput) {
-        const adapter = new PiRpcAgentAdapter({ sessionId, endpoint: rpcEndpoint });
+        const adapter = new PiRpcAgentAdapter({
+          sessionId,
+          cwd: process.cwd(),
+          sessionDir: piSessionDir,
+          bin: piBin,
+          extraArgs: piExtraArgs,
+        });
         await adapter.start(onOutput);
         return adapter;
       },
