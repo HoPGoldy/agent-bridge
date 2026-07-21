@@ -1,0 +1,17 @@
+{
+  "name": "agent-bridge",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "description": "IM to Pi bridge with dual-adapter architecture",
+  "bin": {
+    "agent-bridge": "./src/cli.js"
+  },
+  "scripts": {
+    "start": "node ./src/cli.js",
+    "lint": "node --check ./src/cli.js"
+  },
+  "engines": {
+    "node": ">=22"
+  }
+}
