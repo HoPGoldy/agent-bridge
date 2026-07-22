@@ -1,5 +1,11 @@
 # agent-bridge
 
+[![npm version](https://img.shields.io/npm/v/%40hopgoldy%2Fagent-bridge?style=flat-square&logo=npm)](https://www.npmjs.com/package/@hopgoldy/agent-bridge)
+[![npm unpacked size](https://img.shields.io/npm/unpacked-size/%40hopgoldy%2Fagent-bridge?style=flat-square)](https://www.npmjs.com/package/@hopgoldy/agent-bridge)
+[![test status](https://img.shields.io/github/actions/workflow/status/HoPGoldy/agent-bridge/ci.yml?branch=main&style=flat-square&label=tests)](https://github.com/HoPGoldy/agent-bridge/actions/workflows/ci.yml)
+[![Node.js](https://img.shields.io/badge/node-%3E%3D22-339933?style=flat-square&logo=node.js&logoColor=white)](https://nodejs.org/)
+[![License: MIT](https://img.shields.io/badge/license-MIT-2ea44f?style=flat-square)](#license)
+
 `agent-bridge` connects IM channel (feishu, weixin, weicom...) to local coding agent (pi, codex, opencode...) using a dual-adapter architecture.
 
 The design stays intentionally simple and compact: no harness layer, no extra tools, no extra skills, just forwarding messages from IM to the local agent.
