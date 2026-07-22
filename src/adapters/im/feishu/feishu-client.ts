@@ -1,6 +1,6 @@
 import * as Lark from "@larksuiteoapi/node-sdk";
-import { createLogger, type Logger } from "../../core/logger";
-import type { FeishuClientConfig, FeishuInboundMessage } from "../../types";
+import { createLogger, type Logger } from "../../../core/logger";
+import type { FeishuClientConfig, FeishuInboundMessage } from "../../../types";
 
 const DEDUP_TTL_MS = 12 * 60 * 60 * 1000;
 const DEDUP_MAX_ENTRIES = 5000;

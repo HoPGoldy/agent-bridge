@@ -1,7 +1,7 @@
 import { randomUUID } from "node:crypto";
 import os from "node:os";
 import path from "node:path";
-import { PiRpcAgentAdapter } from "../../adapters/agent/pi-rpc-agent-adapter";
+import { PiRpcAgentAdapter } from "../../adapters/agent/pi-coding-agent/pi-rpc-agent-adapter";
 import type { AgentAdapter, AgentModule, PiRpcAgentConfig } from "../../types";
 
 function parseExtraArgs(raw: string | undefined): string[] {

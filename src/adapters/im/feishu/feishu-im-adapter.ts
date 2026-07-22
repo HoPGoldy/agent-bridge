@@ -1,5 +1,5 @@
-import type { ClientEgressEvent, ClientIngressEvent, FeishuClientConfig, IMAdapter } from "../../types";
-import { createLogger, type Logger } from "../../core/logger";
+import type { ClientEgressEvent, ClientIngressEvent, FeishuClientConfig, IMAdapter } from "../../../types";
+import { createLogger, type Logger } from "../../../core/logger";
 import { FeishuClient } from "./feishu-client";
 import { buildFeishuSessionId, parseFeishuSessionId } from "./feishu-session";
 
