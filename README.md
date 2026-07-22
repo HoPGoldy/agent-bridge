@@ -26,12 +26,16 @@ This project now follows the same general engineering pattern as `review-pilot`:
   - `agent-bridge remove <channel-name>`
   - `agent-bridge start <channel-name>`
 - Config file: `~/.config/agent-bridge/config.json`
-- MVP events:
+- Current client ingress events:
   - `user.message`
+  - `command.session.new`
+  - `command.session.compact`
+- Current client egress event:
   - `assistant.message`
-- Core queues:
-  - ingress FIFO
-  - egress FIFO
+- Queue model:
+  - client ingress FIFO by `clientSessionId`
+  - one agent input queue per `AgentAdapter` instance / `agentSessionId`
+  - client egress FIFO
 - Feishu IM adapter: minimal WebSocket long-connection implementation using official Lark SDK
 - Pi agent adapter: subprocess integration via `pi --mode rpc`
 
@@ -69,8 +73,9 @@ npm run dev -- --help
 }
 ```
 
-- Feishu receive/send text path is implemented for the MVP event pair.
+- Feishu receive/send text path is implemented, including exact-text slash commands `/new` and `/compact`.
 - `PiRpcAgentAdapter` now spawns a real Pi RPC subprocess per session and emits a single final `assistant.message` for each input turn.
+- Core keeps explicit `clientSessionId <-> agentSessionId` bindings and drops late output from stale agent sessions after `/new`.
 - Pi sessions are persisted by exact `--session-id` under the bridge-owned session directory, so adapter recreation can resume the same conversation.
 - Optional runtime overrides:
   - `PI_BIN` (default: `pi`)

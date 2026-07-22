@@ -11,16 +11,11 @@ export async function runChannel({ channelName, channelConfig, defaults }: RunCh
 
   const core = new GatewayCore({
     imAdapter,
+    agentModule,
+    agentConfig: channelConfig.agent.config,
     pollIntervalMs: defaults.pollIntervalMs,
     maxQueueSize: defaults.maxQueueSize,
     agentIdleTimeoutMs: defaults.agentIdleTimeoutMs,
-    agentFactory: {
-      async create(_sessionId, onOutput) {
-        const adapter = agentModule.createAgentAdapter(channelConfig.agent.config);
-        await adapter.start(onOutput);
-        return adapter;
-      },
-    },
   });
 
   await core.start();

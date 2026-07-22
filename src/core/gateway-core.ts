@@ -1,9 +1,18 @@
-import type { AgentAdapter, AgentEgressEvent, AgentFactory, AgentIngressEvent, GatewayCoreOptions } from "../types";
+import type {
+  AgentAdapter,
+  AgentInputEvent,
+  AgentOutputEvent,
+  ClientEgressEvent,
+  ClientIngressEvent,
+  GatewayCoreOptions,
+} from "../types";
 
-type AgentEntry = {
-  adapter: AgentAdapter;
+interface AgentRuntime {
+  agentSessionId: string;
+  agentAdapter: AgentAdapter;
+  queue: AgentInputEvent[];
   lastActiveAt: number;
-};
+}
 
 function createQueue<T>(): T[] {
   return [];
@@ -11,19 +20,23 @@ function createQueue<T>(): T[] {
 
 export class GatewayCore {
   readonly #imAdapter: GatewayCoreOptions["imAdapter"];
-  readonly #agentFactory: AgentFactory;
+  readonly #agentModule: GatewayCoreOptions["agentModule"];
+  readonly #agentConfig: GatewayCoreOptions["agentConfig"];
   readonly #pollIntervalMs: number;
   readonly #maxQueueSize: number;
   readonly #agentIdleTimeoutMs: number;
-  readonly #ingressQueues = new Map<string, AgentIngressEvent[]>();
-  readonly #egressQueue = createQueue<AgentEgressEvent>();
-  readonly #agentEntries = new Map<string, AgentEntry>();
+  readonly #clientIngressQueues = new Map<string, ClientIngressEvent[]>();
+  readonly #clientEgressQueue = createQueue<ClientEgressEvent>();
+  readonly #clientToAgentSession = new Map<string, string>();
+  readonly #agentToClientSession = new Map<string, string>();
+  readonly #agentRuntimes = new Map<string, AgentRuntime>();
   #pollTimer: NodeJS.Timeout | null = null;
   #started = false;
 
-  constructor({ imAdapter, agentFactory, pollIntervalMs, maxQueueSize, agentIdleTimeoutMs }: GatewayCoreOptions) {
+  constructor({ imAdapter, agentModule, agentConfig, pollIntervalMs, maxQueueSize, agentIdleTimeoutMs }: GatewayCoreOptions) {
     this.#imAdapter = imAdapter;
-    this.#agentFactory = agentFactory;
+    this.#agentModule = agentModule;
+    this.#agentConfig = agentConfig;
     this.#pollIntervalMs = pollIntervalMs;
     this.#maxQueueSize = maxQueueSize;
     this.#agentIdleTimeoutMs = agentIdleTimeoutMs;
@@ -34,7 +47,7 @@ export class GatewayCore {
     this.#started = true;
 
     await this.#imAdapter.start(async (event) => {
-      this.#enqueueIngress(event);
+      this.#enqueueClientIngress(event);
     });
 
     this.#pollTimer = setInterval(() => {
@@ -51,105 +64,282 @@ export class GatewayCore {
       this.#pollTimer = null;
     }
 
-    for (const [sessionId, entry] of this.#agentEntries) {
-      await entry.adapter.stop();
-      this.#agentEntries.delete(sessionId);
+    for (const [agentSessionId, runtime] of this.#agentRuntimes) {
+      await runtime.agentAdapter.stop();
+      this.#agentRuntimes.delete(agentSessionId);
     }
 
     await this.#imAdapter.stop();
   }
 
   async #tick(): Promise<void> {
-    await this.#flushIngress();
-    await this.#flushEgress();
+    await this.#flushClientIngress();
+    await this.#flushAgentInputs();
+    await this.#flushClientEgress();
     await this.#collectIdleAgents();
   }
 
-  #enqueueIngress(event: AgentIngressEvent): void {
-    const queue = this.#ingressQueues.get(event.sessionId) ?? createQueue<AgentIngressEvent>();
+  #enqueueClientIngress(event: ClientIngressEvent): void {
+    if (event.type === "command.session.new") {
+      this.#clientIngressQueues.set(event.clientSessionId, [event]);
+      return;
+    }
+
+    const queue = this.#clientIngressQueues.get(event.clientSessionId) ?? createQueue<ClientIngressEvent>();
     if (queue.length >= this.#maxQueueSize) {
-      throw new Error(`Ingress queue overflow for session ${event.sessionId}`);
+      throw new Error(`Client ingress queue overflow for session ${event.clientSessionId}`);
     }
     queue.push(event);
-    this.#ingressQueues.set(event.sessionId, queue);
+    this.#clientIngressQueues.set(event.clientSessionId, queue);
   }
 
-  #enqueueEgress(event: AgentEgressEvent): void {
-    if (this.#egressQueue.length >= this.#maxQueueSize) {
-      throw new Error("Egress queue overflow");
+  #enqueueClientEgress(event: ClientEgressEvent): void {
+    if (this.#clientEgressQueue.length >= this.#maxQueueSize) {
+      throw new Error("Client egress queue overflow");
     }
-    this.#egressQueue.push(event);
+    this.#clientEgressQueue.push(event);
   }
 
-  async #flushIngress(): Promise<void> {
-    for (const [sessionId, queue] of this.#ingressQueues) {
+  async #flushClientIngress(): Promise<void> {
+    for (const [clientSessionId, queue] of this.#clientIngressQueues) {
       if (queue.length === 0) {
-        this.#ingressQueues.delete(sessionId);
+        this.#clientIngressQueues.delete(clientSessionId);
         continue;
       }
 
-      const entry = await this.#getOrCreateAgent(sessionId);
-      if (await entry.adapter.isBusy()) {
-        continue;
+      while (queue.length > 0) {
+        const event = queue.shift();
+        if (!event) break;
+
+        try {
+          if (event.type === "command.session.new") {
+            await this.#handleSessionNew(event.clientSessionId);
+            queue.length = 0;
+            break;
+          }
+
+          if (event.type === "command.session.compact") {
+            await this.#handleSessionCompact(event.clientSessionId);
+            continue;
+          }
+
+          await this.#handleUserMessage(event.clientSessionId, event.text);
+        } catch (error) {
+          console.error(`[core] failed to process client ingress for ${clientSessionId}:`, error);
+        }
       }
 
-      const event = queue.shift();
+      if (queue.length === 0) {
+        this.#clientIngressQueues.delete(clientSessionId);
+      }
+    }
+  }
+
+  async #flushAgentInputs(): Promise<void> {
+    for (const runtime of this.#agentRuntimes.values()) {
+      if (runtime.queue.length === 0) continue;
+      if (await runtime.agentAdapter.isBusy()) continue;
+
+      const event = runtime.queue.shift();
       if (!event) continue;
 
       try {
-        await entry.adapter.input(event);
+        await runtime.agentAdapter.input(event);
       } catch (error) {
-        console.error(`[core] failed to deliver ingress event for ${sessionId}:`, error);
+        console.error(`[core] failed to deliver agent input for ${runtime.agentSessionId}:`, error);
       }
 
-      entry.lastActiveAt = Date.now();
-      if (queue.length === 0) {
-        this.#ingressQueues.delete(sessionId);
-      }
+      runtime.lastActiveAt = Date.now();
     }
   }
 
-  async #flushEgress(): Promise<void> {
-    if (this.#egressQueue.length === 0) return;
+  async #flushClientEgress(): Promise<void> {
+    if (this.#clientEgressQueue.length === 0) return;
     if (await this.#imAdapter.isBusy()) return;
 
-    const event = this.#egressQueue.shift();
+    const event = this.#clientEgressQueue.shift();
     if (!event) return;
 
     try {
       await this.#imAdapter.input(event);
     } catch (error) {
-      console.error("[core] failed to deliver egress event:", error);
+      console.error("[core] failed to deliver client egress event:", error);
     }
   }
 
-  async #getOrCreateAgent(sessionId: string): Promise<AgentEntry> {
-    const existing = this.#agentEntries.get(sessionId);
-    if (existing) return existing;
+  async #handleUserMessage(clientSessionId: string, text: string): Promise<void> {
+    const runtime = await this.#getOrCreateActiveRuntime(clientSessionId);
+    this.#enqueueAgentInput(runtime, {
+      type: "user.message",
+      text,
+    });
+  }
 
-    const adapter = await this.#agentFactory.create(sessionId, async (event) => {
-      this.#enqueueEgress(event);
+  async #handleSessionCompact(clientSessionId: string): Promise<void> {
+    const runtime = await this.#getActiveRuntime(clientSessionId);
+    if (!runtime) {
+      this.#enqueueClientEgress({
+        type: "assistant.message",
+        clientSessionId,
+        text: "No active agent session to compact.",
+      });
+      return;
+    }
+
+    this.#enqueueAgentInput(runtime, {
+      type: "command.session.compact",
+    });
+  }
+
+  async #handleSessionNew(clientSessionId: string): Promise<void> {
+    const previousAgentSessionId = this.#clientToAgentSession.get(clientSessionId);
+    if (previousAgentSessionId) {
+      const previousRuntime = this.#agentRuntimes.get(previousAgentSessionId);
+      if (previousRuntime) {
+        await this.#stopRuntime(previousRuntime);
+      }
+      this.#agentToClientSession.delete(previousAgentSessionId);
+    }
+
+    const runtime = await this.#createRuntimeForClient(clientSessionId);
+    this.#bindClientToAgent(clientSessionId, runtime.agentSessionId);
+    this.#enqueueClientEgress({
+      type: "assistant.message",
+      clientSessionId,
+      text: "Started a new session.",
+    });
+  }
+
+  #enqueueAgentInput(runtime: AgentRuntime, event: AgentInputEvent): void {
+    if (runtime.queue.length >= this.#maxQueueSize) {
+      throw new Error(`Agent input queue overflow for session ${runtime.agentSessionId}`);
+    }
+    runtime.queue.push(event);
+    runtime.lastActiveAt = Date.now();
+  }
+
+  async #getActiveRuntime(clientSessionId: string): Promise<AgentRuntime | null> {
+    const agentSessionId = this.#clientToAgentSession.get(clientSessionId);
+    if (!agentSessionId) {
+      return null;
+    }
+    return this.#getOrRestoreRuntime(clientSessionId, agentSessionId);
+  }
+
+  async #getOrCreateActiveRuntime(clientSessionId: string): Promise<AgentRuntime> {
+    const existing = await this.#getActiveRuntime(clientSessionId);
+    if (existing) {
+      return existing;
+    }
+
+    const runtime = await this.#createRuntimeForClient(clientSessionId);
+    this.#bindClientToAgent(clientSessionId, runtime.agentSessionId);
+    return runtime;
+  }
+
+  async #getOrRestoreRuntime(clientSessionId: string, agentSessionId: string): Promise<AgentRuntime> {
+    const existing = this.#agentRuntimes.get(agentSessionId);
+    if (existing) {
+      return existing;
+    }
+
+    if (this.#agentModule.resumeAgentSession) {
+      const agentAdapter = await this.#agentModule.resumeAgentSession({
+        config: this.#agentConfig,
+        agentSessionId,
+      });
+      return this.#startRuntime(clientSessionId, agentSessionId, agentAdapter);
+    }
+
+    const runtime = await this.#createRuntimeForClient(clientSessionId);
+    this.#agentToClientSession.delete(agentSessionId);
+    this.#bindClientToAgent(clientSessionId, runtime.agentSessionId);
+    return runtime;
+  }
+
+  async #createRuntimeForClient(clientSessionId: string): Promise<AgentRuntime> {
+    const { agentSessionId, agentAdapter } = await this.#agentModule.createAgentSession({
+      config: this.#agentConfig,
+    });
+    return this.#startRuntime(clientSessionId, agentSessionId, agentAdapter);
+  }
+
+  async #startRuntime(clientSessionId: string, agentSessionId: string, agentAdapter: AgentAdapter): Promise<AgentRuntime> {
+    await agentAdapter.start(async (event: AgentOutputEvent) => {
+      this.#handleAgentOutput(event);
     });
 
-    const entry: AgentEntry = {
-      adapter,
+    const runtime: AgentRuntime = {
+      agentSessionId,
+      agentAdapter,
+      queue: createQueue<AgentInputEvent>(),
       lastActiveAt: Date.now(),
     };
-    this.#agentEntries.set(sessionId, entry);
-    return entry;
+    this.#agentRuntimes.set(agentSessionId, runtime);
+    this.#agentToClientSession.set(agentSessionId, clientSessionId);
+    return runtime;
+  }
+
+  #bindClientToAgent(clientSessionId: string, agentSessionId: string): void {
+    const previousAgentSessionId = this.#clientToAgentSession.get(clientSessionId);
+    if (previousAgentSessionId && previousAgentSessionId !== agentSessionId) {
+      this.#agentToClientSession.delete(previousAgentSessionId);
+    }
+    this.#clientToAgentSession.set(clientSessionId, agentSessionId);
+    this.#agentToClientSession.set(agentSessionId, clientSessionId);
+  }
+
+  #handleAgentOutput(event: AgentOutputEvent): void {
+    const clientSessionId = this.#agentToClientSession.get(event.agentSessionId);
+    if (!clientSessionId) {
+      return;
+    }
+
+    const activeAgentSessionId = this.#clientToAgentSession.get(clientSessionId);
+    if (activeAgentSessionId !== event.agentSessionId) {
+      console.log(
+        `[core] dropping late output from inactive agent session ${event.agentSessionId} for client ${clientSessionId}`,
+      );
+      return;
+    }
+
+    const runtime = this.#agentRuntimes.get(event.agentSessionId);
+    if (runtime) {
+      runtime.lastActiveAt = Date.now();
+    }
+
+    this.#enqueueClientEgress({
+      type: "assistant.message",
+      clientSessionId,
+      text: event.text,
+    });
   }
 
   async #collectIdleAgents(): Promise<void> {
     const now = Date.now();
-    for (const [sessionId, entry] of this.#agentEntries) {
-      const hasPendingIngress = (this.#ingressQueues.get(sessionId)?.length ?? 0) > 0;
-      if (hasPendingIngress) continue;
-      if (await entry.adapter.isBusy()) continue;
-      if (now - entry.lastActiveAt < this.#agentIdleTimeoutMs) continue;
+    for (const runtime of this.#agentRuntimes.values()) {
+      if (runtime.queue.length > 0) continue;
+      if (await runtime.agentAdapter.isBusy()) continue;
+      if (now - runtime.lastActiveAt < this.#agentIdleTimeoutMs) continue;
 
-      await entry.adapter.stop();
-      this.#agentEntries.delete(sessionId);
-      console.log(`[core] released idle agent session ${sessionId}`);
+      await runtime.agentAdapter.stop();
+      this.#agentRuntimes.delete(runtime.agentSessionId);
+      console.log(`[core] released idle agent session ${runtime.agentSessionId}`);
+    }
+  }
+
+  async #stopRuntime(runtime: AgentRuntime): Promise<void> {
+    try {
+      if (runtime.agentAdapter.abort && (await runtime.agentAdapter.isBusy())) {
+        try {
+          await runtime.agentAdapter.abort();
+        } catch (error) {
+          console.error(`[core] abort failed for ${runtime.agentSessionId}:`, error);
+        }
+      }
+      await runtime.agentAdapter.stop();
+    } finally {
+      this.#agentRuntimes.delete(runtime.agentSessionId);
     }
   }
 }

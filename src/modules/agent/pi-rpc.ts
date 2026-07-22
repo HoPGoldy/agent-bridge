@@ -1,7 +1,8 @@
+import { randomUUID } from "node:crypto";
 import os from "node:os";
 import path from "node:path";
 import { PiRpcAgentAdapter } from "../../adapters/agent/pi-rpc-agent-adapter";
-import type { AgentModule, PiRpcAgentConfig } from "../../types";
+import type { AgentAdapter, AgentModule, PiRpcAgentConfig } from "../../types";
 
 function parseExtraArgs(raw: string | undefined): string[] {
   if (!raw) return [];
@@ -11,17 +12,29 @@ function parseExtraArgs(raw: string | undefined): string[] {
     .filter(Boolean);
 }
 
+function buildAdapter(config: PiRpcAgentConfig, agentSessionId: string): AgentAdapter {
+  return new PiRpcAgentAdapter({
+    agentSessionId,
+    cwd: process.cwd(),
+    sessionDir:
+      config.sessionDir ??
+      process.env.PI_SESSION_DIR ??
+      path.join(os.homedir(), ".config", "agent-bridge", "pi-sessions"),
+    bin: config.bin ?? process.env.PI_BIN ?? "pi",
+    extraArgs: config.extraArgs ?? parseExtraArgs(process.env.PI_RPC_EXTRA_ARGS),
+  });
+}
+
 export const piRpcAgentModule: AgentModule<PiRpcAgentConfig> = {
   type: "pi-rpc",
-  createAgentAdapter(config) {
-    return new PiRpcAgentAdapter({
-      cwd: process.cwd(),
-      sessionDir:
-        config.sessionDir ??
-        process.env.PI_SESSION_DIR ??
-        path.join(os.homedir(), ".config", "agent-bridge", "pi-sessions"),
-      bin: config.bin ?? process.env.PI_BIN ?? "pi",
-      extraArgs: config.extraArgs ?? parseExtraArgs(process.env.PI_RPC_EXTRA_ARGS),
-    });
+  async createAgentSession({ config }) {
+    const agentSessionId = `pi-rpc:${randomUUID()}`;
+    return {
+      agentSessionId,
+      agentAdapter: buildAdapter(config, agentSessionId),
+    };
+  },
+  async resumeAgentSession({ config, agentSessionId }) {
+    return buildAdapter(config, agentSessionId);
   },
 };

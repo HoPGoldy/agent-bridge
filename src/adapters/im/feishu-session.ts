@@ -17,12 +17,12 @@ export function buildFeishuSessionId(chatType: "p2p" | "dm" | "group", chatId: s
   throw new Error(`Unsupported Feishu chat type: ${chatType}`);
 }
 
-export function parseFeishuSessionId(sessionId: string): FeishuSessionTarget {
-  if (sessionId.startsWith("feishu:dm:")) {
-    return { platform: "feishu", chatType: "dm", chatId: sessionId.slice("feishu:dm:".length) };
+export function parseFeishuSessionId(clientSessionId: string): FeishuSessionTarget {
+  if (clientSessionId.startsWith("feishu:dm:")) {
+    return { platform: "feishu", chatType: "dm", chatId: clientSessionId.slice("feishu:dm:".length) };
   }
-  if (sessionId.startsWith("feishu:group:")) {
-    return { platform: "feishu", chatType: "group", chatId: sessionId.slice("feishu:group:".length) };
+  if (clientSessionId.startsWith("feishu:group:")) {
+    return { platform: "feishu", chatType: "group", chatId: clientSessionId.slice("feishu:group:".length) };
   }
-  throw new Error(`Unsupported sessionId: ${sessionId}`);
+  throw new Error(`Unsupported clientSessionId: ${clientSessionId}`);
 }

@@ -1,10 +1,10 @@
-import type { AgentEgressEvent, AgentIngressEvent, FeishuClientConfig, IMAdapter } from "../../types";
+import type { ClientEgressEvent, ClientIngressEvent, FeishuClientConfig, IMAdapter } from "../../types";
 import { FeishuClient } from "./feishu-client";
 import { buildFeishuSessionId, parseFeishuSessionId } from "./feishu-session";
 
 export class FeishuIMAdapter implements IMAdapter {
   readonly #config: FeishuClientConfig;
-  #onOutput: ((event: AgentIngressEvent) => Promise<void> | void) | null = null;
+  #onOutput: ((event: ClientIngressEvent) => Promise<void> | void) | null = null;
   #busy = false;
   #client: FeishuClient | null = null;
 
@@ -12,15 +12,34 @@ export class FeishuIMAdapter implements IMAdapter {
     this.#config = config;
   }
 
-  async start(onOutput: (event: AgentIngressEvent) => Promise<void> | void): Promise<void> {
+  async start(onOutput: (event: ClientIngressEvent) => Promise<void> | void): Promise<void> {
     this.#onOutput = onOutput;
     this.#client = new FeishuClient(this.#config);
     this.#client.setOnMessage(async ({ chatId, chatType, text }) => {
       if (!this.#onOutput) return;
 
+      const clientSessionId = buildFeishuSessionId(chatType, chatId);
+      const normalizedText = text.trim();
+
+      if (normalizedText === "/new") {
+        await this.#onOutput({
+          type: "command.session.new",
+          clientSessionId,
+        });
+        return;
+      }
+
+      if (normalizedText === "/compact") {
+        await this.#onOutput({
+          type: "command.session.compact",
+          clientSessionId,
+        });
+        return;
+      }
+
       await this.#onOutput({
         type: "user.message",
-        sessionId: buildFeishuSessionId(chatType, chatId),
+        clientSessionId,
         text,
       });
     });
@@ -38,14 +57,14 @@ export class FeishuIMAdapter implements IMAdapter {
     console.log("[feishu] adapter stopped");
   }
 
-  async input(event: AgentEgressEvent): Promise<void> {
+  async input(event: ClientEgressEvent): Promise<void> {
     if (!this.#client) {
       throw new Error("FeishuIMAdapter is not started");
     }
 
     this.#busy = true;
     try {
-      const target = parseFeishuSessionId(event.sessionId);
+      const target = parseFeishuSessionId(event.clientSessionId);
       await this.#client.sendText(target.chatId, event.text);
     } finally {
       this.#busy = false;

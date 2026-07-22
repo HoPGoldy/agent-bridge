@@ -1,26 +1,51 @@
-export type AgentIngressEvent = {
-  type: "user.message";
-  sessionId: string;
+export type ClientIngressEvent =
+  | {
+      type: "user.message";
+      clientSessionId: string;
+      text: string;
+    }
+  | {
+      type: "command.session.new";
+      clientSessionId: string;
+    }
+  | {
+      type: "command.session.compact";
+      clientSessionId: string;
+    };
+
+export type ClientEgressEvent = {
+  type: "assistant.message";
+  clientSessionId: string;
   text: string;
 };
 
-export type AgentEgressEvent = {
+export type AgentInputEvent =
+  | {
+      type: "user.message";
+      text: string;
+    }
+  | {
+      type: "command.session.compact";
+    };
+
+export type AgentOutputEvent = {
   type: "assistant.message";
-  sessionId: string;
+  agentSessionId: string;
   text: string;
 };
 
 export interface IMAdapter {
-  start(onOutput: (event: AgentIngressEvent) => Promise<void> | void): Promise<void>;
+  start(onOutput: (event: ClientIngressEvent) => Promise<void> | void): Promise<void>;
   stop(): Promise<void>;
-  input(event: AgentEgressEvent): Promise<void>;
+  input(event: ClientEgressEvent): Promise<void>;
   isBusy(): Promise<boolean>;
 }
 
 export interface AgentAdapter {
-  start(onOutput: (event: AgentEgressEvent) => Promise<void> | void): Promise<void>;
+  start(onOutput: (event: AgentOutputEvent) => Promise<void> | void): Promise<void>;
   stop(): Promise<void>;
-  input(event: AgentIngressEvent): Promise<void>;
+  abort?(): Promise<void>;
+  input(event: AgentInputEvent): Promise<void>;
   isBusy(): Promise<boolean>;
 }
 
@@ -58,7 +83,11 @@ export interface ClientModule<TConfig = unknown> {
 export interface AgentModule<TConfig = unknown> {
   readonly type: string;
   createConfigCollector?: () => ConfigAdapter<TConfig>;
-  createAgentAdapter(config: TConfig): AgentAdapter;
+  createAgentSession(args: { config: TConfig }): Promise<{
+    agentSessionId: string;
+    agentAdapter: AgentAdapter;
+  }>;
+  resumeAgentSession?(args: { config: TConfig; agentSessionId: string }): Promise<AgentAdapter>;
 }
 
 export interface FeishuClientConfig {
@@ -105,16 +134,10 @@ export interface ChannelRunner {
   stop(): Promise<void>;
 }
 
-export interface AgentFactory {
-  create(
-    sessionId: string,
-    onOutput: (event: AgentEgressEvent) => Promise<void>,
-  ): Promise<AgentAdapter>;
-}
-
 export interface GatewayCoreOptions {
   imAdapter: IMAdapter;
-  agentFactory: AgentFactory;
+  agentModule: AgentModule<any>;
+  agentConfig: AgentConfig["config"];
   pollIntervalMs: number;
   maxQueueSize: number;
   agentIdleTimeoutMs: number;

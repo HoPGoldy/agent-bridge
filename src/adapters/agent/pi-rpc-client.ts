@@ -7,6 +7,7 @@ import { StringDecoder } from "node:string_decoder";
 export type PiRpcCommand =
   | { id?: string; type: "prompt"; message: string }
   | { id?: string; type: "abort" }
+  | { id?: string; type: "compact"; customInstructions?: string }
   | { id?: string; type: "get_last_assistant_text" }
   | { id?: string; type: "get_state" }
   | { id?: string; type: "set_session_name"; name: string };
@@ -26,7 +27,7 @@ export type PiRpcEvent = {
 };
 
 export interface PiRpcClientOptions {
-  bridgeSessionId: string;
+  agentSessionId: string;
   piSessionId: string;
   cwd?: string;
   sessionDir?: string;
@@ -103,7 +104,7 @@ export class PiRpcClient {
 
   constructor(options: PiRpcClientOptions) {
     this.#options = {
-      bridgeSessionId: options.bridgeSessionId,
+      agentSessionId: options.agentSessionId,
       piSessionId: options.piSessionId,
       cwd: options.cwd ?? process.cwd(),
       sessionDir: options.sessionDir ?? defaultSessionDir(),
@@ -173,7 +174,7 @@ export class PiRpcClient {
 
     const state = await this.getState();
     if (!state.sessionName) {
-      await this.setSessionName(this.#options.bridgeSessionId);
+      await this.setSessionName(this.#options.agentSessionId);
     }
   }
 
@@ -213,6 +214,12 @@ export class PiRpcClient {
 
   async abort(): Promise<void> {
     await this.#send({ type: "abort" });
+  }
+
+  async compact(customInstructions?: string): Promise<{ estimatedTokensAfter?: number; summary?: string }> {
+    const response = await this.#send({ type: "compact", customInstructions });
+    const data = response.data as { estimatedTokensAfter?: number; summary?: string } | undefined;
+    return data ?? {};
   }
 
   async getLastAssistantText(): Promise<string | null> {
