@@ -1,5 +1,5 @@
 import type { AgentConfig, AgentModule } from "../../types";
-import { piRpcAgentModule } from "./pi-rpc";
+import { piRpcAgentModule } from "./pi-coding-agent";
 
 const registry = new Map<string, AgentModule<any>>([
   [piRpcAgentModule.type, piRpcAgentModule],

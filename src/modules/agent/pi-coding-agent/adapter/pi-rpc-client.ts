@@ -3,7 +3,7 @@ import { mkdir } from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 import { StringDecoder } from "node:string_decoder";
-import { createLogger, type Logger } from "../../../core/logger";
+import { createLogger, type Logger } from "../../../../core/logger";
 
 export type PiRpcCommand =
   | { id?: string; type: "prompt"; message: string }

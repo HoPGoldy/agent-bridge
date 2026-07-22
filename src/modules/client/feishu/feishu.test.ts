@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { feishuClientModule } from "./feishu";
+import { feishuClientModule } from "./index";
 
 describe("feishuClientModule config collector", () => {
   it("accepts a valid config", () => {

@@ -1,5 +1,5 @@
-import { FeishuIMAdapter } from "../../adapters/im/feishu/feishu-im-adapter";
-import type { ClientModule, ConfigAdapter, FeishuClientConfig } from "../../types";
+import { FeishuIMAdapter } from "./adapter/feishu-im-adapter";
+import type { ClientModule, ConfigAdapter, FeishuClientConfig } from "../../../types";
 
 function createFeishuConfigCollector(): ConfigAdapter<FeishuClientConfig> {
   return {
