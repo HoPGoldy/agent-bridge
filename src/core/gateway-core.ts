@@ -233,6 +233,16 @@ export class GatewayCore {
 
     this.#touchRuntime(runtime);
 
+    if (this.#isToolRelatedEvent(event)) {
+      this.#logger.info("forwarding tool event from agent", {
+        type: event.type,
+        agentSessionId,
+        clientSessionId,
+        toolName: "toolName" in event ? event.toolName : undefined,
+        text: event.text,
+      });
+    }
+
     if (event.type === "assistant.message") {
       await this.#deliverClientInput({
         type: "assistant.message",
@@ -247,6 +257,20 @@ export class GatewayCore {
       ...event,
       clientSessionId,
     });
+  }
+
+  #isToolRelatedEvent(
+    event: AgentOutputEvent,
+  ): event is Extract<
+    AgentOutputEvent,
+    { type: "assistant.tool.running" | "assistant.tool.done" | "assistant.tool.error" | "session.compacting" }
+  > {
+    return (
+      event.type === "assistant.tool.running" ||
+      event.type === "assistant.tool.done" ||
+      event.type === "assistant.tool.error" ||
+      event.type === "session.compacting"
+    );
   }
 
   #touchRuntime(runtime: AgentRuntime): void {

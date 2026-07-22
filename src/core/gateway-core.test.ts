@@ -1,4 +1,4 @@
-import { afterEach, describe, expect, it } from "vitest";
+import { afterEach, describe, expect, it, vi } from "vitest";
 import { GatewayCore } from "./gateway-core";
 import type {
   AgentAdapter,
@@ -344,56 +344,73 @@ describe("GatewayCore", () => {
   it("forwards non-message agent events to the client adapter without aggregating them", async () => {
     const imAdapter = new FakeIMAdapter();
     const createdAdapters: FakeAgentAdapter[] = [];
+    const logSpy = vi.spyOn(console, "log").mockImplementation(() => {});
 
-    const agentModule: AgentModule<Record<string, never>> = {
-      type: "fake",
-      async createAgentSession() {
-        const agentSessionId = `agent-${createdAdapters.length + 1}`;
-        const agentAdapter = new FakeAgentAdapter(agentSessionId);
-        createdAdapters.push(agentAdapter);
-        return { agentSessionId, agentAdapter };
-      },
-    };
+    try {
+      const agentModule: AgentModule<Record<string, never>> = {
+        type: "fake",
+        async createAgentSession() {
+          const agentSessionId = `agent-${createdAdapters.length + 1}`;
+          const agentAdapter = new FakeAgentAdapter(agentSessionId);
+          createdAdapters.push(agentAdapter);
+          return { agentSessionId, agentAdapter };
+        },
+      };
 
-    const core = new GatewayCore({
-      imAdapter,
-      agentModule,
-      agentConfig: {},
-      agentIdleTimeoutMs: 60_000,
-    });
-    running.push(core);
-    await core.start();
+      const core = new GatewayCore({
+        imAdapter,
+        agentModule,
+        agentConfig: {},
+        agentIdleTimeoutMs: 60_000,
+      });
+      running.push(core);
+      await core.start();
 
-    await imAdapter.emit({
-      type: "user.message",
-      clientSessionId: "client-1",
-      text: "hello",
-    });
-
-    await waitFor(() => {
-      expect(createdAdapters).toHaveLength(1);
-    });
-
-    await createdAdapters[0]!.emit({
-      type: "assistant.thinking",
-      agentSessionId: "agent-1",
-      text: "Planning next step",
-    });
-    await createdAdapters[0]!.emit({
-      type: "assistant.tool.running",
-      agentSessionId: "agent-1",
-      toolName: "read_file",
-      text: "Running read_file",
-    });
-
-    await waitFor(() => {
-      expect(imAdapter.outputs.at(-1)).toEqual({
-        type: "assistant.tool.running",
+      await imAdapter.emit({
+        type: "user.message",
         clientSessionId: "client-1",
+        text: "hello",
+      });
+
+      await waitFor(() => {
+        expect(createdAdapters).toHaveLength(1);
+      });
+
+      await createdAdapters[0]!.emit({
+        type: "assistant.thinking",
+        agentSessionId: "agent-1",
+        text: "Planning next step",
+      });
+      await createdAdapters[0]!.emit({
+        type: "assistant.tool.running",
         agentSessionId: "agent-1",
         toolName: "read_file",
         text: "Running read_file",
       });
-    });
+
+      await waitFor(() => {
+        expect(imAdapter.outputs.at(-1)).toEqual({
+          type: "assistant.tool.running",
+          clientSessionId: "client-1",
+          agentSessionId: "agent-1",
+          toolName: "read_file",
+          text: "Running read_file",
+        });
+      });
+
+      expect(logSpy).toHaveBeenCalledWith(
+        expect.stringContaining("[core]"),
+        "forwarding tool event from agent",
+        {
+          type: "assistant.tool.running",
+          agentSessionId: "agent-1",
+          clientSessionId: "client-1",
+          toolName: "read_file",
+          text: "Running read_file",
+        },
+      );
+    } finally {
+      logSpy.mockRestore();
+    }
   });
 });
