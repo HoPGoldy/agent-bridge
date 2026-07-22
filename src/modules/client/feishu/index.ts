@@ -20,10 +20,13 @@ function createFeishuConfigCollector(): ConfigAdapter<FeishuClientConfig> {
         { label: "Lark", value: "lark" },
       ]);
 
+      const requireMentionInGroup = await ctx.confirm("Require @mention in group chats", true);
+
       return {
         appId,
         appSecret,
         domain: domain as FeishuClientConfig["domain"],
+        requireMentionInGroup,
       };
     },
 
@@ -41,11 +44,9 @@ function createFeishuConfigCollector(): ConfigAdapter<FeishuClientConfig> {
 
     summarize(config) {
       const masked =
-        config.appId.length > 8
-          ? `${config.appId.slice(0, 4)}****${config.appId.slice(-4)}`
-          : "****";
+        config.appId.length > 8 ? `${config.appId.slice(0, 4)}****${config.appId.slice(-4)}` : "****";
 
-      return `type=feishu appId=${masked} domain=${config.domain ?? "feishu"}`;
+      return `type=feishu appId=${masked} domain=${config.domain ?? "feishu"} requireMentionInGroup=${config.requireMentionInGroup ?? true}`;
     },
   };
 }

@@ -6,109 +6,109 @@ const DEDUP_TTL_MS = 12 * 60 * 60 * 1000;
 const DEDUP_MAX_ENTRIES = 5000;
 const MESSAGE_EXPIRY_MS = 30 * 60 * 1000;
 const DEDUP_SWEEP_INTERVAL_MS = 5 * 60 * 1000;
+const REACTION_TYPING = "Typing";
 
-type FeishuMention = {
-  key?: string;
-  name?: string;
-};
-
-type FeishuMessagePayload = {
-  sender?: {
-    sender_type?: string;
-  };
-  message?: {
-    message_id?: string;
-    create_time?: string;
-    chat_id?: string;
-    chat_type?: "p2p" | "group";
-    message_type?: string;
-    content?: string;
-    mentions?: FeishuMention[];
+type LarkClientLike = {
+  im: {
+    message: {
+      create(args: unknown): Promise<unknown>;
+      reply(args: unknown): Promise<unknown>;
+    };
+    messageReaction: {
+      create(args: unknown): Promise<{ data?: { reaction_id?: string | null } }>;
+      delete(args: unknown): Promise<unknown>;
+    };
   };
 };
 
-function now(): number {
-  return Date.now();
+type LarkChannelLike = {
+  connect(): Promise<void>;
+  disconnect(): Promise<void>;
+  send(
+    to: string,
+    input: { text: string },
+    opts?: {
+      replyTo?: string;
+    },
+  ): Promise<unknown>;
+  on(name: "message", handler: (message: Lark.NormalizedMessage) => void | Promise<void>): () => void;
+  on(
+    name: "reject",
+    handler: (event: { reason: string; messageId: string; chatId: string }) => void,
+  ): () => void;
+  on(name: "error", handler: (error: unknown) => void): () => void;
+  on(name: "reconnecting" | "reconnected", handler: () => void): () => void;
+};
+
+function createChannel(config: FeishuClientConfig, logger: Logger): LarkChannelLike {
+  const domain = config.domain === "lark" ? Lark.Domain.Lark : Lark.Domain.Feishu;
+
+  return Lark.createLarkChannel({
+    appId: config.appId,
+    appSecret: config.appSecret,
+    domain,
+    logger: {
+      error: (...args: unknown[]) => logger.error(...args),
+      warn: (...args: unknown[]) => logger.warn(...args),
+      info: (...args: unknown[]) => logger.info(...args),
+      debug: (...args: unknown[]) => logger.debug(...args),
+      trace: (...args: unknown[]) => logger.debug(...args),
+    },
+    loggerLevel: Lark.LoggerLevel.warn,
+    safety: {
+      dedup: {
+        ttl: DEDUP_TTL_MS,
+        maxEntries: DEDUP_MAX_ENTRIES,
+        sweepIntervalMs: DEDUP_SWEEP_INTERVAL_MS,
+      },
+      staleMessageWindowMs: MESSAGE_EXPIRY_MS,
+    },
+    policy: {
+      requireMention: false,
+    },
+    webhook: {
+      encryptKey: config.encryptKey,
+      verificationToken: config.verificationToken,
+    },
+  });
 }
 
-function parseJson(raw: string): unknown {
-  try {
-    return JSON.parse(raw);
-  } catch {
-    return raw;
-  }
+function createClient(config: FeishuClientConfig): LarkClientLike {
+  const domain = config.domain === "lark" ? Lark.Domain.Lark : Lark.Domain.Feishu;
+
+  return new Lark.Client({
+    appId: config.appId,
+    appSecret: config.appSecret,
+    domain,
+  }) as LarkClientLike;
 }
 
-function replaceMentionKeys(text: string, mentions: FeishuMention[] = []): string {
-  let result = text;
-  for (const mention of mentions) {
-    if (!mention.key) continue;
-    const display = mention.name ? `@${mention.name}` : "";
-    result = result.replaceAll(mention.key, display);
-  }
-  return result.trim();
-}
-
-function parseTextContent(rawContent: string, messageType: string, mentions: FeishuMention[] = []): string {
-  const parsed = parseJson(rawContent) as
-    | string
-    | {
-        text?: string;
-        zh_cn?: { title?: string; content?: Array<Array<{ tag?: string; text?: string }>> };
-        en_us?: { title?: string; content?: Array<Array<{ tag?: string; text?: string }>> };
-        ja_jp?: { title?: string; content?: Array<Array<{ tag?: string; text?: string }>> };
-      };
-
-  switch (messageType) {
-    case "text": {
-      const text = typeof parsed === "string" ? parsed : (parsed?.text ?? "");
-      return replaceMentionKeys(text, mentions);
-    }
-
-    case "post": {
-      const locale =
-        typeof parsed === "object" && parsed !== null
-          ? (parsed.zh_cn ?? parsed.en_us ?? parsed.ja_jp)
-          : undefined;
-      const parts: string[] = [];
-      if (locale?.title) parts.push(locale.title);
-      if (Array.isArray(locale?.content)) {
-        for (const row of locale.content) {
-          for (const item of row) {
-            if (["text", "a", "md"].includes(item.tag ?? "") && item.text) {
-              parts.push(item.text);
-            }
-          }
-        }
-      }
-      return parts.join("").trim();
-    }
-
-    default:
-      return "";
-  }
+function buildMarkdownCard(text: string): string {
+  return JSON.stringify({
+    schema: "2.0",
+    body: {
+      elements: [
+        {
+          tag: "markdown",
+          content: text,
+        },
+      ],
+    },
+  });
 }
 
 export class FeishuClient {
-  readonly #config: FeishuClientConfig;
   readonly #logger: Logger;
-  readonly #client: Lark.Client;
-  #wsClient: Lark.WSClient | null = null;
+  readonly #channel: LarkChannelLike;
+  readonly #client: LarkClientLike;
   #onMessage: ((message: FeishuInboundMessage) => Promise<void> | void) | null = null;
-  #dedup = new Map<string, number>();
-  #dedupTimer: NodeJS.Timeout | null = null;
+  #unsubscribe: Array<() => void> = [];
+  #typingReactionByChatId = new Map<string, { messageId: string; reactionId: string }>();
 
   constructor(config: FeishuClientConfig, logger: Logger = createLogger("feishu")) {
-    this.#config = config;
     this.#logger = logger;
-    const domain = config.domain === "lark" ? Lark.Domain.Lark : Lark.Domain.Feishu;
-
-    this.#client = new Lark.Client({
-      appId: config.appId,
-      appSecret: config.appSecret,
-      appType: Lark.AppType.SelfBuild,
-      domain,
-    });
+    this.#channel = createChannel(config, logger);
+    this.#client = createClient(config);
   }
 
   setOnMessage(onMessage: (message: FeishuInboundMessage) => Promise<void> | void): void {
@@ -116,160 +116,155 @@ export class FeishuClient {
   }
 
   async connect(): Promise<void> {
-    const dispatcher = new Lark.EventDispatcher({
-      encryptKey: this.#config.encryptKey ?? "",
-      verificationToken: this.#config.verificationToken ?? "",
-    });
+    this.#unsubscribe = [
+      this.#channel.on("message", (message) => {
+        void this.#handleMessage(message);
+      }),
+      this.#channel.on("reject", (event) => {
+        this.#logger.debug(
+          `channel rejected inbound message (reason=${event.reason} chatId=${event.chatId} messageId=${event.messageId})`,
+        );
+      }),
+      this.#channel.on("error", (error) => {
+        this.#logger.error("channel error:", error);
+      }),
+      this.#channel.on("reconnecting", () => {
+        this.#logger.info("channel reconnecting");
+      }),
+      this.#channel.on("reconnected", () => {
+        this.#logger.info("channel reconnected");
+      }),
+    ];
 
-    dispatcher.register({
-      "im.message.receive_v1": (data: unknown) => {
-        void this.#handleMessage(data as FeishuMessagePayload);
-      },
-    });
-
-    this.#startDedupSweep();
-
-    const domain = this.#config.domain === "lark" ? Lark.Domain.Lark : Lark.Domain.Feishu;
-    this.#wsClient = new Lark.WSClient({
-      appId: this.#config.appId,
-      appSecret: this.#config.appSecret,
-      domain,
-      loggerLevel: Lark.LoggerLevel.warn,
-      autoReconnect: true,
-      onReady: () => {
-        this.#logger.info("websocket ready");
-      },
-      onError: (error: unknown) => {
-        const message = error instanceof Error ? error.message : String(error);
-        this.#logger.error("websocket error:", message);
-      },
-      onReconnecting: () => {
-        this.#logger.info("websocket reconnecting");
-      },
-      onReconnected: () => {
-        this.#logger.info("websocket reconnected");
-      },
-    });
-
-    this.#logger.info(`starting websocket (domain=${this.#config.domain ?? "feishu"})`);
-    await this.#wsClient.start({ eventDispatcher: dispatcher });
-    this.#logger.info("websocket started");
+    this.#logger.info("starting channel connection");
+    await this.#channel.connect();
+    this.#logger.info("channel connected");
   }
 
   async disconnect(): Promise<void> {
-    if (this.#dedupTimer) {
-      clearInterval(this.#dedupTimer);
-      this.#dedupTimer = null;
-    }
-
-    if (this.#wsClient) {
+    for (const unsubscribe of this.#unsubscribe.splice(0)) {
       try {
-        this.#wsClient.close({ force: true });
+        unsubscribe();
       } catch (error) {
-        this.#logger.debug("ignored websocket close error:", error);
+        this.#logger.debug("ignored channel unsubscribe error:", error);
       }
-      this.#wsClient = null;
+    }
+
+    await this.#channel.disconnect();
+  }
+
+  async sendText(chatId: string, text: string, replyToMessageId?: string): Promise<void> {
+    await this.sendMarkdown(chatId, text, replyToMessageId);
+  }
+
+  async sendMarkdown(chatId: string, text: string, replyToMessageId?: string): Promise<void> {
+    const content = buildMarkdownCard(text);
+
+    try {
+      if (replyToMessageId) {
+        await this.#client.im.message.reply({
+          path: {
+            message_id: replyToMessageId,
+          },
+          data: {
+            content,
+            msg_type: "interactive",
+          },
+        });
+      } else {
+        await this.#client.im.message.create({
+          params: {
+            receive_id_type: "chat_id",
+          },
+          data: {
+            receive_id: chatId,
+            content,
+            msg_type: "interactive",
+          },
+        });
+      }
+    } catch (error: any) {
+      if (replyToMessageId && (error?.code === 230011 || error?.code === 231003)) {
+        this.#logger.warn(
+          `reply target unavailable, falling back to create (chatId=${chatId} replyTo=${replyToMessageId})`,
+        );
+        await this.#client.im.message.create({
+          params: {
+            receive_id_type: "chat_id",
+          },
+          data: {
+            receive_id: chatId,
+            content,
+            msg_type: "interactive",
+          },
+        });
+      } else {
+        throw error;
+      }
+    }
+
+    this.#logger.debug(
+      `markdown message sent (chatId=${chatId} replyTo=${replyToMessageId ?? "none"} length=${text.length})`,
+    );
+  }
+
+  async startTyping(chatId: string, messageId: string): Promise<void> {
+    try {
+      const response = await this.#client.im.messageReaction.create({
+        path: {
+          message_id: messageId,
+        },
+        data: {
+          reaction_type: {
+            emoji_type: REACTION_TYPING,
+          },
+        },
+      });
+      const reactionId = response.data?.reaction_id;
+      if (reactionId) {
+        this.#typingReactionByChatId.set(chatId, { messageId, reactionId });
+      }
+    } catch (error) {
+      this.#logger.debug(`failed to add typing reaction (chatId=${chatId} messageId=${messageId})`, error);
     }
   }
 
-  async sendText(chatId: string, text: string): Promise<void> {
-    const content = JSON.stringify({ text });
-    await this.#client.im.message.create({
-      params: { receive_id_type: "chat_id" },
-      data: {
-        receive_id: chatId,
-        msg_type: "text",
-        content,
-      },
-    });
-    this.#logger.debug(`message sent (chatId=${chatId} length=${text.length})`);
+  async stopTyping(chatId: string): Promise<void> {
+    const entry = this.#typingReactionByChatId.get(chatId);
+    if (!entry) {
+      return;
+    }
+
+    this.#typingReactionByChatId.delete(chatId);
+
+    try {
+      await this.#client.im.messageReaction.delete({
+        path: {
+          message_id: entry.messageId,
+          reaction_id: entry.reactionId,
+        },
+      });
+    } catch (error) {
+      this.#logger.debug(
+        `failed to remove typing reaction (chatId=${chatId} messageId=${entry.messageId})`,
+        error,
+      );
+    }
   }
 
-  async #handleMessage(data: FeishuMessagePayload): Promise<void> {
-    const message = data.message;
-    const sender = data.sender;
-    if (!message || !sender) {
-      this.#logger.warn("dropping event with missing message or sender:", JSON.stringify(data).slice(0, 500));
-      return;
-    }
-
-    if (sender.sender_type === "app" || sender.sender_type === "bot") {
-      this.#logger.debug(`ignoring message from ${sender.sender_type} (messageId=${message.message_id ?? "unknown"})`);
-      return;
-    }
-
-    if (message.create_time && this.#isExpired(message.create_time)) {
-      this.#logger.debug(`dropping expired message (messageId=${message.message_id ?? "unknown"} createTime=${message.create_time})`);
-      return;
-    }
-
-    if (!this.#recordDedup(message.message_id)) {
-      this.#logger.debug(`dropping duplicate message (messageId=${message.message_id ?? "unknown"})`);
-      return;
-    }
-
-    if (
-      !message.content ||
-      !message.message_type ||
-      !message.chat_id ||
-      !message.chat_type ||
-      !message.message_id
-    ) {
-      this.#logger.warn("dropping message with missing fields:", JSON.stringify(message).slice(0, 500));
-      return;
-    }
-
-    const text = parseTextContent(message.content, message.message_type, message.mentions ?? []);
-    if (!text) {
-      this.#logger.debug(`dropping message with no text content (messageId=${message.message_id} messageType=${message.message_type})`);
+  async #handleMessage(message: Lark.NormalizedMessage): Promise<void> {
+    if (!message.content) {
+      this.#logger.debug(`dropping message with no text content (messageId=${message.messageId})`);
       return;
     }
 
     await this.#onMessage?.({
-      chatId: message.chat_id,
-      chatType: message.chat_type,
-      messageId: message.message_id,
-      text,
-      raw: data,
+      chatId: message.chatId,
+      chatType: message.chatType,
+      messageId: message.messageId,
+      text: message.content,
+      mentionedBot: message.mentionedBot,
+      raw: message.raw,
     });
-  }
-
-  #recordDedup(messageId?: string): boolean {
-    if (!messageId) return false;
-    if (this.#dedup.has(messageId)) return false;
-    this.#dedup.set(messageId, now());
-
-    if (this.#dedup.size > DEDUP_MAX_ENTRIES) {
-      const oldest = this.#dedup.keys().next().value;
-      if (typeof oldest === "string") {
-        this.#dedup.delete(oldest);
-        this.#logger.warn(`dedup cache exceeded ${DEDUP_MAX_ENTRIES} entries, evicted oldest (messageId=${oldest})`);
-      }
-    }
-
-    return true;
-  }
-
-  #isExpired(createTime: string): boolean {
-    const timestamp = Number.parseInt(String(createTime), 10);
-    if (!Number.isFinite(timestamp)) return false;
-    return now() - timestamp > MESSAGE_EXPIRY_MS;
-  }
-
-  #startDedupSweep(): void {
-    if (this.#dedupTimer) return;
-    this.#dedupTimer = setInterval(() => {
-      const cutoff = now() - DEDUP_TTL_MS;
-      let evicted = 0;
-      for (const [messageId, timestamp] of this.#dedup) {
-        if (timestamp < cutoff) {
-          this.#dedup.delete(messageId);
-          evicted += 1;
-        }
-      }
-      if (evicted > 0) {
-        this.#logger.debug(`dedup sweep evicted ${evicted} entries (remaining=${this.#dedup.size})`);
-      }
-    }, DEDUP_SWEEP_INTERVAL_MS);
   }
 }

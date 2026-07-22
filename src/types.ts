@@ -96,6 +96,7 @@ export interface FeishuClientConfig {
   domain?: "feishu" | "lark";
   encryptKey?: string;
   verificationToken?: string;
+  requireMentionInGroup?: boolean;
 }
 
 export interface PiCodingAgentConfig {
@@ -157,5 +158,6 @@ export interface FeishuInboundMessage {
   chatType: "p2p" | "group";
   messageId: string;
   text: string;
+  mentionedBot?: boolean;
   raw?: unknown;
 }
