@@ -1,21 +1,24 @@
 import type { ClientEgressEvent, ClientIngressEvent, FeishuClientConfig, IMAdapter } from "../../types";
+import { createLogger, type Logger } from "../../core/logger";
 import { FeishuClient } from "./feishu-client";
 import { buildFeishuSessionId, parseFeishuSessionId } from "./feishu-session";
 
 export class FeishuIMAdapter implements IMAdapter {
   readonly #config: FeishuClientConfig;
+  readonly #logger: Logger;
   #onOutput: ((event: ClientIngressEvent) => Promise<void> | void) | null = null;
   #client: FeishuClient | null = null;
   #egressQueue: ClientEgressEvent[] = [];
   #processing = false;
 
-  constructor(config: FeishuClientConfig) {
+  constructor(config: FeishuClientConfig, logger: Logger = createLogger("feishu")) {
     this.#config = config;
+    this.#logger = logger;
   }
 
   async start(onOutput: (event: ClientIngressEvent) => Promise<void> | void): Promise<void> {
     this.#onOutput = onOutput;
-    this.#client = new FeishuClient(this.#config);
+    this.#client = new FeishuClient(this.#config, this.#logger);
     this.#client.setOnMessage(async ({ chatId, chatType, text }) => {
       if (!this.#onOutput) return;
 
@@ -23,6 +26,7 @@ export class FeishuIMAdapter implements IMAdapter {
       const normalizedText = text.trim();
 
       if (normalizedText === "/new") {
+        this.#logger.info(`received command /new (session=${clientSessionId})`);
         await this.#onOutput({
           type: "command.session.new",
           clientSessionId,
@@ -31,6 +35,7 @@ export class FeishuIMAdapter implements IMAdapter {
       }
 
       if (normalizedText === "/compact") {
+        this.#logger.info(`received command /compact (session=${clientSessionId})`);
         await this.#onOutput({
           type: "command.session.compact",
           clientSessionId,
@@ -38,6 +43,7 @@ export class FeishuIMAdapter implements IMAdapter {
         return;
       }
 
+      this.#logger.info(`received user message (session=${clientSessionId}): ${normalizedText}`);
       await this.#onOutput({
         type: "user.message",
         clientSessionId,
@@ -46,7 +52,7 @@ export class FeishuIMAdapter implements IMAdapter {
     });
 
     await this.#client.connect();
-    console.log(`[feishu] adapter started (domain=${this.#config.domain ?? "feishu"})`);
+    this.#logger.info(`adapter started (domain=${this.#config.domain ?? "feishu"})`);
   }
 
   async stop(): Promise<void> {
@@ -57,7 +63,7 @@ export class FeishuIMAdapter implements IMAdapter {
     }
     this.#processing = false;
     this.#onOutput = null;
-    console.log("[feishu] adapter stopped");
+    this.#logger.info("adapter stopped");
   }
 
   async input(event: ClientEgressEvent): Promise<void> {
@@ -86,9 +92,10 @@ export class FeishuIMAdapter implements IMAdapter {
 
         try {
           const target = parseFeishuSessionId(event.clientSessionId);
+          this.#logger.info(`sending reply (session=${event.clientSessionId})`);
           await this.#client.sendText(target.chatId, event.text);
         } catch (error) {
-          console.error("[feishu] failed to send egress event:", error);
+          this.#logger.error("failed to send egress event:", error);
         }
       }
     } finally {

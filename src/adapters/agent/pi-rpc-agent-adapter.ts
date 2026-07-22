@@ -1,4 +1,5 @@
 import type { AgentAdapter, AgentInputEvent, AgentOutputEvent } from "../../types";
+import { createLogger, type Logger } from "../../core/logger";
 import { PiRpcClient } from "./pi-rpc-client";
 import { toPiSessionId } from "./pi-session-id";
 
@@ -9,6 +10,7 @@ export class PiRpcAgentAdapter implements AgentAdapter {
   readonly #sessionDir?: string;
   readonly #bin: string;
   readonly #extraArgs: string[];
+  readonly #logger: Logger;
   #client: PiRpcClient | null = null;
   #onOutput: ((event: AgentOutputEvent) => Promise<void> | void) | null = null;
   #inputQueue: AgentInputEvent[] = [];
@@ -20,12 +22,14 @@ export class PiRpcAgentAdapter implements AgentAdapter {
     sessionDir,
     bin,
     extraArgs,
+    logger,
   }: {
     agentSessionId: string;
     cwd?: string;
     sessionDir?: string;
     bin?: string;
     extraArgs?: string[];
+    logger?: Logger;
   }) {
     this.#agentSessionId = agentSessionId;
     this.#piSessionId = toPiSessionId(agentSessionId);
@@ -33,6 +37,7 @@ export class PiRpcAgentAdapter implements AgentAdapter {
     this.#sessionDir = sessionDir;
     this.#bin = bin ?? "pi";
     this.#extraArgs = extraArgs ?? [];
+    this.#logger = logger ?? createLogger("pi-rpc");
   }
 
   async start(onOutput: (event: AgentOutputEvent) => Promise<void> | void): Promise<void> {
@@ -44,14 +49,16 @@ export class PiRpcAgentAdapter implements AgentAdapter {
       sessionDir: this.#sessionDir,
       bin: this.#bin,
       extraArgs: this.#extraArgs,
+      logger: this.#logger,
     });
     this.#client.onEvent((rpcEvent) => {
       if (rpcEvent.type === "extension_error") {
-        console.error(`[pi-rpc] extension_error for ${this.#agentSessionId}:`, rpcEvent);
+        this.#logger.error(`extension_error for ${this.#agentSessionId}:`, rpcEvent);
       }
     });
+    this.#logger.info(`starting agent instance (bin=${this.#bin} cwd=${this.#cwd})`);
     await this.#client.start();
-    console.log(`[pi-rpc] session ${this.#agentSessionId} started (piSessionId=${this.#piSessionId})`);
+    this.#logger.info(`session ${this.#agentSessionId} started (piSessionId=${this.#piSessionId})`);
   }
 
   async stop(): Promise<void> {
@@ -60,7 +67,7 @@ export class PiRpcAgentAdapter implements AgentAdapter {
     this.#client = null;
     this.#processing = false;
     this.#onOutput = null;
-    console.log(`[pi-rpc] session ${this.#agentSessionId} stopped`);
+    this.#logger.info(`session ${this.#agentSessionId} stopped`);
   }
 
   async abort(): Promise<void> {
@@ -104,6 +111,7 @@ export class PiRpcAgentAdapter implements AgentAdapter {
 
     try {
       if (event.type === "user.message") {
+        this.#logger.info(`sending prompt to agent (session=${this.#agentSessionId})`);
         await this.#client.prompt(event.text);
         await this.#client.waitForSettled();
         const text = await this.#client.getLastAssistantText();
@@ -111,6 +119,7 @@ export class PiRpcAgentAdapter implements AgentAdapter {
         return;
       }
 
+      this.#logger.info(`compacting context (session=${this.#agentSessionId})`);
       const result = await this.#client.compact();
       const suffix =
         typeof result.estimatedTokensAfter === "number"
@@ -125,7 +134,7 @@ export class PiRpcAgentAdapter implements AgentAdapter {
 
   async #emitAssistant(text: string): Promise<void> {
     if (!this.#onOutput) {
-      console.error(`[pi-rpc] dropped assistant output for stopped session ${this.#agentSessionId}`);
+      this.#logger.error(`dropped assistant output for stopped session ${this.#agentSessionId}`);
       return;
     }
 

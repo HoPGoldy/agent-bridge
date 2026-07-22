@@ -3,6 +3,7 @@ import { mkdir } from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 import { StringDecoder } from "node:string_decoder";
+import { createLogger, type Logger } from "../../core/logger";
 
 export type PiRpcCommand =
   | { id?: string; type: "prompt"; message: string }
@@ -33,6 +34,7 @@ export interface PiRpcClientOptions {
   sessionDir?: string;
   bin?: string;
   extraArgs?: string[];
+  logger?: Logger;
 }
 
 type PendingRequest = {
@@ -91,7 +93,8 @@ function defaultSessionDir(): string {
 }
 
 export class PiRpcClient {
-  readonly #options: Required<Omit<PiRpcClientOptions, "extraArgs">> & { extraArgs: string[] };
+  readonly #options: Required<Omit<PiRpcClientOptions, "extraArgs" | "logger">> & { extraArgs: string[] };
+  readonly #logger: Logger;
   #process: ChildProcessWithoutNullStreams | null = null;
   #stderr = "";
   #requestId = 0;
@@ -111,6 +114,7 @@ export class PiRpcClient {
       bin: options.bin ?? "pi",
       extraArgs: options.extraArgs ?? [],
     };
+    this.#logger = options.logger ?? createLogger("pi-rpc");
   }
 
   onEvent(listener: (event: PiRpcEvent) => void): () => void {
@@ -289,7 +293,7 @@ export class PiRpcClient {
     try {
       payload = JSON.parse(line) as PiRpcResponse | PiRpcEvent;
     } catch (error) {
-      console.error("[pi-rpc] failed to parse line:", error);
+      this.#logger.error("failed to parse line:", error);
       return;
     }
 

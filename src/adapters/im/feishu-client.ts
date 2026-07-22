@@ -1,4 +1,5 @@
 import * as Lark from "@larksuiteoapi/node-sdk";
+import { createLogger, type Logger } from "../../core/logger";
 import type { FeishuClientConfig, FeishuInboundMessage } from "../../types";
 
 const DEDUP_TTL_MS = 12 * 60 * 60 * 1000;
@@ -48,11 +49,7 @@ function replaceMentionKeys(text: string, mentions: FeishuMention[] = []): strin
   return result.trim();
 }
 
-function parseTextContent(
-  rawContent: string,
-  messageType: string,
-  mentions: FeishuMention[] = [],
-): string {
+function parseTextContent(rawContent: string, messageType: string, mentions: FeishuMention[] = []): string {
   const parsed = parseJson(rawContent) as
     | string
     | {
@@ -64,14 +61,14 @@ function parseTextContent(
 
   switch (messageType) {
     case "text": {
-      const text = typeof parsed === "string" ? parsed : parsed?.text ?? "";
+      const text = typeof parsed === "string" ? parsed : (parsed?.text ?? "");
       return replaceMentionKeys(text, mentions);
     }
 
     case "post": {
       const locale =
         typeof parsed === "object" && parsed !== null
-          ? parsed.zh_cn ?? parsed.en_us ?? parsed.ja_jp
+          ? (parsed.zh_cn ?? parsed.en_us ?? parsed.ja_jp)
           : undefined;
       const parts: string[] = [];
       if (locale?.title) parts.push(locale.title);
@@ -94,14 +91,16 @@ function parseTextContent(
 
 export class FeishuClient {
   readonly #config: FeishuClientConfig;
+  readonly #logger: Logger;
   readonly #client: Lark.Client;
   #wsClient: Lark.WSClient | null = null;
   #onMessage: ((message: FeishuInboundMessage) => Promise<void> | void) | null = null;
   #dedup = new Map<string, number>();
   #dedupTimer: NodeJS.Timeout | null = null;
 
-  constructor(config: FeishuClientConfig) {
+  constructor(config: FeishuClientConfig, logger: Logger = createLogger("feishu")) {
     this.#config = config;
+    this.#logger = logger;
     const domain = config.domain === "lark" ? Lark.Domain.Lark : Lark.Domain.Feishu;
 
     this.#client = new Lark.Client({
@@ -134,22 +133,21 @@ export class FeishuClient {
     this.#wsClient = new Lark.WSClient({
       appId: this.#config.appId,
       appSecret: this.#config.appSecret,
-      appType: Lark.AppType.SelfBuild,
       domain,
-      loggerLevel: Lark.LoggerLevel.info,
+      loggerLevel: Lark.LoggerLevel.warn,
       autoReconnect: true,
       onReady: () => {
-        console.log("[feishu] websocket ready");
+        this.#logger.info("websocket ready");
       },
       onError: (error: unknown) => {
         const message = error instanceof Error ? error.message : String(error);
-        console.error("[feishu] websocket error:", message);
+        this.#logger.error("websocket error:", message);
       },
       onReconnecting: () => {
-        console.log("[feishu] websocket reconnecting");
+        this.#logger.info("websocket reconnecting");
       },
       onReconnected: () => {
-        console.log("[feishu] websocket reconnected");
+        this.#logger.info("websocket reconnected");
       },
     });
 
@@ -201,7 +199,13 @@ export class FeishuClient {
       return;
     }
 
-    if (!message.content || !message.message_type || !message.chat_id || !message.chat_type || !message.message_id) {
+    if (
+      !message.content ||
+      !message.message_type ||
+      !message.chat_id ||
+      !message.chat_type ||
+      !message.message_id
+    ) {
       return;
     }
 
