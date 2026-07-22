@@ -238,6 +238,7 @@ export class GatewayCore {
         type: "assistant.message",
         clientSessionId,
         text: event.text,
+        attachments: event.attachments,
       });
       return;
     }

@@ -198,10 +198,20 @@ export class FeishuIMAdapter implements IMAdapter {
           }
 
           const replyToMessageId = this.#lastInboundMessageIdBySession.get(event.clientSessionId);
-          const chunks = chunkText(event.text, MAX_TEXT_CHUNK);
           this.#logger.info(`sending reply (session=${event.clientSessionId})`);
-          for (const [index, chunk] of chunks.entries()) {
-            await this.#client.sendText(target.chatId, chunk, index === 0 ? replyToMessageId : undefined);
+          if (event.text.trim().length > 0) {
+            const chunks = chunkText(event.text, MAX_TEXT_CHUNK);
+            for (const [index, chunk] of chunks.entries()) {
+              await this.#client.sendText(target.chatId, chunk, index === 0 ? replyToMessageId : undefined);
+            }
+          }
+          for (const attachment of event.attachments ?? []) {
+            try {
+              await this.#client.sendAttachment(target.chatId, attachment, replyToMessageId);
+            } catch (attachmentError) {
+              this.#logger.error("failed to send attachment:", attachmentError);
+              await this.#notifySendFailure(target.chatId, attachmentError);
+            }
           }
           await this.#client.stopTyping(target.chatId);
           this.#logger.debug(`reply sent (session=${event.clientSessionId})`);

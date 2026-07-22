@@ -4,6 +4,7 @@ import os from "node:os";
 import path from "node:path";
 import { StringDecoder } from "node:string_decoder";
 import { createLogger, type Logger } from "../../../../core/logger";
+import { resolveMediaPromptExtensionPath } from "./pi-extension-path";
 
 export type PiRpcCommand =
   | { id?: string; type: "prompt"; message: string }
@@ -47,10 +48,7 @@ function serializeJsonLine(value: unknown): string {
   return `${JSON.stringify(value)}\n`;
 }
 
-function attachStrictJsonlReader(
-  stream: NodeJS.ReadableStream,
-  onLine: (line: string) => void,
-): () => void {
+function attachStrictJsonlReader(stream: NodeJS.ReadableStream, onLine: (line: string) => void): () => void {
   const decoder = new StringDecoder("utf8");
   let buffer = "";
 
@@ -144,6 +142,8 @@ export class PiRpcClient {
       this.#options.piSessionId,
       "--session-dir",
       this.#options.sessionDir,
+      "--extension",
+      resolveMediaPromptExtensionPath(),
       ...(this.#options.model ? ["--model", this.#options.model] : []),
       ...this.#options.extraArgs,
     ];
@@ -153,7 +153,9 @@ export class PiRpcClient {
       env: process.env,
       stdio: ["pipe", "pipe", "pipe"],
     });
-    this.#logger.info(`spawned pi process (pid=${child.pid} bin=${this.#options.bin} args=${args.join(" ")} cwd=${this.#options.cwd})`);
+    this.#logger.info(
+      `spawned pi process (pid=${child.pid} bin=${this.#options.bin} args=${args.join(" ")} cwd=${this.#options.cwd})`,
+    );
 
     this.#process = child;
     this.#started = true;
@@ -172,7 +174,9 @@ export class PiRpcClient {
     child.once("exit", (code, signal) => {
       const detail = signal ? `signal ${signal}` : `code ${String(code)}`;
       const stderr = this.#stderr.trim();
-      const message = stderr ? `pi RPC process exited (${detail}): ${stderr}` : `pi RPC process exited (${detail})`;
+      const message = stderr
+        ? `pi RPC process exited (${detail}): ${stderr}`
+        : `pi RPC process exited (${detail})`;
       this.#handleExitError(new Error(message));
     });
 
@@ -296,7 +300,9 @@ export class PiRpcClient {
     }).then((response) => {
       this.#logger.debug(`received response (id=${id} type=${command.type} success=${response.success})`);
       if (!response.success) {
-        this.#logger.error(`pi RPC command failed (id=${id} type=${response.command}): ${response.error ?? "unknown error"}`);
+        this.#logger.error(
+          `pi RPC command failed (id=${id} type=${response.command}): ${response.error ?? "unknown error"}`,
+        );
         throw new Error(response.error ?? `pi RPC command failed: ${response.command}`);
       }
       return response;

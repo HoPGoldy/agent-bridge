@@ -1,5 +1,6 @@
-import type { AgentAdapter, AgentInputEvent, AgentOutputEvent } from "../../../../types";
+import type { AgentAdapter, AgentInputEvent, AgentOutputEvent, OutboundAttachment } from "../../../../types";
 import { createLogger, type Logger } from "../../../../core/logger";
+import { extractMediaMarkers } from "../media-marker";
 import { PiRpcClient } from "./pi-rpc-client";
 import { toPiSessionId } from "./pi-session-id";
 
@@ -130,11 +131,12 @@ export class PiCodingAgentAdapter implements AgentAdapter {
         });
         await this.#client.prompt(event.text);
         await this.#client.waitForSettled();
-        const text = await this.#client.getLastAssistantText();
+        const rawText = await this.#client.getLastAssistantText();
+        const { text, attachments } = extractMediaMarkers(rawText ?? "(pi returned no assistant text)");
         this.#logger.debug(
-          `prompt settled (session=${this.#agentSessionId} durationMs=${Date.now() - startedAt} replyLength=${text?.length ?? 0})`,
+          `prompt settled (session=${this.#agentSessionId} durationMs=${Date.now() - startedAt} replyLength=${text.length} attachments=${attachments.length})`,
         );
-        await this.#emitAssistant(text ?? "(pi returned no assistant text)");
+        await this.#emitAssistant(text, attachments);
         return;
       }
 
@@ -163,7 +165,7 @@ export class PiCodingAgentAdapter implements AgentAdapter {
     }
   }
 
-  async #emitAssistant(text: string): Promise<void> {
+  async #emitAssistant(text: string, attachments?: OutboundAttachment[]): Promise<void> {
     if (!this.#onOutput) {
       this.#logger.error(`dropped assistant output for stopped session ${this.#agentSessionId}`);
       return;
@@ -173,6 +175,7 @@ export class PiCodingAgentAdapter implements AgentAdapter {
       type: "assistant.message",
       agentSessionId: this.#agentSessionId,
       text,
+      attachments,
     });
   }
 

@@ -22,10 +22,18 @@ export type AgentInputEvent =
       type: "command.session.compact";
     };
 
+export interface OutboundAttachment {
+  kind: "image" | "file";
+  filePath: string;
+  fileName?: string;
+  caption?: string;
+}
+
 type AgentOutputPayload =
   | {
       type: "assistant.message";
       text: string;
+      attachments?: OutboundAttachment[];
     }
   | {
       type: "assistant.thinking";

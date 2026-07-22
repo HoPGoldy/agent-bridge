@@ -23,8 +23,12 @@
     }
   },
   "types": "./dist/index.d.ts",
+  "files": [
+    "dist"
+  ],
   "scripts": {
     "build": "tsup",
+    "prepublishOnly": "npm run build",
     "dev": "tsx bin/agent-bridge.ts",
     "test": "vitest run --passWithNoTests",
     "test:coverage": "vitest run --coverage",

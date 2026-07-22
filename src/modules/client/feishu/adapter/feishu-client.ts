@@ -1,6 +1,9 @@
 import * as Lark from "@larksuiteoapi/node-sdk";
+import { existsSync, mkdirSync, writeFileSync } from "node:fs";
+import { basename, join } from "node:path";
+import { tmpdir } from "node:os";
 import { createLogger, type Logger } from "../../../../core/logger";
-import type { FeishuClientConfig, FeishuInboundMessage } from "../../../../types";
+import type { FeishuClientConfig, FeishuInboundMessage, OutboundAttachment } from "../../../../types";
 
 const DEDUP_TTL_MS = 12 * 60 * 60 * 1000;
 const DEDUP_MAX_ENTRIES = 5000;
@@ -19,19 +22,19 @@ type LarkClientLike = {
       create(args: unknown): Promise<{ data?: { reaction_id?: string | null } }>;
       delete(args: unknown): Promise<unknown>;
     };
+    messageResource: {
+      get(args: unknown): Promise<{
+        writeFile?: (path: string) => Promise<void>;
+        getReadableStream?: () => AsyncIterable<Buffer>;
+      } | null>;
+    };
   };
 };
 
 type LarkChannelLike = {
   connect(): Promise<void>;
   disconnect(): Promise<void>;
-  send(
-    to: string,
-    input: { text: string },
-    opts?: {
-      replyTo?: string;
-    },
-  ): Promise<unknown>;
+  send(to: string, input: Lark.SendInput, opts?: Lark.SendOptions): Promise<Lark.SendResult>;
   on(name: "message", handler: (message: Lark.NormalizedMessage) => void | Promise<void>): () => void;
   on(
     name: "reject",
@@ -192,6 +195,69 @@ export class FeishuClient {
     });
   }
 
+  /** Download an inbound image/file/audio/video resource to a local temp path. */
+  async downloadResource(
+    messageId: string,
+    fileKey: string,
+    resourceType: string,
+    fileName?: string,
+  ): Promise<string | null> {
+    try {
+      const resp = await this.#client.im.messageResource.get({
+        path: { message_id: messageId, file_key: fileKey },
+        params: { type: resourceType },
+      });
+      if (!resp) return null;
+
+      const ext = resourceType === "image" ? ".png" : resourceType === "audio" ? ".ogg" : "";
+      const safeName =
+        fileName && fileName.length > 0 ? fileName.replace(/[^a-zA-Z0-9._-]/g, "_") : `${fileKey}${ext}`;
+      const dir = join(tmpdir(), "agent-bridge-feishu-media");
+      if (!existsSync(dir)) {
+        mkdirSync(dir, { recursive: true });
+      }
+      const localPath = join(dir, `${Date.now()}-${safeName}`);
+
+      if (typeof resp.writeFile === "function") {
+        await resp.writeFile(localPath);
+        return localPath;
+      }
+
+      if (typeof resp.getReadableStream === "function") {
+        const chunks: Buffer[] = [];
+        for await (const chunk of resp.getReadableStream()) {
+          chunks.push(Buffer.from(chunk));
+        }
+        writeFileSync(localPath, Buffer.concat(chunks));
+        return localPath;
+      }
+
+      this.#logger.warn(`resource response had neither writeFile nor getReadableStream (fileKey=${fileKey})`);
+      return null;
+    } catch (error) {
+      this.#logger.error(`failed to download resource (fileKey=${fileKey}):`, error);
+      return null;
+    }
+  }
+
+  /** Upload and send a local image/file as a native Feishu attachment. */
+  async sendAttachment(
+    chatId: string,
+    attachment: OutboundAttachment,
+    replyToMessageId?: string,
+  ): Promise<void> {
+    const input: Lark.SendInput =
+      attachment.kind === "image"
+        ? { image: { source: attachment.filePath } }
+        : {
+            file: {
+              source: attachment.filePath,
+              fileName: attachment.fileName ?? basename(attachment.filePath),
+            },
+          };
+    await this.#channel.send(chatId, input, replyToMessageId ? { replyTo: replyToMessageId } : undefined);
+  }
+
   async #sendInteractive(
     chatId: string,
     content: string,
@@ -285,16 +351,30 @@ export class FeishuClient {
   }
 
   async #handleMessage(message: Lark.NormalizedMessage): Promise<void> {
-    if (!message.content) {
-      this.#logger.debug(`dropping message with no text content (messageId=${message.messageId})`);
+    if (!message.content && message.resources.length === 0) {
+      this.#logger.debug(`dropping message with no content or resources (messageId=${message.messageId})`);
       return;
+    }
+
+    let text = message.content ?? "";
+    for (const resource of message.resources) {
+      if (resource.type === "sticker") continue;
+      const localPath = await this.downloadResource(
+        message.messageId,
+        resource.fileKey,
+        resource.type,
+        resource.fileName,
+      );
+      if (localPath) {
+        text += `\n[Received ${resource.type}: ${localPath}]`;
+      }
     }
 
     await this.#onMessage?.({
       chatId: message.chatId,
       chatType: message.chatType,
       messageId: message.messageId,
-      text: message.content,
+      text,
       mentionedBot: message.mentionedBot,
       raw: message.raw,
     });
