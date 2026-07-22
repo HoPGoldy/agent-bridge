@@ -9,6 +9,7 @@ export class PiRpcAgentAdapter implements AgentAdapter {
   readonly #cwd: string;
   readonly #sessionDir?: string;
   readonly #bin: string;
+  readonly #model?: string;
   readonly #extraArgs: string[];
   readonly #logger: Logger;
   #client: PiRpcClient | null = null;
@@ -21,6 +22,7 @@ export class PiRpcAgentAdapter implements AgentAdapter {
     cwd,
     sessionDir,
     bin,
+    model,
     extraArgs,
     logger,
   }: {
@@ -28,6 +30,7 @@ export class PiRpcAgentAdapter implements AgentAdapter {
     cwd?: string;
     sessionDir?: string;
     bin?: string;
+    model?: string;
     extraArgs?: string[];
     logger?: Logger;
   }) {
@@ -36,6 +39,7 @@ export class PiRpcAgentAdapter implements AgentAdapter {
     this.#cwd = cwd ?? process.cwd();
     this.#sessionDir = sessionDir;
     this.#bin = bin ?? "pi";
+    this.#model = model;
     this.#extraArgs = extraArgs ?? [];
     this.#logger = logger ?? createLogger("pi-rpc");
   }
@@ -48,6 +52,7 @@ export class PiRpcAgentAdapter implements AgentAdapter {
       cwd: this.#cwd,
       sessionDir: this.#sessionDir,
       bin: this.#bin,
+      model: this.#model,
       extraArgs: this.#extraArgs,
       logger: this.#logger,
     });

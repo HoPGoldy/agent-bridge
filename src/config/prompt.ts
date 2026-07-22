@@ -1,42 +1,44 @@
-import { stdin as input, stdout as output } from "node:process";
-import { createInterface } from "node:readline/promises";
+import { cancel, confirm as clackConfirm, isCancel, password, select as clackSelect, text } from "@clack/prompts";
 import type { ConfigCollectContext, ConfigInputOptions, ConfigSelectOption } from "../types";
 
 function normalize(value: unknown): string {
   return value == null ? "" : String(value).trim();
 }
 
-export function createPromptContext(): ConfigCollectContext {
-  const rl = createInterface({ input, output });
+function throwIfCancelled<T>(value: T | symbol): asserts value is T {
+  if (isCancel(value)) {
+    cancel("Setup cancelled.");
+    throw new Error("Setup cancelled");
+  }
+}
 
+export function createPromptContext(): ConfigCollectContext {
   return {
     async input(label: string, opts: ConfigInputOptions = {}) {
       const { defaultValue, required = false, secret = false, validate } = opts;
 
-      while (true) {
-        const suffix = defaultValue ? ` (${defaultValue})` : "";
-        const raw = await rl.question(`${label}${suffix}: `);
+      const validateInput = (raw: unknown): string | undefined => {
         const value = normalize(raw) || normalize(defaultValue);
-
         if (required && !value) {
-          output.write("This field is required.\n");
-          continue;
+          return "This field is required.";
         }
-
         if (validate) {
-          const message = validate(value);
-          if (message) {
-            output.write(`${message}\n`);
-            continue;
-          }
+          return validate(value) ?? undefined;
         }
+        return undefined;
+      };
 
-        if (secret && value) {
-          output.write("(secret captured)\n");
-        }
+      const raw = secret
+        ? await password({ message: label, validate: validateInput })
+        : await text({
+            message: label,
+            defaultValue: defaultValue || undefined,
+            placeholder: defaultValue,
+            validate: validateInput,
+          });
+      throwIfCancelled(raw);
 
-        return value;
-      }
+      return normalize(raw) || normalize(defaultValue);
     },
 
     async select(label: string, options: ConfigSelectOption[]) {
@@ -44,34 +46,24 @@ export function createPromptContext(): ConfigCollectContext {
         throw new Error("select() requires at least one option");
       }
 
-      output.write(`${label}\n`);
-      options.forEach((option, index) => {
-        output.write(`  ${index + 1}. ${option.label}\n`);
+      const value = await clackSelect<string>({
+        message: label,
+        options: options.map((option) => ({ value: option.value, label: option.label })),
       });
+      throwIfCancelled(value);
 
-      while (true) {
-        const raw = await rl.question("Select an option by number: ");
-        const index = Number.parseInt(raw, 10);
-        if (Number.isInteger(index) && index >= 1 && index <= options.length) {
-          return options[index - 1]!.value;
-        }
-        output.write("Invalid selection.\n");
-      }
+      return value;
     },
 
     async confirm(label: string, defaultValue = false) {
-      const defaultHint = defaultValue ? "Y/n" : "y/N";
-      while (true) {
-        const raw = normalize(await rl.question(`${label} (${defaultHint}): `)).toLowerCase();
-        if (!raw) return defaultValue;
-        if (["y", "yes"].includes(raw)) return true;
-        if (["n", "no"].includes(raw)) return false;
-        output.write("Please answer yes or no.\n");
-      }
+      const value = await clackConfirm({ message: label, initialValue: defaultValue });
+      throwIfCancelled(value);
+
+      return value;
     },
 
     close() {
-      rl.close();
+      // @clack/prompts manages the terminal per prompt; nothing to release.
     },
   };
 }

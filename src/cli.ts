@@ -15,9 +15,6 @@ async function selectModuleType<T extends { type: string }>(
   if (modules.length === 0) {
     throw new Error(`No modules available for ${label}`);
   }
-  if (modules.length === 1) {
-    return modules[0]!.type;
-  }
   return ctx.select(
     label,
     modules.map((module) => ({

@@ -33,6 +33,7 @@ export interface PiRpcClientOptions {
   cwd?: string;
   sessionDir?: string;
   bin?: string;
+  model?: string;
   extraArgs?: string[];
   logger?: Logger;
 }
@@ -93,7 +94,10 @@ function defaultSessionDir(): string {
 }
 
 export class PiRpcClient {
-  readonly #options: Required<Omit<PiRpcClientOptions, "extraArgs" | "logger">> & { extraArgs: string[] };
+  readonly #options: Required<Omit<PiRpcClientOptions, "model" | "extraArgs" | "logger">> & {
+    model?: string;
+    extraArgs: string[];
+  };
   readonly #logger: Logger;
   #process: ChildProcessWithoutNullStreams | null = null;
   #stderr = "";
@@ -113,6 +117,7 @@ export class PiRpcClient {
       cwd: options.cwd ?? process.cwd(),
       sessionDir: options.sessionDir ?? defaultSessionDir(),
       bin: options.bin ?? "pi",
+      model: options.model,
       extraArgs: options.extraArgs ?? [],
     };
     this.#logger = options.logger ?? createLogger("pi-rpc");
@@ -139,6 +144,7 @@ export class PiRpcClient {
       this.#options.piSessionId,
       "--session-dir",
       this.#options.sessionDir,
+      ...(this.#options.model ? ["--model", this.#options.model] : []),
       ...this.#options.extraArgs,
     ];
 

@@ -101,6 +101,7 @@ export interface FeishuClientConfig {
 export interface PiRpcAgentConfig {
   bin?: string;
   sessionDir?: string;
+  model?: string;
   extraArgs?: string[];
 }
 
