@@ -6,9 +6,9 @@ The design stays intentionally simple and compact: no harness layer, no extra to
 
 ## Current support
 
-Client side: FeiShu.
+Client side: `FeiShu`.
 
-Agent side: PI Coding Agent.
+Agent side: `PI Coding Agent`.
 
 The current built-in support is intentionally small, but the architecture is designed for straightforward horizontal extension. The project will primarily maintain the integrations used in practice today, and contributions for additional client or agent adapters are welcome through forks and PRs.
 
