@@ -1,6 +1,6 @@
 {
   "name": "agent-bridge",
-  "version": "0.1.0",
+  "version": "0.1.1",
   "private": true,
   "description": "IM to Pi bridge with dual-adapter architecture",
   "keywords": [
