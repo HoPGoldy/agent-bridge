@@ -11,8 +11,8 @@ export class PiRpcAgentAdapter implements AgentAdapter {
   readonly #extraArgs: string[];
   #client: PiRpcClient | null = null;
   #onOutput: ((event: AgentOutputEvent) => Promise<void> | void) | null = null;
-  #busy = false;
-  #lastActiveAt = Date.now();
+  #inputQueue: AgentInputEvent[] = [];
+  #processing = false;
 
   constructor({
     agentSessionId,
@@ -55,8 +55,10 @@ export class PiRpcAgentAdapter implements AgentAdapter {
   }
 
   async stop(): Promise<void> {
+    this.#inputQueue.length = 0;
     await this.#client?.stop();
     this.#client = null;
+    this.#processing = false;
     this.#onOutput = null;
     console.log(`[pi-rpc] session ${this.#agentSessionId} stopped`);
   }
@@ -70,19 +72,42 @@ export class PiRpcAgentAdapter implements AgentAdapter {
       throw new Error("PiRpcAgentAdapter is not started");
     }
 
-    this.#busy = true;
-    this.#lastActiveAt = Date.now();
+    this.#inputQueue.push(event);
+    void this.#drainInputQueue();
+  }
+
+  async isBusy(): Promise<boolean> {
+    return this.#processing || this.#inputQueue.length > 0;
+  }
+
+  async #drainInputQueue(): Promise<void> {
+    if (this.#processing) {
+      return;
+    }
+
+    this.#processing = true;
+    try {
+      while (this.#client && this.#onOutput && this.#inputQueue.length > 0) {
+        const event = this.#inputQueue.shift();
+        if (!event) continue;
+        await this.#processEvent(event);
+      }
+    } finally {
+      this.#processing = false;
+    }
+  }
+
+  async #processEvent(event: AgentInputEvent): Promise<void> {
+    if (!this.#client) {
+      throw new Error("PiRpcAgentAdapter is not started");
+    }
+
     try {
       if (event.type === "user.message") {
         await this.#client.prompt(event.text);
         await this.#client.waitForSettled();
         const text = await this.#client.getLastAssistantText();
-
-        await this.#onOutput({
-          type: "assistant.message",
-          agentSessionId: this.#agentSessionId,
-          text: text ?? "(pi returned no assistant text)",
-        });
+        await this.#emitAssistant(text ?? "(pi returned no assistant text)");
         return;
       }
 
@@ -91,29 +116,23 @@ export class PiRpcAgentAdapter implements AgentAdapter {
         typeof result.estimatedTokensAfter === "number"
           ? ` Estimated tokens after: ${result.estimatedTokensAfter}.`
           : "";
-      await this.#onOutput({
-        type: "assistant.message",
-        agentSessionId: this.#agentSessionId,
-        text: `Context compacted.${suffix}`,
-      });
+      await this.#emitAssistant(`Context compacted.${suffix}`);
     } catch (error) {
       const message = error instanceof Error ? error.message : String(error);
-      await this.#onOutput({
-        type: "assistant.message",
-        agentSessionId: this.#agentSessionId,
-        text: `[pi-rpc error] ${message}`,
-      });
-    } finally {
-      this.#busy = false;
-      this.#lastActiveAt = Date.now();
+      await this.#emitAssistant(`[pi-rpc error] ${message}`);
     }
   }
 
-  async isBusy(): Promise<boolean> {
-    return this.#busy;
-  }
+  async #emitAssistant(text: string): Promise<void> {
+    if (!this.#onOutput) {
+      console.error(`[pi-rpc] dropped assistant output for stopped session ${this.#agentSessionId}`);
+      return;
+    }
 
-  getLastActiveAt(): number {
-    return this.#lastActiveAt;
+    await this.#onOutput({
+      type: "assistant.message",
+      agentSessionId: this.#agentSessionId,
+      text,
+    });
   }
 }

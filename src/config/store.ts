@@ -27,8 +27,7 @@ function mergeDefaults(config: RawAppConfig = {}): AppConfig {
   return {
     channels,
     defaults: {
-      ...DEFAULTS,
-      ...(config.defaults ?? {}),
+      agentIdleTimeoutMs: config.defaults?.agentIdleTimeoutMs ?? DEFAULTS.agentIdleTimeoutMs,
     },
   };
 }

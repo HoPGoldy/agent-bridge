@@ -33,9 +33,9 @@ This project now follows the same general engineering pattern as `review-pilot`:
 - Current client egress event:
   - `assistant.message`
 - Queue model:
-  - client ingress FIFO by `clientSessionId`
-  - one agent input queue per `AgentAdapter` instance / `agentSessionId`
-  - client egress FIFO
+  - queueing is adapter-owned, not Core-owned
+  - client adapters may batch/merge/update according to platform behavior
+  - each `AgentAdapter` instance may keep its own per-session input queue
 - Feishu IM adapter: minimal WebSocket long-connection implementation using official Lark SDK
 - Pi agent adapter: subprocess integration via `pi --mode rpc`
 
@@ -69,13 +69,16 @@ npm run dev -- --help
         "config": {}
       }
     }
+  },
+  "defaults": {
+    "agentIdleTimeoutMs": 600000
   }
 }
 ```
 
 - Feishu receive/send text path is implemented, including exact-text slash commands `/new` and `/compact`.
 - `PiRpcAgentAdapter` now spawns a real Pi RPC subprocess per session and emits a single final `assistant.message` for each input turn.
-- Core keeps explicit `clientSessionId <-> agentSessionId` bindings and drops late output from stale agent sessions after `/new`.
+- Core keeps explicit `clientSessionId <-> agentSessionId` bindings, routes events directly, and drops late output from stale agent sessions after `/new`.
 - Pi sessions are persisted by exact `--session-id` under the bridge-owned session directory, so adapter recreation can resume the same conversation.
 - Optional runtime overrides:
   - `PI_BIN` (default: `pi`)

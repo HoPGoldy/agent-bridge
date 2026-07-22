@@ -13,8 +13,6 @@ export async function runChannel({ channelName, channelConfig, defaults }: RunCh
     imAdapter,
     agentModule,
     agentConfig: channelConfig.agent.config,
-    pollIntervalMs: defaults.pollIntervalMs,
-    maxQueueSize: defaults.maxQueueSize,
     agentIdleTimeoutMs: defaults.agentIdleTimeoutMs,
   });
 

@@ -5,8 +5,9 @@ import { buildFeishuSessionId, parseFeishuSessionId } from "./feishu-session";
 export class FeishuIMAdapter implements IMAdapter {
   readonly #config: FeishuClientConfig;
   #onOutput: ((event: ClientIngressEvent) => Promise<void> | void) | null = null;
-  #busy = false;
   #client: FeishuClient | null = null;
+  #egressQueue: ClientEgressEvent[] = [];
+  #processing = false;
 
   constructor(config: FeishuClientConfig) {
     this.#config = config;
@@ -49,10 +50,12 @@ export class FeishuIMAdapter implements IMAdapter {
   }
 
   async stop(): Promise<void> {
+    this.#egressQueue.length = 0;
     if (this.#client) {
       await this.#client.disconnect();
       this.#client = null;
     }
+    this.#processing = false;
     this.#onOutput = null;
     console.log("[feishu] adapter stopped");
   }
@@ -62,16 +65,34 @@ export class FeishuIMAdapter implements IMAdapter {
       throw new Error("FeishuIMAdapter is not started");
     }
 
-    this.#busy = true;
-    try {
-      const target = parseFeishuSessionId(event.clientSessionId);
-      await this.#client.sendText(target.chatId, event.text);
-    } finally {
-      this.#busy = false;
-    }
+    this.#egressQueue.push(event);
+    void this.#drainEgressQueue();
   }
 
   async isBusy(): Promise<boolean> {
-    return this.#busy;
+    return this.#processing || this.#egressQueue.length > 0;
+  }
+
+  async #drainEgressQueue(): Promise<void> {
+    if (this.#processing) {
+      return;
+    }
+
+    this.#processing = true;
+    try {
+      while (this.#client && this.#egressQueue.length > 0) {
+        const event = this.#egressQueue.shift();
+        if (!event) continue;
+
+        try {
+          const target = parseFeishuSessionId(event.clientSessionId);
+          await this.#client.sendText(target.chatId, event.text);
+        } catch (error) {
+          console.error("[feishu] failed to send egress event:", error);
+        }
+      }
+    } finally {
+      this.#processing = false;
+    }
   }
 }

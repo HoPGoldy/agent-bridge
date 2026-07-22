@@ -123,8 +123,6 @@ describe("GatewayCore", () => {
       imAdapter,
       agentModule,
       agentConfig: {},
-      pollIntervalMs: 5,
-      maxQueueSize: 10,
       agentIdleTimeoutMs: 60_000,
     });
     running.push(core);
@@ -177,8 +175,6 @@ describe("GatewayCore", () => {
       imAdapter,
       agentModule,
       agentConfig: {},
-      pollIntervalMs: 5,
-      maxQueueSize: 10,
       agentIdleTimeoutMs: 60_000,
     });
     running.push(core);

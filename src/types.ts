@@ -120,8 +120,6 @@ export interface ChannelConfig {
 }
 
 export interface AppDefaults {
-  pollIntervalMs: number;
-  maxQueueSize: number;
   agentIdleTimeoutMs: number;
 }
 
@@ -138,8 +136,6 @@ export interface GatewayCoreOptions {
   imAdapter: IMAdapter;
   agentModule: AgentModule<any>;
   agentConfig: AgentConfig["config"];
-  pollIntervalMs: number;
-  maxQueueSize: number;
   agentIdleTimeoutMs: number;
 }
 
