@@ -2,498 +2,202 @@
 
 ## 目标
 
-为新的 IM ↔ Agent 架构定义一套**双向 Adapter 接口**。
+为 `agent-bridge` 定义一套清晰的 **Client ↔ Core ↔ Agent** 双侧适配架构。
 
-当前约束：
+当前范围：
 
-- **IM 侧先只做 Feishu**
-- **Agent 侧先只做 Pi**
-- Core 尽量保持薄，只负责：
-  - 转发
-  - 会话路由
-  - 队列 / 缓冲
+- Client side v1: **Feishu**
+- Agent side v1: **Pi RPC**
+- 一个 channel = 一个 client side + 一个 agent side
+
+核心原则：
+
+- Core 尽量保持薄
+- Core 负责：
+  - 会话绑定
   - 生命周期管理
-- Core **不负责**：
-  - IM 平台展示策略
-  - 什么时候调用哪个平台 API
-  - agent 输出如何渲染成消息 / 卡片 / 进度条
+  - 事件转发
+  - `/new` / `/compact` 这类控制语义
+- Core 不负责：
+  - IM 展示策略
+  - 平台 API 选择
+  - 队列合并/批处理/消息折叠
+  - agent 平台特定的会话创建细节
 
 ---
 
-## 关键设计原则
+## 总体架构
 
-### 1. 双向 Adapter
+```text
+Client Adapter -> Core -> Agent Adapter
+Agent Adapter  -> Core -> Client Adapter
+```
 
-采用对称结构：
+更准确地说：
 
-- **IM Adapter 的输出 = Agent Adapter 的输入**
-- **Agent Adapter 的输出 = IM Adapter 的输入**
+- ClientAdapter 产出的是 **ClientIngressEvent**
+- Core 路由后投递给 AgentAdapter 的是 **AgentInputEvent**
+- AgentAdapter 产出的是 **AgentOutputEvent**
+- Core 再反查并发给 ClientAdapter 的是 **ClientEgressEvent**
 
-也就是说，它们通过两套共享协议对接：
-
-- `AgentIngressEvent`
-- `AgentEgressEvent`
-
-Core 只负责在这两个协议之间做路由和调度。
-
----
-
-### 2. Core 不做表现层逻辑
-
-以下逻辑不应该固化在 Core：
-
-- 一条 agent 输出应该发成普通文本还是富文本卡片
-- 应该调用 send 还是 update / edit
-- 是否显示 typing
-- slash command 的结果如何在 Feishu 里渲染
-- 同样一条 agent 事件，在两个 Feishu adapter 里展示成不同样式
-
-这些都应该放在 **IM Adapter** 里完成。
-
-同理，IM 输入如何解释成 agent 协议，也应该放在 **IM Adapter** 里：
-
-- 飞书按钮点击是否转成 approval / interaction
-- 某种 message callback 是否翻译成 session control
-- 某条消息是普通文本还是 command
+这四套边界事件语义不同，不再共用同一个 `sessionId` 字段。
 
 ---
 
-### 3. 不做泛型父接口抽象
+## 命名规则
 
-虽然 IM Adapter 和 Agent Adapter 目前都长得很像：
+后续设计里不再使用模糊的 `sessionId` 命名。
+
+统一显式命名为：
+
+- `clientSessionId`
+- `agentSessionId`
+
+原因：
+
+- client 侧的会话标识由 client adapter 决定
+- agent 侧的会话标识由 agent module / agent runtime 决定
+- 两者不是同一命名空间，不能再用一个同名字段假装对称
+
+---
+
+## 运行时接口
+
+## IMAdapter
+
+```ts
+interface IMAdapter {
+  start(onOutput: (event: ClientIngressEvent) => Promise<void> | void): Promise<void>;
+  stop(): Promise<void>;
+  input(event: ClientEgressEvent): Promise<void>;
+  isBusy(): Promise<boolean>;
+}
+```
+
+语义：
+
+- `start(onOutput)`
+  - 启动 client 连接
+  - 收到外部输入后转成 `ClientIngressEvent`
+  - 通过 `onOutput(event)` 发给 Core
+- `input(event)`
+  - 接收来自 Core 的 client 输出事件
+  - 是否立即发送、是否编辑、是否合并、是否折叠，都由 adapter 自己决定
+- `input()` 返回只表示：
+  - adapter 已接收并纳入自己的内部处理流程
+  - **不表示整个消息已经真正发出**
+
+## AgentAdapter
+
+```ts
+interface AgentAdapter {
+  start(onOutput: (event: AgentOutputEvent) => Promise<void> | void): Promise<void>;
+  stop(): Promise<void>;
+  abort?(): Promise<void>;
+  input(event: AgentInputEvent): Promise<void>;
+  isBusy(): Promise<boolean>;
+}
+```
+
+语义：
+
+- 一个 `AgentAdapter` 实例只绑定一个 `agentSessionId`
+- `input(event)` 返回只表示：
+  - adapter 已接收该事件并纳入自己的内部处理流程
+- `abort()` 是可选能力
+  - 主要用于 `/new` 之类的强控制操作
+- `stop()` 停止该 session 对应的 runtime，并清理该实例内部状态
+
+---
+
+## 为什么不抽泛型父接口
+
+虽然 `IMAdapter` 和 `AgentAdapter` 当前都长得像：
 
 - `start()`
 - `stop()`
 - `input()`
 - `isBusy()`
 
-但**不建议先抽一个泛型 `DuplexAdapter<TInput, TOutput>` 父接口**。
+但当前仍然不建议抽一个统一的 `DuplexAdapter<TInput, TOutput>`：
 
-原因：
+- 两侧未来职责未必持续对称
+- Agent 侧已经出现了 `abort?()` 这类特有能力
+- Client 侧未来也可能出现自己的专属 API
+- 过早抽象会限制演进
 
-- 现在相似，不代表以后职责相同
-- 两者未来可能长出各自独有 API
-- 过早抽象会限制演化
+因此仍保留：
 
-因此更推荐：
+- `IMAdapter`
+- `AgentAdapter`
 
-- **直接写两个独立接口**
-- 形状相似即可
-- 不强制通过继承 / 泛型统一
-
----
-
-### 4. `isBusy()` 保持简单布尔语义
-
-当前架构前提：
-
-> **每一个 AgentAdapter 实例只绑定一个 session**
-
-因此，`AgentAdapter.isBusy()` 不需要区分：
-
-- global
-- session-scoped
-- channel-scoped
-
-它只需要回答：
-
-> 这个 adapter 现在是否忙。
-
-同样，`IMAdapter.isBusy()` 也可以保持简单语义：
-
-> 我现在是否适合继续消费下一个 `AgentEgressEvent`。
-
-所以当前阶段不引入 `scope` 概念。
+两个独立接口。
 
 ---
 
-## 最终接口草案
+## 模块层设计
 
-## 1. IM Adapter
+配置能力不并入运行时 adapter instance，而是并入模块层。
 
-```ts
-interface IMAdapter {
-  start(
-    onOutput: (event: AgentIngressEvent) => Promise<void> | void
-  ): Promise<void>;
-
-  stop(): Promise<void>;
-
-  input(event: AgentEgressEvent): Promise<void>;
-
-  isBusy(): Promise<boolean>;
-}
-```
-
-### 语义
-
-- `start(onOutput)`
-  - 启动 IM 连接
-  - 当 IM 收到输入后，将其转成 `AgentIngressEvent`
-  - 通过 `onOutput(event)` 向 Core 发出
-
-- `stop()`
-  - 停止 IM 连接，释放资源
-
-- `input(event)`
-  - 接收来自 Core 的 `AgentEgressEvent`
-  - 由 adapter 决定如何映射为 Feishu API 调用和展示效果
-
-- `isBusy()`
-  - 表示 IM adapter 当前是否繁忙，不适合立刻消费新的 output event
-
----
-
-## 2. Agent Adapter
-
-```ts
-interface AgentAdapter {
-  start(
-    onOutput: (event: AgentEgressEvent) => Promise<void> | void
-  ): Promise<void>;
-
-  stop(): Promise<void>;
-
-  input(event: AgentIngressEvent): Promise<void>;
-
-  isBusy(): Promise<boolean>;
-}
-```
-
-### 语义
-
-- `start(onOutput)`
-  - 启动 agent runtime / session
-  - 当 agent 产生输出时，将其转成 `AgentEgressEvent`
-  - 通过 `onOutput(event)` 发回 Core
-
-- `stop()`
-  - 停止该 agent runtime，释放资源
-
-- `input(event)`
-  - 接收来自 Core 的 `AgentIngressEvent`
-  - 推进 agent 会话
-
-- `isBusy()`
-  - 表示该 session 对应的 agent 是否正在忙
-
----
-
-## `input()` 的约定
-
-建议约定：
-
-> `input()` 表示“成功接收并开始处理这个事件”，而不是“整个处理流程已经完成”。
-
-也就是说：
-
-- `await adapter.input(event)` 只表示 adapter 已接住输入
-- 后续结果通过 `onOutput(...)` 异步持续返回
-
-这样与流式事件输出模型一致。
-
----
-
-## Core 的职责
-
-在当前设计下，Core 只负责：
-
-1. 接收 IM Adapter 发出的 `AgentIngressEvent`
-2. 根据 `sessionId` 找到 / 创建对应的 AgentAdapter
-3. 将 ingress event 转发给 AgentAdapter
-4. 接收 AgentAdapter 发出的 `AgentEgressEvent`
-5. 转发给 IMAdapter
-6. 通过 `isBusy()` + 队列处理缓冲与顺序
-7. 管理 adapter 生命周期
-
-Core **不负责**：
-
-- 决定如何发送 Feishu 消息
-- 决定是否编辑消息还是发新消息
-- 决定进度条/富文本/按钮样式
-- 决定 command 在平台上的最终呈现形式
-
----
-
-## 队列 / 缓冲策略
-
-当前讨论结论：
-
-- Core 可以维护自己的缓冲队列
-- 当某个 adapter `isBusy() === true` 时，暂缓向其发送下一个 event
-- 可通过轮询方式继续重试，例如：
-  1. 每隔固定时间轮询一次 `isBusy()`
-  2. 如果为 `true`，继续等待
-  3. 如果为 `false`，发送下一个 event
-
-### 当前前提
-
-- 1 个 IMAdapter
-- 多个 AgentAdapter
-- 每个 AgentAdapter 对应 1 个 session
-
-所以：
-
-- Agent 侧的 busy 判定天然是 session 级的
-- IM 侧的 busy 判定天然是单 adapter 级的
-
-> 备注：轮询间隔应作为可配置项，默认值后续再定（例如 300ms / 500ms / 1000ms）。
-
----
-
-## 当前阶段明确不做的事情
-
-- 不引入 `scope` 化的 `isBusy(scope)`
-- 不引入泛型父接口抽象
-- 不在 Core 中固化展示策略
-- 不在接口层区分 global/session/channel 级 busy 语义
-- 不把 IM 行为逻辑提前抽到 Core
-
----
-
-## 当前达成的共识
-
-1. **采用双向 Adapter 架构**
-2. **IM Adapter 与 Agent Adapter 是两个独立接口，不抽泛型父类**
-3. **两侧共享 ingress / egress 协议**
-4. **Core 只做转发、路由、队列、生命周期管理**
-5. **展示策略 / 平台 API 选择放在 IM Adapter 中**
-6. **每个 AgentAdapter 只绑定一个 session，因此 `isBusy()` 只需要简单布尔值**
-7. **Core 可以基于 `isBusy()` 做轮询和缓冲队列控制**
-
----
-
-## MVP 事件集合（已确认）
-
-当前确认采用**最小可用闭环**，只保留 2 个事件：
-
-### 1. AgentIngressEvent
-
-```ts
-type AgentIngressEvent = {
-  type: 'user.message';
-  sessionId: string; // 由 IMAdapter 生成
-  text: string;
-};
-```
-
-### 2. AgentEgressEvent
-
-```ts
-type AgentEgressEvent = {
-  type: 'assistant.message';
-  sessionId: string;
-  text: string;
-};
-```
-
-### 当前明确不进入 MVP 的内容
-
-先不进入协议：
-
-- `session.control`
-- streaming / delta
-- typing
-- progress / tool events
-- artifact / file / image
-- approval / interaction
-- read receipt
-- attachments
-
-这些都等最小链路跑通后再扩展。
-
----
-
-## 最新确认的 MVP 决策
-
-### sessionId 生成
-
-由 **IMAdapter 生成**。
-
-当前 Feishu 规则固定为：
-
-- 私聊：`feishu:dm:<chatId>`
-- 群聊：`feishu:group:<chatId>`
-
-说明：
-
-- 群聊天然共享一个 session
-- 如果用户不想和别人串上下文，应直接私聊 bot
-
-### 队列策略
-
-采用两条 FIFO 队列：
-
-1. **IM -> Agent**
-   - FIFO
-   - busy 时只排队，不丢弃
-
-2. **Agent -> IM**
-   - FIFO
-   - busy 时只排队，不丢弃
-
-### 轮询间隔
-
-- 默认 `500ms`
-- 作为配置项暴露
-
-### `input()` 语义
-
-`input()` 返回时，只表示：
-
-> 事件已被 adapter 接收并开始处理
-
-不表示整个流程已经完成。
-
-### AgentAdapter 生命周期
-
-- 每个 AgentAdapter 对应一个 session
-- 按需创建
-- 空闲超时后释放
-- 收到同一 `sessionId` 的后续消息时允许重建
-
-### 队列上限
-
-- 默认每条队列上限为 **10**
-
-### 输出策略
-
-- 一轮 agent 处理，最终只发一条 `assistant.message`
-- MVP 只做纯文本
-- 不做卡片、不做编辑、不做 typing
-
----
-
-## CLI 设计（MVP）
-
-命令行工具名称：
-
-```bash
-agent-bridge
-```
-
-### 命令集合
-
-#### 1. `agent-bridge add`
-
-交互式创建一个渠道配置。
-
-行为：
-
-- 选择 IM adapter 类型（当前只支持 `feishu`）
-- 输入 channel 名称
-- 调用对应 adapter 的配置交互逻辑，填写必要配置
-- 将结果写入本地配置文件
-
-#### 2. `agent-bridge ls`
-
-列出所有已创建的渠道配置。
-
-#### 3. `agent-bridge remove <channel-name>`
-
-删除指定渠道配置。
-
-#### 4. `agent-bridge start <channel-name>`
-
-启动指定渠道。
-
-说明：
-
-- 前台运行
-- 一个启动实例只包含：
-  - 一个 Core
-  - 一个 IMAdapter
-  - 多个 AgentAdapter
-- 用户 `Ctrl+C` 即停止该实例
-
----
-
-## 配置文件位置
-
-固定为：
-
-```text
-~/.config/agent-bridge/config.json
-```
-
----
-
-## 配置文件结构（当前草案）
-
-```json
-{
-  "channels": {
-    "my-feishu": {
-      "type": "feishu",
-      "appId": "cli_xxx",
-      "appSecret": "xxx"
-    }
-  },
-  "defaults": {
-    "pollIntervalMs": 500,
-    "maxQueueSize": 10,
-    "agentIdleTimeoutMs": 600000
-  }
-}
-```
-
-说明：
-
-- `add`：向 `channels` 增加条目
-- `ls`：读取 `channels`
-- `remove`：删除 `channels[name]`
-- `start <name>`：读取 `channels[name]` 并启动
-
----
-
-## ConfigAdapter 概念
-
-除了 IMAdapter 和 AgentAdapter 之外，补充一个 **ConfigAdapter** 概念。
-
-### 作用
-
-用于 `agent-bridge add` 阶段，负责：
-
-- 根据 adapter 类型交互式采集必要配置
-- 输出可持久化的配置对象
-- 对采集出的配置做最小校验
-- （可选）输出简短摘要供 `ls` 命令展示
-
-### 设计动机
-
-不同 IM adapter 所需配置不同：
-
-- Feishu 需要 `appId` / `appSecret`
-- 未来 Telegram / Slack / Discord 会有不同字段
-
-如果把这些交互式问题都固化在 CLI 主逻辑里，会导致 `add` 命令越来越重。
-
-因此引入：
-
-> **每种 IM adapter 自带自己的配置采集逻辑**
-
-这样 `agent-bridge add` 只负责：
-
-1. 选择 adapter 类型
-2. 调用对应 `ConfigAdapter`
-3. 获取配置对象
-4. 写入 `~/.config/agent-bridge/config.json`
-
-### 最小接口草案
+## ConfigAdapter
 
 ```ts
 interface ConfigAdapter<TConfig = unknown> {
-  readonly type: string;
-
   collect(ctx: ConfigCollectContext): Promise<TConfig>;
-
   validate(config: TConfig): Promise<void> | void;
-
   summarize?(config: TConfig): string;
 }
 ```
 
-### `ConfigCollectContext` 草案
+## ClientModule
+
+```ts
+interface ClientModule<TConfig = unknown> {
+  readonly type: string;
+  createConfigCollector?: () => ConfigAdapter<TConfig>;
+  createClientAdapter(config: TConfig): IMAdapter;
+}
+```
+
+## AgentModule
+
+```ts
+interface AgentModule<TConfig = unknown> {
+  readonly type: string;
+  createConfigCollector?: () => ConfigAdapter<TConfig>;
+
+  createAgentSession(args: { config: TConfig }): Promise<{
+    agentSessionId: string;
+    agentAdapter: AgentAdapter;
+  }>;
+
+  resumeAgentSession?(args: {
+    config: TConfig;
+    agentSessionId: string;
+  }): Promise<AgentAdapter>;
+}
+```
+
+### 设计说明
+
+- `createAgentSession()` 由 agent module 自己创建新会话
+- `agentSessionId` **由 agent module 决定并返回**
+- Core **不负责生成** `agentSessionId`
+
+原因：
+
+- 不同 agent 对 session id 的规则不同
+- 有的要求特定格式
+- 有的会做归一化
+- 有的甚至不支持由外部指定 session id
+
+所以：
+
+> Core 只保存和使用 `agentSessionId`，不生成它。
+
+---
+
+## ConfigCollectContext
 
 ```ts
 interface ConfigCollectContext {
@@ -513,29 +217,337 @@ interface ConfigCollectContext {
 }
 ```
 
-### 设计说明
+---
 
-- `collect()`：负责交互式提问并返回配置对象
-- `validate()`：负责最小合法性检查
-- `summarize()`：可选，用于 `ls` 输出摘要
-- 当前阶段不做 JSON Schema / 表单 DSL / 通用配置向导系统
-- 当前阶段不把 AgentAdapter 纳入 ConfigAdapter 体系
+## 配置结构
 
-### Feishu 的最小配置对象（MVP）
+一个 channel = 一个 client side + 一个 agent side。
 
-```ts
-interface FeishuChannelConfig {
-  type: 'feishu';
-  appId: string;
-  appSecret: string;
-  domain?: 'feishu' | 'lark';
+```json
+{
+  "channels": {
+    "my-feishu": {
+      "client": {
+        "type": "feishu",
+        "config": {
+          "appId": "cli_xxx",
+          "appSecret": "xxx",
+          "domain": "feishu"
+        }
+      },
+      "agent": {
+        "type": "pi-rpc",
+        "config": {}
+      }
+    }
+  },
+  "defaults": {
+    "agentIdleTimeoutMs": 600000
+  }
 }
 ```
 
-### 当前定位
+说明：
 
-MVP 阶段：
+- `pollIntervalMs` 已从 Core 配置中移除
+- `maxQueueSize` 已从 Core 配置中移除
+- 如果某个 adapter 需要这些能力，应由自己的 config / config collector 设计对应参数
 
-- 只需要 **FeishuConfigAdapter**
-- 先服务于 `add` 命令
-- AgentAdapter(Pi) 通过 RPC 连接，不纳入当前 `add` 的交互配置范围
+---
+
+## 事件模型
+
+## Client -> Core
+
+```ts
+type ClientIngressEvent =
+  | {
+      type: "user.message";
+      clientSessionId: string;
+      text: string;
+    }
+  | {
+      type: "command.session.new";
+      clientSessionId: string;
+    }
+  | {
+      type: "command.session.compact";
+      clientSessionId: string;
+    };
+```
+
+## Core -> Agent
+
+```ts
+type AgentInputEvent =
+  | {
+      type: "user.message";
+      text: string;
+    }
+  | {
+      type: "command.session.compact";
+    };
+```
+
+说明：
+
+- `command.session.new` 只在 Core 层处理
+- 不会下发到 AgentAdapter
+
+## Agent -> Core
+
+```ts
+type AgentOutputEvent = {
+  type: "assistant.message";
+  agentSessionId: string;
+  text: string;
+};
+```
+
+## Core -> Client
+
+```ts
+type ClientEgressEvent = {
+  type: "assistant.message";
+  clientSessionId: string;
+  text: string;
+};
+```
+
+---
+
+## Core 的职责
+
+Core 现在只负责：
+
+1. 接收 `ClientIngressEvent`
+2. 维护 `clientSessionId <-> agentSessionId` 绑定
+3. 按需创建 / 恢复 / 停止 `AgentAdapter`
+4. 处理 `command.session.new`
+5. 将 `command.session.compact` 路由给当前 active agent session
+6. 接收 `AgentOutputEvent`
+7. 通过 `agentSessionId -> clientSessionId` 反查目标 client
+8. 丢弃 stale agent session 的晚到输出
+
+Core 不负责：
+
+- client queue 的批处理
+- agent queue 的缓冲策略
+- 平台展示优化
+- 工具调用消息的聚合 / 折叠
+- polling loop
+- 全局统一 queue size
+
+换句话说：
+
+> Core 是 **binding manager + router**，不是统一 scheduler。
+
+---
+
+## Core 状态模型
+
+Core 维护三类核心状态：
+
+```ts
+clientSessionId -> agentSessionId
+agentSessionId -> clientSessionId
+agentSessionId -> AgentRuntime
+```
+
+其中：
+
+```ts
+interface AgentRuntime {
+  agentSessionId: string;
+  agentAdapter: AgentAdapter;
+}
+```
+
+说明：
+
+- 当前 active agent session 是按 `clientSessionId` 查到的
+- agent 输出回流时，通过 `agentSessionId -> clientSessionId` 反查要回哪个 client 会话
+
+---
+
+## 队列归属（最新决议）
+
+队列尽量下沉到 adapter 内部。
+
+### ClientAdapter
+
+- ClientAdapter 可以拥有自己的内部发送队列
+- 它可以对队列做平台相关优化：
+  - 合并消息
+  - 覆盖更新
+  - 折叠工具调用状态
+  - 批量发送
+
+### AgentAdapter
+
+- 每个 `AgentAdapter` 实例拥有自己的一条输入队列
+- 该队列与该实例绑定的 `agentSessionId` 一起存在
+- Core 不维护统一的 agent 输入总队列
+
+可理解为：
+
+```ts
+agentSessionId -> {
+  agentAdapter,
+  queue,
+  busy,
+}
+```
+
+但该 `queue` 是 adapter 的内部实现细节，不属于 Core 的职责。
+
+### 结果
+
+- `input()` 的语义统一为：
+  - event 已被 adapter 接收并进入其内部处理流程
+- `isBusy()` 保留，但更偏向：
+  - 观测状态
+  - 停机/回收判断
+  - 调试用途
+- Core 不再依赖 polling + queue 作为主流程控制方式
+
+---
+
+## `/new` 与 `/compact`
+
+## `command.session.new`
+
+行为定义：
+
+- 为当前 `clientSessionId` 创建一个全新的 agent session
+- 创建一个全新的 `AgentAdapter` 实例
+- 更新 `clientSessionId -> agentSessionId` 绑定关系
+
+处理规则：
+
+1. 找到该 `clientSessionId` 当前绑定的 active `agentSessionId`
+2. 如果旧 adapter 正在运行，可先尝试 `abort`，再 `stop`
+3. 调用 `AgentModule.createAgentSession()` 创建新会话
+4. 更新双向映射与 runtime 表
+5. 向 client 返回确认消息
+
+说明：
+
+- 如果旧 adapter 内部有 pending queue，则随 `stop()` 一并销毁
+- Core 不再负责清理 adapter 内部队列
+
+## `command.session.compact`
+
+行为定义：
+
+- 对当前 active agent session 执行一次 compact
+
+处理规则：
+
+1. 通过 `clientSessionId` 找当前 active `agentSessionId`
+2. 找到对应 `AgentAdapter`
+3. 向该 adapter 发送 `command.session.compact`
+4. 由 agent 输出结果，再经 Core 反查回 client
+
+如果当前没有 active agent session：
+
+- 不自动创建 agent session
+- 直接向 client 返回提示消息
+
+---
+
+## 旧会话晚到输出
+
+如果旧 agent session 在 `/new` 之后仍晚到输出：
+
+- Core 必须检查该 `agentSessionId` 是否仍是该 `clientSessionId` 的 active 绑定
+- 如果不是，则丢弃这条输出
+
+否则会导致：
+
+- 用户已经 `/new`
+- 旧会话回复却又发回原 chat
+
+这是必须避免的。
+
+---
+
+## 命令解析规则（MVP）
+
+目前仅支持两条文本命令：
+
+- `/new`
+- `/compact`
+
+解析规则：
+
+- 只做**精确匹配**
+- 其他文本一律按普通 `user.message` 处理
+
+---
+
+## idle 清理规则
+
+当某个 agent runtime 因 idle timeout 被回收时：
+
+- 删除 `agentSessionId -> AgentRuntime`
+- 保留 `clientSessionId <-> agentSessionId` 映射
+
+后续如果该 `clientSessionId` 再收到新消息：
+
+- 若对应 agent module 支持 `resumeAgentSession()`，则按既有 `agentSessionId` 重建 runtime
+- 若不支持 `resumeAgentSession()`，则 Core 退化为调用 `createAgentSession()` 创建一个**新的** agent session
+
+如果发生退化创建，则 Core 必须：
+
+1. 删除旧的 `agentSessionId -> clientSessionId` 映射
+2. 更新 `clientSessionId -> newAgentSessionId`
+3. 建立 `newAgentSessionId -> clientSessionId`
+4. 用新的 runtime 替换旧绑定
+
+这意味着：
+
+- “保留映射、删除 runtime” 仍然是默认策略
+- 但对**不支持 resume 的 agent**，idle 回收后下一次恢复本质上会退化为“重新开一个新的 agent session”
+- 这是 agent 能力边界带来的限制，Core 只能接受这个缺陷，不能凭空恢复原 agent 会话上下文
+
+---
+
+## MVP 范围
+
+当前保留的核心事件：
+
+- `user.message`
+- `assistant.message`
+- `command.session.new`
+- `command.session.compact`
+
+当前明确不进入协议：
+
+- streaming / delta
+- typing
+- progress / tool events
+- artifact / file / image
+- approval / interaction
+- attachments
+- read receipt
+- richer session control families
+
+这些都等最小链路稳定后再扩展。
+
+---
+
+## 当前结论总结
+
+1. 采用双侧 adapter 架构，不抽泛型父接口
+2. 一个 channel = 一个 client side + 一个 agent side
+3. 配置能力挂在模块层：`ClientModule` / `AgentModule`
+4. Core 不生成 `agentSessionId`，而由 `AgentModule.createAgentSession()` 返回
+5. 不再使用模糊的 `sessionId` 命名，统一拆成 `clientSessionId` / `agentSessionId`
+6. `/new` 与 `/compact` 是两个独立事件类型：
+   - `command.session.new`
+   - `command.session.compact`
+7. Core 负责绑定、路由、生命周期与 stale output 过滤
+8. 队列尽量下沉到 adapter 内部，Core 不做统一 queue/poll scheduler
+9. `pollIntervalMs` 与 `maxQueueSize` 已从 Core 级配置中移除
+10. 不支持 resume 的 agent 在 runtime 丢失后，只能接受退化为新建 agent session
