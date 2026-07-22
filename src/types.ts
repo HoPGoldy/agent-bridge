@@ -98,7 +98,7 @@ export interface FeishuClientConfig {
   verificationToken?: string;
 }
 
-export interface PiRpcAgentConfig {
+export interface PiCodingAgentConfig {
   bin?: string;
   sessionDir?: string;
   model?: string;
@@ -111,8 +111,8 @@ export type ClientConfig = {
 };
 
 export type AgentConfig = {
-  type: "pi-rpc";
-  config: PiRpcAgentConfig;
+  type: "pi-coding-agent";
+  config: PiCodingAgentConfig;
 };
 
 export interface ChannelConfig {

@@ -171,10 +171,7 @@ interface AgentModule<TConfig = unknown> {
     agentAdapter: AgentAdapter;
   }>;
 
-  resumeAgentSession?(args: {
-    config: TConfig;
-    agentSessionId: string;
-  }): Promise<AgentAdapter>;
+  resumeAgentSession?(args: { config: TConfig; agentSessionId: string }): Promise<AgentAdapter>;
 }
 ```
 
@@ -201,17 +198,23 @@ interface AgentModule<TConfig = unknown> {
 
 ```ts
 interface ConfigCollectContext {
-  input(label: string, opts?: {
-    defaultValue?: string;
-    required?: boolean;
-    secret?: boolean;
-    validate?: (value: string) => string | null;
-  }): Promise<string>;
+  input(
+    label: string,
+    opts?: {
+      defaultValue?: string;
+      required?: boolean;
+      secret?: boolean;
+      validate?: (value: string) => string | null;
+    },
+  ): Promise<string>;
 
-  select(label: string, options: Array<{
-    label: string;
-    value: string;
-  }>): Promise<string>;
+  select(
+    label: string,
+    options: Array<{
+      label: string;
+      value: string;
+    }>,
+  ): Promise<string>;
 
   confirm(label: string, defaultValue?: boolean): Promise<boolean>;
 }
@@ -236,7 +239,7 @@ interface ConfigCollectContext {
         }
       },
       "agent": {
-        "type": "pi-rpc",
+        "type": "pi-coding-agent",
         "config": {}
       }
     }

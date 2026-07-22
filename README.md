@@ -65,7 +65,7 @@ npm run dev -- --help
         }
       },
       "agent": {
-        "type": "pi-rpc",
+        "type": "pi-coding-agent",
         "config": {}
       }
     }
@@ -77,7 +77,7 @@ npm run dev -- --help
 ```
 
 - Feishu receive/send text path is implemented, including exact-text slash commands `/new` and `/compact`.
-- `PiRpcAgentAdapter` now spawns a real Pi RPC subprocess per session and emits a single final `assistant.message` for each input turn.
+- `PiCodingAgentAdapter` now spawns a real Pi RPC subprocess per session and emits a single final `assistant.message` for each input turn.
 - Core keeps explicit `clientSessionId <-> agentSessionId` bindings, routes events directly, and drops late output from stale agent sessions after `/new`.
 - Pi sessions are persisted by exact `--session-id` under the bridge-owned session directory, so adapter recreation can resume the same conversation.
 - Optional runtime overrides:

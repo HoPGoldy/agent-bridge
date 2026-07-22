@@ -1,11 +1,11 @@
 import { randomUUID } from "node:crypto";
 import os from "node:os";
 import path from "node:path";
-import { PiRpcAgentAdapter } from "./adapter/pi-rpc-agent-adapter";
+import { PiCodingAgentAdapter } from "./adapter/pi-coding-agent-adapter";
 import { createLogger } from "../../../core/logger";
-import type { AgentAdapter, AgentModule, ConfigAdapter, PiRpcAgentConfig } from "../../../types";
+import type { AgentAdapter, AgentModule, ConfigAdapter, PiCodingAgentConfig } from "../../../types";
 
-const logger = createLogger("pi-rpc");
+const logger = createLogger("pi-coding-agent");
 
 function parseExtraArgs(raw: string | undefined): string[] {
   if (!raw) return [];
@@ -15,8 +15,8 @@ function parseExtraArgs(raw: string | undefined): string[] {
     .filter(Boolean);
 }
 
-function buildAdapter(config: PiRpcAgentConfig, agentSessionId: string): AgentAdapter {
-  return new PiRpcAgentAdapter({
+function buildAdapter(config: PiCodingAgentConfig, agentSessionId: string): AgentAdapter {
+  return new PiCodingAgentAdapter({
     agentSessionId,
     cwd: process.cwd(),
     sessionDir:
@@ -29,7 +29,7 @@ function buildAdapter(config: PiRpcAgentConfig, agentSessionId: string): AgentAd
   });
 }
 
-function createPiRpcConfigCollector(): ConfigAdapter<PiRpcAgentConfig> {
+function createPiCodingAgentConfigCollector(): ConfigAdapter<PiCodingAgentConfig> {
   return {
     async collect(ctx) {
       const model = await ctx.input("Pi model (leave empty for pi default)");
@@ -43,16 +43,16 @@ function createPiRpcConfigCollector(): ConfigAdapter<PiRpcAgentConfig> {
     },
 
     summarize(config) {
-      return `type=pi-rpc model=${config.model ?? "default"}`;
+      return `type=pi-coding-agent model=${config.model ?? "default"}`;
     },
   };
 }
 
-export const piRpcAgentModule: AgentModule<PiRpcAgentConfig> = {
-  type: "pi-rpc",
-  createConfigCollector: createPiRpcConfigCollector,
+export const piCodingAgentModule: AgentModule<PiCodingAgentConfig> = {
+  type: "pi-coding-agent",
+  createConfigCollector: createPiCodingAgentConfigCollector,
   async createAgentSession({ config }) {
-    const agentSessionId = `pi-rpc:${randomUUID()}`;
+    const agentSessionId = `pi-coding-agent:${randomUUID()}`;
     logger.info(`creating agent session ${agentSessionId}`);
     return {
       agentSessionId,

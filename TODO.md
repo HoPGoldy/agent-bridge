@@ -1,0 +1,3 @@
+- [x] core 的 agent idle release 是怎么做的？
+- [x] config collector 需要优化，换用新的交互式填写模式，pi agent 也需要添加 config，先只加一个“模型名称”，可以不填，不填就用pi的默认模型
+- [x] pi-rpc module 改个名字，改成 pi-coding-agent 即可

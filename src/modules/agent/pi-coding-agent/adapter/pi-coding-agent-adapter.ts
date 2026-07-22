@@ -3,7 +3,7 @@ import { createLogger, type Logger } from "../../../../core/logger";
 import { PiRpcClient } from "./pi-rpc-client";
 import { toPiSessionId } from "./pi-session-id";
 
-export class PiRpcAgentAdapter implements AgentAdapter {
+export class PiCodingAgentAdapter implements AgentAdapter {
   readonly #agentSessionId: string;
   readonly #piSessionId: string;
   readonly #cwd: string;
@@ -41,7 +41,7 @@ export class PiRpcAgentAdapter implements AgentAdapter {
     this.#bin = bin ?? "pi";
     this.#model = model;
     this.#extraArgs = extraArgs ?? [];
-    this.#logger = logger ?? createLogger("pi-rpc");
+    this.#logger = logger ?? createLogger("pi-coding-agent");
   }
 
   async start(onOutput: (event: AgentOutputEvent) => Promise<void> | void): Promise<void> {
@@ -82,11 +82,13 @@ export class PiRpcAgentAdapter implements AgentAdapter {
 
   async input(event: AgentInputEvent): Promise<void> {
     if (!this.#client || !this.#onOutput) {
-      throw new Error("PiRpcAgentAdapter is not started");
+      throw new Error("PiCodingAgentAdapter is not started");
     }
 
     this.#inputQueue.push(event);
-    this.#logger.debug(`input event queued (session=${this.#agentSessionId} type=${event.type} queueDepth=${this.#inputQueue.length})`);
+    this.#logger.debug(
+      `input event queued (session=${this.#agentSessionId} type=${event.type} queueDepth=${this.#inputQueue.length})`,
+    );
     void this.#drainInputQueue();
   }
 
@@ -113,7 +115,7 @@ export class PiRpcAgentAdapter implements AgentAdapter {
 
   async #processEvent(event: AgentInputEvent): Promise<void> {
     if (!this.#client) {
-      throw new Error("PiRpcAgentAdapter is not started");
+      throw new Error("PiCodingAgentAdapter is not started");
     }
 
     try {
@@ -142,8 +144,11 @@ export class PiRpcAgentAdapter implements AgentAdapter {
       await this.#emitAssistant(`Context compacted.${suffix}`);
     } catch (error) {
       const message = error instanceof Error ? error.message : String(error);
-      this.#logger.error(`event processing failed (session=${this.#agentSessionId} type=${event.type}):`, error);
-      await this.#emitAssistant(`[pi-rpc error] ${message}`);
+      this.#logger.error(
+        `event processing failed (session=${this.#agentSessionId} type=${event.type}):`,
+        error,
+      );
+      await this.#emitAssistant(`[pi-coding-agent error] ${message}`);
     }
   }
 

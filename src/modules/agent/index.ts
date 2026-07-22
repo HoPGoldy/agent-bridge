@@ -1,9 +1,7 @@
 import type { AgentConfig, AgentModule } from "../../types";
-import { piRpcAgentModule } from "./pi-coding-agent";
+import { piCodingAgentModule } from "./pi-coding-agent";
 
-const registry = new Map<string, AgentModule<any>>([
-  [piRpcAgentModule.type, piRpcAgentModule],
-]);
+const registry = new Map<string, AgentModule<any>>([[piCodingAgentModule.type, piCodingAgentModule]]);
 
 export function listAgentModules(): AgentModule<any>[] {
   return [...registry.values()];
