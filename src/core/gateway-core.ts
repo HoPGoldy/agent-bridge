@@ -76,6 +76,11 @@ export class GatewayCore {
       return;
     }
 
+    if (event.type === "command.session.stop") {
+      await this.#handleSessionStop(event.clientSessionId);
+      return;
+    }
+
     await this.#handleUserMessage(event.clientSessionId, event.text);
   }
 
@@ -103,6 +108,40 @@ export class GatewayCore {
     await runtime.agentAdapter.input({
       type: "command.session.compact",
     });
+  }
+
+  async #handleSessionStop(clientSessionId: string): Promise<void> {
+    const runtime = await this.#getActiveRuntime(clientSessionId);
+    if (!runtime) {
+      await this.#deliverClientInput({
+        type: "assistant.message",
+        clientSessionId,
+        text: "No active agent session to stop.",
+      });
+      return;
+    }
+
+    this.#touchRuntime(runtime);
+
+    if (!runtime.agentAdapter.abort) {
+      await this.#deliverClientInput({
+        type: "assistant.message",
+        clientSessionId,
+        text: "This agent session cannot be stopped right now.",
+      });
+      return;
+    }
+
+    if (!(await runtime.agentAdapter.isBusy())) {
+      await this.#deliverClientInput({
+        type: "assistant.message",
+        clientSessionId,
+        text: "No active agent run to stop.",
+      });
+      return;
+    }
+
+    await runtime.agentAdapter.abort();
   }
 
   async #handleSessionNew(clientSessionId: string): Promise<void> {

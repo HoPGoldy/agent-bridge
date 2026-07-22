@@ -147,7 +147,7 @@ describe("FeishuIMAdapter", () => {
     expect(fakeClientState.startTyping).toHaveBeenCalledWith("oc_dm", "msg-2");
   });
 
-  it("handles /progress locally in the client adapter", async () => {
+  it("forwards /stop to the core as a command event", async () => {
     const adapter = new FeishuIMAdapter(
       {
         appId: "cli_xxx",
@@ -162,17 +162,15 @@ describe("FeishuIMAdapter", () => {
     await fakeClientState.onMessage?.({
       chatId: "oc_dm",
       chatType: "p2p",
-      messageId: "msg-progress",
-      text: "/progress",
+      messageId: "msg-stop",
+      text: "/stop",
       mentionedBot: false,
     });
 
-    expect(onOutput).not.toHaveBeenCalled();
-    expect(fakeClientState.sendText).toHaveBeenCalledWith(
-      "oc_dm",
-      "No active progress for this session.",
-      "msg-progress",
-    );
+    expect(onOutput).toHaveBeenCalledWith({
+      type: "command.session.stop",
+      clientSessionId: "feishu:dm:oc_dm",
+    });
   });
 
   it("sends chunked replies sequentially and replies only on the first chunk", async () => {

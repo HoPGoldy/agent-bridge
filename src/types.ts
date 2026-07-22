@@ -11,6 +11,10 @@ export type ClientOutputEvent =
   | {
       type: "command.session.compact";
       clientSessionId: string;
+    }
+  | {
+      type: "command.session.stop";
+      clientSessionId: string;
     };
 
 export type AgentInputEvent =

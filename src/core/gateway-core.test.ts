@@ -61,6 +61,7 @@ class FakeAgentAdapter implements AgentAdapter {
   readonly outputs: AgentOutputEvent[] = [];
   stopCount = 0;
   abortCount = 0;
+  busy = false;
   #onOutput: ((event: AgentOutputEvent) => Promise<void> | void) | null = null;
 
   constructor(readonly agentSessionId: string) {}
@@ -87,7 +88,7 @@ class FakeAgentAdapter implements AgentAdapter {
   }
 
   async isBusy(): Promise<boolean> {
-    return false;
+    return this.busy;
   }
 
   async emitAssistant(text: string): Promise<void> {
@@ -337,6 +338,86 @@ describe("GatewayCore", () => {
         type: "assistant.message",
         clientSessionId: "client-1",
         text: "No active agent session to compact.",
+      });
+    });
+  });
+
+  it("aborts the active agent run when stop is requested", async () => {
+    const imAdapter = new FakeIMAdapter();
+    const createdAdapters: FakeAgentAdapter[] = [];
+
+    const agentModule: AgentModule<Record<string, never>> = {
+      type: "fake",
+      async createAgentSession() {
+        const agentSessionId = `agent-${createdAdapters.length + 1}`;
+        const agentAdapter = new FakeAgentAdapter(agentSessionId);
+        agentAdapter.busy = true;
+        createdAdapters.push(agentAdapter);
+        return { agentSessionId, agentAdapter };
+      },
+    };
+
+    const core = new GatewayCore({
+      imAdapter,
+      agentModule,
+      agentConfig: {},
+      agentIdleTimeoutMs: 60_000,
+    });
+    running.push(core);
+    await core.start();
+
+    await imAdapter.emit({
+      type: "user.message",
+      clientSessionId: "client-1",
+      text: "hello",
+    });
+
+    await waitFor(() => {
+      expect(createdAdapters).toHaveLength(1);
+    });
+
+    await imAdapter.emit({
+      type: "command.session.stop",
+      clientSessionId: "client-1",
+    });
+
+    await waitFor(() => {
+      expect(createdAdapters[0]!.abortCount).toBe(1);
+    });
+  });
+
+  it("returns a message when stop is requested without an active agent session", async () => {
+    const imAdapter = new FakeIMAdapter();
+
+    const agentModule: AgentModule<Record<string, never>> = {
+      type: "fake",
+      async createAgentSession() {
+        return {
+          agentSessionId: "agent-1",
+          agentAdapter: new FakeAgentAdapter("agent-1"),
+        };
+      },
+    };
+
+    const core = new GatewayCore({
+      imAdapter,
+      agentModule,
+      agentConfig: {},
+      agentIdleTimeoutMs: 60_000,
+    });
+    running.push(core);
+    await core.start();
+
+    await imAdapter.emit({
+      type: "command.session.stop",
+      clientSessionId: "client-1",
+    });
+
+    await waitFor(() => {
+      expect(imAdapter.outputs).toContainEqual({
+        type: "assistant.message",
+        clientSessionId: "client-1",
+        text: "No active agent session to stop.",
       });
     });
   });

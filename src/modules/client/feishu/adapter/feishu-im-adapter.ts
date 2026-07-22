@@ -141,9 +141,12 @@ export class FeishuIMAdapter implements IMAdapter {
         return;
       }
 
-      if (normalizedText === "/progress") {
-        this.#logger.info(`received command /progress (session=${clientSessionId})`);
-        await this.#sendProgressSnapshot(clientSessionId);
+      if (normalizedText === "/stop") {
+        this.#logger.info(`received command /stop (session=${clientSessionId})`);
+        await this.#onOutput({
+          type: "command.session.stop",
+          clientSessionId,
+        });
         return;
       }
 
@@ -288,24 +291,6 @@ export class FeishuIMAdapter implements IMAdapter {
     } finally {
       state.creating = false;
     }
-  }
-
-  async #sendProgressSnapshot(clientSessionId: string): Promise<void> {
-    if (!this.#client) {
-      return;
-    }
-
-    const state = this.#progressStateBySession.get(clientSessionId);
-    const target = parseFeishuSessionId(clientSessionId);
-    const text =
-      state && (state.lines.length > 0 || state.collapsedCount > 0)
-        ? FeishuIMAdapter.progressBody(state.lines, state.collapsedCount)
-        : "No active progress for this session.";
-    await this.#client.sendText(
-      target.chatId,
-      text,
-      this.#lastInboundMessageIdBySession.get(clientSessionId),
-    );
   }
 
   #shouldRenderProgressEvent(event: Exclude<ClientInputEvent, { type: "assistant.message" }>): boolean {
