@@ -1,7 +1,7 @@
 {
   "name": "agent-bridge",
   "version": "0.1.1",
-  "private": true,
+  "private": false,
   "description": "IM to Pi bridge with dual-adapter architecture",
   "keywords": [
     "im",
@@ -11,6 +11,14 @@
     "cli"
   ],
   "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/HoPGoldy/agent-bridge"
+  },
+  "bugs": {
+    "url": "https://github.com/HoPGoldy/agent-bridge/issues"
+  },
+  "homepage": "https://github.com/HoPGoldy/agent-bridge#readme",
   "type": "module",
   "bin": {
     "agent-bridge": "./dist/agent-bridge.js"
