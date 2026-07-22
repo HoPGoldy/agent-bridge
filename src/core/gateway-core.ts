@@ -1,7 +1,9 @@
 import type { AgentAdapter, AgentOutputEvent, ClientEgressEvent, ClientIngressEvent, GatewayCoreOptions } from "../types";
+import { createLogger, type Logger } from "./logger";
 
 interface AgentRuntime {
   agentSessionId: string;
+  clientSessionId: string;
   agentAdapter: AgentAdapter;
   lastActiveAt: number;
   idleTimer: NodeJS.Timeout | null;
@@ -12,8 +14,8 @@ export class GatewayCore {
   readonly #agentModule: GatewayCoreOptions["agentModule"];
   readonly #agentConfig: GatewayCoreOptions["agentConfig"];
   readonly #agentIdleTimeoutMs: number;
+  readonly #logger: Logger = createLogger("core");
   readonly #clientToAgentSession = new Map<string, string>();
-  readonly #agentToClientSession = new Map<string, string>();
   readonly #agentRuntimes = new Map<string, AgentRuntime>();
   #started = false;
 
@@ -32,7 +34,7 @@ export class GatewayCore {
       try {
         await this.#handleClientIngress(event);
       } catch (error) {
-        console.error("[core] failed to process client ingress event:", error);
+        this.#logger.error("failed to process client ingress event:", error);
       }
     });
   }
@@ -95,7 +97,6 @@ export class GatewayCore {
       if (previousRuntime) {
         await this.#stopRuntime(previousRuntime);
       }
-      this.#agentToClientSession.delete(previousAgentSessionId);
     }
 
     const runtime = await this.#createRuntimeForClient(clientSessionId);
@@ -111,7 +112,7 @@ export class GatewayCore {
     try {
       await this.#imAdapter.input(event);
     } catch (error) {
-      console.error("[core] failed to deliver client egress event:", error);
+      this.#logger.error("failed to deliver client egress event:", error);
     }
   }
 
@@ -150,7 +151,6 @@ export class GatewayCore {
     }
 
     const runtime = await this.#createRuntimeForClient(clientSessionId);
-    this.#agentToClientSession.delete(agentSessionId);
     this.#bindClientToAgent(clientSessionId, runtime.agentSessionId);
     return runtime;
   }
@@ -169,43 +169,37 @@ export class GatewayCore {
 
     const runtime: AgentRuntime = {
       agentSessionId,
+      clientSessionId,
       agentAdapter,
       lastActiveAt: Date.now(),
       idleTimer: null,
     };
     this.#agentRuntimes.set(agentSessionId, runtime);
-    this.#agentToClientSession.set(agentSessionId, clientSessionId);
     this.#touchRuntime(runtime);
     return runtime;
   }
 
   #bindClientToAgent(clientSessionId: string, agentSessionId: string): void {
-    const previousAgentSessionId = this.#clientToAgentSession.get(clientSessionId);
-    if (previousAgentSessionId && previousAgentSessionId !== agentSessionId) {
-      this.#agentToClientSession.delete(previousAgentSessionId);
-    }
     this.#clientToAgentSession.set(clientSessionId, agentSessionId);
-    this.#agentToClientSession.set(agentSessionId, clientSessionId);
   }
 
   async #handleAgentOutput(event: AgentOutputEvent): Promise<void> {
-    const clientSessionId = this.#agentToClientSession.get(event.agentSessionId);
-    if (!clientSessionId) {
+    const runtime = this.#agentRuntimes.get(event.agentSessionId);
+    if (!runtime) {
+      this.#logger.info(`dropping output from released agent session ${event.agentSessionId}`);
       return;
     }
 
+    const clientSessionId = runtime.clientSessionId;
     const activeAgentSessionId = this.#clientToAgentSession.get(clientSessionId);
     if (activeAgentSessionId !== event.agentSessionId) {
-      console.log(
-        `[core] dropping late output from inactive agent session ${event.agentSessionId} for client ${clientSessionId}`,
+      this.#logger.info(
+        `dropping late output from inactive agent session ${event.agentSessionId} for client ${clientSessionId}`,
       );
       return;
     }
 
-    const runtime = this.#agentRuntimes.get(event.agentSessionId);
-    if (runtime) {
-      this.#touchRuntime(runtime);
-    }
+    this.#touchRuntime(runtime);
 
     await this.#deliverClientEgress({
       type: "assistant.message",
@@ -252,7 +246,7 @@ export class GatewayCore {
     }
 
     await this.#stopRuntime(runtime);
-    console.log(`[core] released idle agent session ${agentSessionId}`);
+    this.#logger.info(`released idle agent session ${agentSessionId}`);
   }
 
   async #stopRuntime(runtime: AgentRuntime): Promise<void> {
@@ -266,7 +260,7 @@ export class GatewayCore {
         try {
           await runtime.agentAdapter.abort();
         } catch (error) {
-          console.error(`[core] abort failed for ${runtime.agentSessionId}:`, error);
+          this.#logger.error(`abort failed for ${runtime.agentSessionId}:`, error);
         }
       }
       await runtime.agentAdapter.stop();

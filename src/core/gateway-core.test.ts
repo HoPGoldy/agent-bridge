@@ -70,8 +70,12 @@ class FakeAgentAdapter implements AgentAdapter {
 
   async stop(): Promise<void> {
     this.stopCount += 1;
-    this.#onOutput = null;
+    if (!this.retainOutputCallback) {
+      this.#onOutput = null;
+    }
   }
+
+  retainOutputCallback = false;
 
   async abort(): Promise<void> {
     this.abortCount += 1;
@@ -156,6 +160,47 @@ describe("GatewayCore", () => {
     await sleep(30);
 
     expect(imAdapter.outputs.some((event) => event.text === "late old reply")).toBe(false);
+  });
+
+  it("drops output from an agent session released after idle timeout", async () => {
+    const imAdapter = new FakeIMAdapter();
+    const createdAdapters: FakeAgentAdapter[] = [];
+
+    const agentModule: AgentModule<Record<string, never>> = {
+      type: "fake",
+      async createAgentSession() {
+        const agentSessionId = `agent-${createdAdapters.length + 1}`;
+        const agentAdapter = new FakeAgentAdapter(agentSessionId);
+        agentAdapter.retainOutputCallback = true;
+        createdAdapters.push(agentAdapter);
+        return { agentSessionId, agentAdapter };
+      },
+    };
+
+    const core = new GatewayCore({
+      imAdapter,
+      agentModule,
+      agentConfig: {},
+      agentIdleTimeoutMs: 20,
+    });
+    running.push(core);
+    await core.start();
+
+    await imAdapter.emit({
+      type: "user.message",
+      clientSessionId: "client-1",
+      text: "hello",
+    });
+
+    const first = createdAdapters[0]!;
+    await waitFor(() => {
+      expect(first.stopCount).toBe(1);
+    });
+
+    await first.emitAssistant("late reply after release");
+    await sleep(30);
+
+    expect(imAdapter.outputs.some((event) => event.text === "late reply after release")).toBe(false);
   });
 
   it("returns a message when compact is requested without an active agent session", async () => {
