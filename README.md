@@ -17,7 +17,7 @@ The current built-in support is intentionally small, but the architecture is des
 Install the CLI:
 
 ```bash
-npm install -g agent-bridge
+npm install -g @hopgoldy/agent-bridge
 ```
 
 The CLI currently provides these commands:
