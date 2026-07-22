@@ -5,8 +5,8 @@ import type {
   AgentInputEvent,
   AgentModule,
   AgentOutputEvent,
-  ClientEgressEvent,
-  ClientIngressEvent,
+  ClientInputEvent,
+  ClientOutputEvent,
   IMAdapter,
   SessionBindingStore,
 } from "../types";
@@ -29,10 +29,10 @@ async function waitFor(assertion: () => void | Promise<void>, timeoutMs = 1000):
 }
 
 class FakeIMAdapter implements IMAdapter {
-  #onOutput: ((event: ClientIngressEvent) => Promise<void> | void) | null = null;
-  readonly outputs: ClientEgressEvent[] = [];
+  #onOutput: ((event: ClientOutputEvent) => Promise<void> | void) | null = null;
+  readonly outputs: ClientInputEvent[] = [];
 
-  async start(onOutput: (event: ClientIngressEvent) => Promise<void> | void): Promise<void> {
+  async start(onOutput: (event: ClientOutputEvent) => Promise<void> | void): Promise<void> {
     this.#onOutput = onOutput;
   }
 
@@ -40,7 +40,7 @@ class FakeIMAdapter implements IMAdapter {
     this.#onOutput = null;
   }
 
-  async input(event: ClientEgressEvent): Promise<void> {
+  async input(event: ClientInputEvent): Promise<void> {
     this.outputs.push(event);
   }
 
@@ -48,7 +48,7 @@ class FakeIMAdapter implements IMAdapter {
     return false;
   }
 
-  async emit(event: ClientIngressEvent): Promise<void> {
+  async emit(event: ClientOutputEvent): Promise<void> {
     if (!this.#onOutput) {
       throw new Error("FakeIMAdapter is not started");
     }
@@ -96,6 +96,11 @@ class FakeAgentAdapter implements AgentAdapter {
       agentSessionId: this.agentSessionId,
       text,
     };
+    this.outputs.push(event);
+    await this.#onOutput?.(event);
+  }
+
+  async emit(event: AgentOutputEvent): Promise<void> {
     this.outputs.push(event);
     await this.#onOutput?.(event);
   }
@@ -332,6 +337,62 @@ describe("GatewayCore", () => {
         type: "assistant.message",
         clientSessionId: "client-1",
         text: "No active agent session to compact.",
+      });
+    });
+  });
+
+  it("forwards non-message agent events to the client adapter without aggregating them", async () => {
+    const imAdapter = new FakeIMAdapter();
+    const createdAdapters: FakeAgentAdapter[] = [];
+
+    const agentModule: AgentModule<Record<string, never>> = {
+      type: "fake",
+      async createAgentSession() {
+        const agentSessionId = `agent-${createdAdapters.length + 1}`;
+        const agentAdapter = new FakeAgentAdapter(agentSessionId);
+        createdAdapters.push(agentAdapter);
+        return { agentSessionId, agentAdapter };
+      },
+    };
+
+    const core = new GatewayCore({
+      imAdapter,
+      agentModule,
+      agentConfig: {},
+      agentIdleTimeoutMs: 60_000,
+    });
+    running.push(core);
+    await core.start();
+
+    await imAdapter.emit({
+      type: "user.message",
+      clientSessionId: "client-1",
+      text: "hello",
+    });
+
+    await waitFor(() => {
+      expect(createdAdapters).toHaveLength(1);
+    });
+
+    await createdAdapters[0]!.emit({
+      type: "assistant.thinking",
+      agentSessionId: "agent-1",
+      text: "Planning next step",
+    });
+    await createdAdapters[0]!.emit({
+      type: "assistant.tool.running",
+      agentSessionId: "agent-1",
+      toolName: "read_file",
+      text: "Running read_file",
+    });
+
+    await waitFor(() => {
+      expect(imAdapter.outputs.at(-1)).toEqual({
+        type: "assistant.tool.running",
+        clientSessionId: "client-1",
+        agentSessionId: "agent-1",
+        toolName: "read_file",
+        text: "Running read_file",
       });
     });
   });

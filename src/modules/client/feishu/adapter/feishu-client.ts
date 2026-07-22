@@ -11,8 +11,9 @@ const REACTION_TYPING = "Typing";
 type LarkClientLike = {
   im: {
     message: {
-      create(args: unknown): Promise<unknown>;
-      reply(args: unknown): Promise<unknown>;
+      create(args: unknown): Promise<{ data?: { message_id?: string | null } }>;
+      reply(args: unknown): Promise<{ data?: { message_id?: string | null } }>;
+      patch(args: unknown): Promise<unknown>;
     };
     messageReaction: {
       create(args: unknown): Promise<{ data?: { reaction_id?: string | null } }>;
@@ -97,6 +98,10 @@ function buildMarkdownCard(text: string): string {
   });
 }
 
+function buildCardPayload(card: Record<string, unknown>): string {
+  return JSON.stringify(card);
+}
+
 export class FeishuClient {
   readonly #logger: Logger;
   readonly #channel: LarkChannelLike;
@@ -159,10 +164,42 @@ export class FeishuClient {
 
   async sendMarkdown(chatId: string, text: string, replyToMessageId?: string): Promise<void> {
     const content = buildMarkdownCard(text);
+    await this.#sendInteractive(chatId, content, replyToMessageId);
 
+    this.#logger.debug(
+      `markdown message sent (chatId=${chatId} replyTo=${replyToMessageId ?? "none"} length=${text.length})`,
+    );
+  }
+
+  async sendCard(
+    chatId: string,
+    card: Record<string, unknown>,
+    replyToMessageId?: string,
+  ): Promise<string | null> {
+    const content = buildCardPayload(card);
+    const response = await this.#sendInteractive(chatId, content, replyToMessageId);
+    return response.data?.message_id ?? null;
+  }
+
+  async updateCard(messageId: string, card: Record<string, unknown>): Promise<void> {
+    await this.#client.im.message.patch({
+      path: {
+        message_id: messageId,
+      },
+      data: {
+        content: buildCardPayload(card),
+      },
+    });
+  }
+
+  async #sendInteractive(
+    chatId: string,
+    content: string,
+    replyToMessageId?: string,
+  ): Promise<{ data?: { message_id?: string | null } }> {
     try {
       if (replyToMessageId) {
-        await this.#client.im.message.reply({
+        return await this.#client.im.message.reply({
           path: {
             message_id: replyToMessageId,
           },
@@ -171,24 +208,24 @@ export class FeishuClient {
             msg_type: "interactive",
           },
         });
-      } else {
-        await this.#client.im.message.create({
-          params: {
-            receive_id_type: "chat_id",
-          },
-          data: {
-            receive_id: chatId,
-            content,
-            msg_type: "interactive",
-          },
-        });
       }
+
+      return await this.#client.im.message.create({
+        params: {
+          receive_id_type: "chat_id",
+        },
+        data: {
+          receive_id: chatId,
+          content,
+          msg_type: "interactive",
+        },
+      });
     } catch (error: any) {
       if (replyToMessageId && (error?.code === 230011 || error?.code === 231003)) {
         this.#logger.warn(
           `reply target unavailable, falling back to create (chatId=${chatId} replyTo=${replyToMessageId})`,
         );
-        await this.#client.im.message.create({
+        return await this.#client.im.message.create({
           params: {
             receive_id_type: "chat_id",
           },
@@ -198,14 +235,9 @@ export class FeishuClient {
             msg_type: "interactive",
           },
         });
-      } else {
-        throw error;
       }
+      throw error;
     }
-
-    this.#logger.debug(
-      `markdown message sent (chatId=${chatId} replyTo=${replyToMessageId ?? "none"} length=${text.length})`,
-    );
   }
 
   async startTyping(chatId: string, messageId: string): Promise<void> {

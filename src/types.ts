@@ -1,4 +1,4 @@
-export type ClientIngressEvent =
+export type ClientOutputEvent =
   | {
       type: "user.message";
       clientSessionId: string;
@@ -13,12 +13,6 @@ export type ClientIngressEvent =
       clientSessionId: string;
     };
 
-export type ClientEgressEvent = {
-  type: "assistant.message";
-  clientSessionId: string;
-  text: string;
-};
-
 export type AgentInputEvent =
   | {
       type: "user.message";
@@ -28,16 +22,49 @@ export type AgentInputEvent =
       type: "command.session.compact";
     };
 
-export type AgentOutputEvent = {
-  type: "assistant.message";
+type AgentOutputPayload =
+  | {
+      type: "assistant.message";
+      text: string;
+    }
+  | {
+      type: "assistant.thinking";
+      text?: string;
+    }
+  | {
+      type: "assistant.tool.running";
+      toolName: string;
+      text?: string;
+    }
+  | {
+      type: "assistant.tool.done";
+      toolName: string;
+      text?: string;
+    }
+  | {
+      type: "assistant.tool.error";
+      toolName: string;
+      text?: string;
+    }
+  | {
+      type: "session.compacting";
+      text?: string;
+    };
+
+export type AgentOutputEvent = AgentOutputPayload & {
   agentSessionId: string;
-  text: string;
 };
 
+export type ClientInputEvent = AgentOutputPayload & {
+  clientSessionId: string;
+};
+
+export type LegacyAgentInputEvent = AgentInputEvent;
+
 export interface IMAdapter {
-  start(onOutput: (event: ClientIngressEvent) => Promise<void> | void): Promise<void>;
+  start(onOutput: (event: ClientOutputEvent) => Promise<void> | void): Promise<void>;
   stop(): Promise<void>;
-  input(event: ClientEgressEvent): Promise<void>;
+  input(event: ClientInputEvent): Promise<void>;
   isBusy(): Promise<boolean>;
 }
 

@@ -1,5 +1,5 @@
 import { afterEach, describe, expect, it, vi } from "vitest";
-import type { FeishuInboundMessage } from "../../../../types";
+import type { ClientOutputEvent, FeishuInboundMessage } from "../../../../types";
 import { createLogger } from "../../../../core/logger";
 import { FeishuIMAdapter } from "./feishu-im-adapter";
 
@@ -8,6 +8,12 @@ type FakeClientInstance = {
   connect: () => Promise<void>;
   disconnect: () => Promise<void>;
   sendText: (chatId: string, text: string, replyToMessageId?: string) => Promise<void>;
+  sendCard: (
+    chatId: string,
+    card: Record<string, unknown>,
+    replyToMessageId?: string,
+  ) => Promise<string | null>;
+  updateCard: (messageId: string, card: Record<string, unknown>) => Promise<void>;
   startTyping: (chatId: string, messageId: string) => Promise<void>;
   stopTyping: (chatId: string) => Promise<void>;
 };
@@ -15,6 +21,8 @@ type FakeClientInstance = {
 const fakeClientState: {
   onMessage: ((message: FeishuInboundMessage) => Promise<void> | void) | null;
   sendText: ReturnType<typeof vi.fn>;
+  sendCard: ReturnType<typeof vi.fn>;
+  updateCard: ReturnType<typeof vi.fn>;
   connect: ReturnType<typeof vi.fn>;
   disconnect: ReturnType<typeof vi.fn>;
   startTyping: ReturnType<typeof vi.fn>;
@@ -22,6 +30,8 @@ const fakeClientState: {
 } = {
   onMessage: null,
   sendText: vi.fn(async () => {}),
+  sendCard: vi.fn(async () => "card-1"),
+  updateCard: vi.fn(async () => {}),
   connect: vi.fn(async () => {}),
   disconnect: vi.fn(async () => {}),
   startTyping: vi.fn(async () => {}),
@@ -38,6 +48,8 @@ vi.mock("./feishu-client", () => {
         connect: fakeClientState.connect,
         disconnect: fakeClientState.disconnect,
         sendText: fakeClientState.sendText,
+        sendCard: fakeClientState.sendCard,
+        updateCard: fakeClientState.updateCard,
         startTyping: fakeClientState.startTyping,
         stopTyping: fakeClientState.stopTyping,
       }),
@@ -49,6 +61,10 @@ function resetFakeClient(): void {
   fakeClientState.onMessage = null;
   fakeClientState.sendText.mockReset();
   fakeClientState.sendText.mockImplementation(async () => {});
+  fakeClientState.sendCard.mockReset();
+  fakeClientState.sendCard.mockImplementation(async () => "card-1");
+  fakeClientState.updateCard.mockReset();
+  fakeClientState.updateCard.mockImplementation(async () => {});
   fakeClientState.connect.mockReset();
   fakeClientState.connect.mockImplementation(async () => {});
   fakeClientState.disconnect.mockReset();
@@ -106,7 +122,7 @@ describe("FeishuIMAdapter", () => {
       },
       createLogger("test"),
     );
-    const onOutput = vi.fn(async () => {});
+    const onOutput = vi.fn(async (_event: ClientOutputEvent) => {});
 
     await adapter.start(onOutput);
     await fakeClientState.onMessage?.({
@@ -125,6 +141,34 @@ describe("FeishuIMAdapter", () => {
     expect(fakeClientState.startTyping).toHaveBeenCalledWith("oc_dm", "msg-2");
   });
 
+  it("handles /progress locally in the client adapter", async () => {
+    const adapter = new FeishuIMAdapter(
+      {
+        appId: "cli_xxx",
+        appSecret: "secret",
+        requireMentionInGroup: true,
+      },
+      createLogger("test"),
+    );
+    const onOutput = vi.fn(async (_event: ClientOutputEvent) => {});
+
+    await adapter.start(onOutput);
+    await fakeClientState.onMessage?.({
+      chatId: "oc_dm",
+      chatType: "p2p",
+      messageId: "msg-progress",
+      text: "/progress",
+      mentionedBot: false,
+    });
+
+    expect(onOutput).not.toHaveBeenCalled();
+    expect(fakeClientState.sendText).toHaveBeenCalledWith(
+      "oc_dm",
+      "No active progress for this session.",
+      "msg-progress",
+    );
+  });
+
   it("sends chunked replies sequentially and replies only on the first chunk", async () => {
     const adapter = new FeishuIMAdapter(
       {
@@ -134,7 +178,7 @@ describe("FeishuIMAdapter", () => {
       },
       createLogger("test"),
     );
-    const onOutput = vi.fn(async () => {});
+    const onOutput = vi.fn(async (_event: ClientOutputEvent) => {});
     const callOrder: string[] = [];
     let inFlight = 0;
     let maxInFlight = 0;

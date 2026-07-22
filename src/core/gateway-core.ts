@@ -1,4 +1,10 @@
-import type { AgentAdapter, AgentOutputEvent, ClientEgressEvent, ClientIngressEvent, GatewayCoreOptions } from "../types";
+import type {
+  AgentAdapter,
+  AgentOutputEvent,
+  ClientInputEvent,
+  ClientOutputEvent,
+  GatewayCoreOptions,
+} from "../types";
 import { createLogger, type Logger } from "./logger";
 
 interface AgentRuntime {
@@ -41,9 +47,9 @@ export class GatewayCore {
 
     await this.#imAdapter.start(async (event) => {
       try {
-        await this.#handleClientIngress(event);
+        await this.#handleClientOutput(event);
       } catch (error) {
-        this.#logger.error("failed to process client ingress event:", error);
+        this.#logger.error("failed to process client output event:", error);
       }
     });
   }
@@ -59,7 +65,7 @@ export class GatewayCore {
     await this.#imAdapter.stop();
   }
 
-  async #handleClientIngress(event: ClientIngressEvent): Promise<void> {
+  async #handleClientOutput(event: ClientOutputEvent): Promise<void> {
     if (event.type === "command.session.new") {
       await this.#handleSessionNew(event.clientSessionId);
       return;
@@ -85,7 +91,7 @@ export class GatewayCore {
   async #handleSessionCompact(clientSessionId: string): Promise<void> {
     const runtime = await this.#getActiveRuntime(clientSessionId);
     if (!runtime) {
-      await this.#deliverClientEgress({
+      await this.#deliverClientInput({
         type: "assistant.message",
         clientSessionId,
         text: "No active agent session to compact.",
@@ -110,18 +116,18 @@ export class GatewayCore {
 
     const runtime = await this.#createRuntimeForClient(clientSessionId);
     this.#bindClientToAgent(clientSessionId, runtime.agentSessionId);
-    await this.#deliverClientEgress({
+    await this.#deliverClientInput({
       type: "assistant.message",
       clientSessionId,
       text: "Started a new session.",
     });
   }
 
-  async #deliverClientEgress(event: ClientEgressEvent): Promise<void> {
+  async #deliverClientInput(event: ClientInputEvent): Promise<void> {
     try {
       await this.#imAdapter.input(event);
     } catch (error) {
-      this.#logger.error("failed to deliver client egress event:", error);
+      this.#logger.error("failed to deliver client input event:", error);
     }
   }
 
@@ -171,7 +177,11 @@ export class GatewayCore {
     return this.#startRuntime(clientSessionId, agentSessionId, agentAdapter);
   }
 
-  async #startRuntime(clientSessionId: string, agentSessionId: string, agentAdapter: AgentAdapter): Promise<AgentRuntime> {
+  async #startRuntime(
+    clientSessionId: string,
+    agentSessionId: string,
+    agentAdapter: AgentAdapter,
+  ): Promise<AgentRuntime> {
     await agentAdapter.start(async (event: AgentOutputEvent) => {
       await this.#handleAgentOutput(event);
     });
@@ -205,27 +215,36 @@ export class GatewayCore {
   }
 
   async #handleAgentOutput(event: AgentOutputEvent): Promise<void> {
-    const runtime = this.#agentRuntimes.get(event.agentSessionId);
+    const agentSessionId = event.agentSessionId;
+    const runtime = this.#agentRuntimes.get(agentSessionId);
     if (!runtime) {
-      this.#logger.info(`dropping output from released agent session ${event.agentSessionId}`);
+      this.#logger.info(`dropping output from released agent session ${agentSessionId}`);
       return;
     }
 
     const clientSessionId = runtime.clientSessionId;
     const activeAgentSessionId = this.#clientToAgentSession.get(clientSessionId);
-    if (activeAgentSessionId !== event.agentSessionId) {
+    if (activeAgentSessionId !== agentSessionId) {
       this.#logger.info(
-        `dropping late output from inactive agent session ${event.agentSessionId} for client ${clientSessionId}`,
+        `dropping late output from inactive agent session ${agentSessionId} for client ${clientSessionId}`,
       );
       return;
     }
 
     this.#touchRuntime(runtime);
 
-    await this.#deliverClientEgress({
-      type: "assistant.message",
+    if (event.type === "assistant.message") {
+      await this.#deliverClientInput({
+        type: "assistant.message",
+        clientSessionId,
+        text: event.text,
+      });
+      return;
+    }
+
+    await this.#deliverClientInput({
+      ...event,
       clientSessionId,
-      text: event.text,
     });
   }
 

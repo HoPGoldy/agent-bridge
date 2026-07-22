@@ -1,4 +1,4 @@
-import type { ClientEgressEvent, ClientIngressEvent, FeishuClientConfig, IMAdapter } from "../../../../types";
+import type { ClientInputEvent, ClientOutputEvent, FeishuClientConfig, IMAdapter } from "../../../../types";
 import { createLogger, type Logger } from "../../../../core/logger";
 import { FeishuClient } from "./feishu-client";
 import { buildFeishuSessionId, parseFeishuSessionId } from "./feishu-session";
@@ -38,11 +38,40 @@ function chunkText(text: string, maxLen: number): string[] {
 export class FeishuIMAdapter implements IMAdapter {
   readonly #config: FeishuClientConfig;
   readonly #logger: Logger;
-  #onOutput: ((event: ClientIngressEvent) => Promise<void> | void) | null = null;
+  #onOutput: ((event: ClientOutputEvent) => Promise<void> | void) | null = null;
   #client: FeishuClient | null = null;
-  #egressQueue: ClientEgressEvent[] = [];
+  #egressQueue: ClientInputEvent[] = [];
   #processing = false;
   #lastInboundMessageIdBySession = new Map<string, string>();
+  #progressStateBySession = new Map<
+    string,
+    {
+      messageId: string | null;
+      creating: boolean;
+      lines: string[];
+      status: string;
+    }
+  >();
+
+  static buildProgressCard(lines: string[], status: string): Record<string, unknown> {
+    return {
+      schema: "2.0",
+      header: {
+        title: {
+          tag: "plain_text",
+          content: `Current progress · ${status}`,
+        },
+      },
+      body: {
+        elements: [
+          {
+            tag: "markdown",
+            content: lines.length > 0 ? lines.join("\n") : "No progress yet.",
+          },
+        ],
+      },
+    };
+  }
 
   async #notifySendFailure(chatId: string, error: unknown): Promise<void> {
     if (!this.#client) {
@@ -64,7 +93,7 @@ export class FeishuIMAdapter implements IMAdapter {
     this.#logger = logger;
   }
 
-  async start(onOutput: (event: ClientIngressEvent) => Promise<void> | void): Promise<void> {
+  async start(onOutput: (event: ClientOutputEvent) => Promise<void> | void): Promise<void> {
     this.#onOutput = onOutput;
     this.#client = new FeishuClient(this.#config, this.#logger);
     this.#client.setOnMessage(async ({ chatId, chatType, text, messageId, mentionedBot }) => {
@@ -104,6 +133,12 @@ export class FeishuIMAdapter implements IMAdapter {
         return;
       }
 
+      if (normalizedText === "/progress") {
+        this.#logger.info(`received command /progress (session=${clientSessionId})`);
+        await this.#sendProgressSnapshot(clientSessionId);
+        return;
+      }
+
       this.#logger.info(`received user message (session=${clientSessionId}): ${normalizedText}`);
       await this.#onOutput({
         type: "user.message",
@@ -127,7 +162,7 @@ export class FeishuIMAdapter implements IMAdapter {
     this.#logger.info("adapter stopped");
   }
 
-  async input(event: ClientEgressEvent): Promise<void> {
+  async input(event: ClientInputEvent): Promise<void> {
     if (!this.#client) {
       throw new Error("FeishuIMAdapter is not started");
     }
@@ -156,6 +191,12 @@ export class FeishuIMAdapter implements IMAdapter {
 
         try {
           const target = parseFeishuSessionId(event.clientSessionId);
+
+          if (event.type !== "assistant.message") {
+            await this.#handleProgressEvent(target.chatId, event);
+            continue;
+          }
+
           const replyToMessageId = this.#lastInboundMessageIdBySession.get(event.clientSessionId);
           const chunks = chunkText(event.text, MAX_TEXT_CHUNK);
           this.#logger.info(`sending reply (session=${event.clientSessionId})`);
@@ -177,6 +218,92 @@ export class FeishuIMAdapter implements IMAdapter {
       }
     } finally {
       this.#processing = false;
+    }
+  }
+
+  async #handleProgressEvent(
+    chatId: string,
+    event: Exclude<ClientInputEvent, { type: "assistant.message" }>,
+  ): Promise<void> {
+    if (!this.#client) {
+      return;
+    }
+
+    const state = this.#progressStateBySession.get(event.clientSessionId) ?? {
+      messageId: null,
+      creating: false,
+      lines: [],
+      status: "running",
+    };
+    state.lines.push(this.#formatProgressLine(event));
+    if (state.lines.length > 10) {
+      state.lines.splice(0, state.lines.length - 10);
+    }
+    state.status = this.#progressStatus(event);
+    this.#progressStateBySession.set(event.clientSessionId, state);
+
+    const card = FeishuIMAdapter.buildProgressCard(state.lines, state.status);
+    if (state.messageId) {
+      await this.#client.updateCard(state.messageId, card);
+      return;
+    }
+
+    if (state.creating) {
+      return;
+    }
+
+    state.creating = true;
+    try {
+      state.messageId = await this.#client.sendCard(
+        chatId,
+        card,
+        this.#lastInboundMessageIdBySession.get(event.clientSessionId),
+      );
+    } finally {
+      state.creating = false;
+    }
+  }
+
+  async #sendProgressSnapshot(clientSessionId: string): Promise<void> {
+    if (!this.#client) {
+      return;
+    }
+
+    const state = this.#progressStateBySession.get(clientSessionId);
+    const target = parseFeishuSessionId(clientSessionId);
+    const text = state
+      ? ["Current progress:", ...state.lines].join("\n")
+      : "No active progress for this session.";
+    await this.#client.sendText(
+      target.chatId,
+      text,
+      this.#lastInboundMessageIdBySession.get(clientSessionId),
+    );
+  }
+
+  #formatProgressLine(event: Exclude<ClientInputEvent, { type: "assistant.message" }>): string {
+    switch (event.type) {
+      case "assistant.thinking":
+        return `- assistant.thinking${event.text ? `: ${event.text}` : ""}`;
+      case "session.compacting":
+        return `- session.compacting${event.text ? `: ${event.text}` : ""}`;
+      case "assistant.tool.running":
+        return `- assistant.tool.running: ${event.toolName}${event.text ? ` (${event.text})` : ""}`;
+      case "assistant.tool.done":
+        return `- assistant.tool.done: ${event.toolName}${event.text ? ` (${event.text})` : ""}`;
+      case "assistant.tool.error":
+        return `- assistant.tool.error: ${event.toolName}${event.text ? ` (${event.text})` : ""}`;
+    }
+  }
+
+  #progressStatus(event: Exclude<ClientInputEvent, { type: "assistant.message" }>): string {
+    switch (event.type) {
+      case "assistant.tool.error":
+        return "error";
+      case "assistant.tool.done":
+        return "done";
+      default:
+        return "running";
     }
   }
 }

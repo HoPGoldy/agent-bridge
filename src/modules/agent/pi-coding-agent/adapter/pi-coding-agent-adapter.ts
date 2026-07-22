@@ -57,6 +57,7 @@ export class PiCodingAgentAdapter implements AgentAdapter {
       logger: this.#logger,
     });
     this.#client.onEvent((rpcEvent) => {
+      void this.#handleRpcEvent(rpcEvent);
       if (rpcEvent.type === "extension_error") {
         this.#logger.error(`extension_error for ${this.#agentSessionId}:`, rpcEvent);
       }
@@ -122,6 +123,11 @@ export class PiCodingAgentAdapter implements AgentAdapter {
       if (event.type === "user.message") {
         this.#logger.info(`sending prompt to agent (session=${this.#agentSessionId})`);
         const startedAt = Date.now();
+        await this.#emitProgress({
+          type: "assistant.thinking",
+          agentSessionId: this.#agentSessionId,
+          text: "Processing request",
+        });
         await this.#client.prompt(event.text);
         await this.#client.waitForSettled();
         const text = await this.#client.getLastAssistantText();
@@ -133,6 +139,11 @@ export class PiCodingAgentAdapter implements AgentAdapter {
       }
 
       this.#logger.info(`compacting context (session=${this.#agentSessionId})`);
+      await this.#emitProgress({
+        type: "session.compacting",
+        agentSessionId: this.#agentSessionId,
+        text: "Compacting context",
+      });
       const result = await this.#client.compact();
       this.#logger.debug(
         `compact finished (session=${this.#agentSessionId} estimatedTokensAfter=${result.estimatedTokensAfter ?? "unknown"})`,
@@ -163,5 +174,40 @@ export class PiCodingAgentAdapter implements AgentAdapter {
       agentSessionId: this.#agentSessionId,
       text,
     });
+  }
+
+  async #emitProgress(event: Exclude<AgentOutputEvent, { type: "assistant.message" }>): Promise<void> {
+    if (!this.#onOutput) {
+      return;
+    }
+    await this.#onOutput(event);
+  }
+
+  async #handleRpcEvent(rpcEvent: { type: string; [key: string]: unknown }): Promise<void> {
+    if (!this.#onOutput) {
+      return;
+    }
+
+    if (rpcEvent.type === "tool_execution_start") {
+      const toolName = typeof rpcEvent.toolName === "string" ? rpcEvent.toolName : "unknown";
+      await this.#emitProgress({
+        type: "assistant.tool.running",
+        agentSessionId: this.#agentSessionId,
+        toolName,
+        text: `Running ${toolName}`,
+      });
+      return;
+    }
+
+    if (rpcEvent.type === "tool_execution_end") {
+      const toolName = typeof rpcEvent.toolName === "string" ? rpcEvent.toolName : "unknown";
+      const isError = Boolean(rpcEvent.isError);
+      await this.#emitProgress({
+        type: isError ? "assistant.tool.error" : "assistant.tool.done",
+        agentSessionId: this.#agentSessionId,
+        toolName,
+        text: isError ? `Failed ${toolName}` : `Finished ${toolName}`,
+      });
+    }
   }
 }
