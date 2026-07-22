@@ -20,7 +20,10 @@ export class FeishuIMAdapter implements IMAdapter {
     this.#onOutput = onOutput;
     this.#client = new FeishuClient(this.#config, this.#logger);
     this.#client.setOnMessage(async ({ chatId, chatType, text }) => {
-      if (!this.#onOutput) return;
+      if (!this.#onOutput) {
+        this.#logger.warn(`dropping inbound message, adapter not ready (chatId=${chatId})`);
+        return;
+      }
 
       const clientSessionId = buildFeishuSessionId(chatType, chatId);
       const normalizedText = text.trim();
@@ -72,6 +75,7 @@ export class FeishuIMAdapter implements IMAdapter {
     }
 
     this.#egressQueue.push(event);
+    this.#logger.debug(`egress event queued (session=${event.clientSessionId} queueDepth=${this.#egressQueue.length})`);
     void this.#drainEgressQueue();
   }
 
@@ -94,6 +98,7 @@ export class FeishuIMAdapter implements IMAdapter {
           const target = parseFeishuSessionId(event.clientSessionId);
           this.#logger.info(`sending reply (session=${event.clientSessionId})`);
           await this.#client.sendText(target.chatId, event.text);
+          this.#logger.debug(`reply sent (session=${event.clientSessionId})`);
         } catch (error) {
           this.#logger.error("failed to send egress event:", error);
         }

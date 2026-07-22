@@ -1,7 +1,10 @@
 import type { ChannelRunner, RunChannelOptions } from "../types";
 import { GatewayCore } from "./gateway-core";
+import { createLogger } from "./logger";
 import { getTypedAgentModule } from "../modules/agent";
 import { getTypedClientModule } from "../modules/client";
+
+const logger = createLogger("runner");
 
 export async function runChannel({ channelName, channelConfig, defaults }: RunChannelOptions): Promise<ChannelRunner> {
   const clientModule = getTypedClientModule(channelConfig.client);
@@ -17,13 +20,13 @@ export async function runChannel({ channelName, channelConfig, defaults }: RunCh
   });
 
   await core.start();
-  console.log(`[runner] channel ${channelName} started`);
-  console.log("[runner] press Ctrl+C to stop");
+  logger.info(`channel ${channelName} started`);
+  logger.info("press Ctrl+C to stop");
 
   return {
     async stop() {
       await core.stop();
-      console.log(`[runner] channel ${channelName} stopped`);
+      logger.info(`channel ${channelName} stopped`);
     },
   };
 }

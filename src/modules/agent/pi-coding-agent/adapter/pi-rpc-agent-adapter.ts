@@ -71,6 +71,7 @@ export class PiRpcAgentAdapter implements AgentAdapter {
   }
 
   async abort(): Promise<void> {
+    this.#logger.info(`aborting agent turn (session=${this.#agentSessionId})`);
     await this.#client?.abort();
   }
 
@@ -80,6 +81,7 @@ export class PiRpcAgentAdapter implements AgentAdapter {
     }
 
     this.#inputQueue.push(event);
+    this.#logger.debug(`input event queued (session=${this.#agentSessionId} type=${event.type} queueDepth=${this.#inputQueue.length})`);
     void this.#drainInputQueue();
   }
 
@@ -112,15 +114,22 @@ export class PiRpcAgentAdapter implements AgentAdapter {
     try {
       if (event.type === "user.message") {
         this.#logger.info(`sending prompt to agent (session=${this.#agentSessionId})`);
+        const startedAt = Date.now();
         await this.#client.prompt(event.text);
         await this.#client.waitForSettled();
         const text = await this.#client.getLastAssistantText();
+        this.#logger.debug(
+          `prompt settled (session=${this.#agentSessionId} durationMs=${Date.now() - startedAt} replyLength=${text?.length ?? 0})`,
+        );
         await this.#emitAssistant(text ?? "(pi returned no assistant text)");
         return;
       }
 
       this.#logger.info(`compacting context (session=${this.#agentSessionId})`);
       const result = await this.#client.compact();
+      this.#logger.debug(
+        `compact finished (session=${this.#agentSessionId} estimatedTokensAfter=${result.estimatedTokensAfter ?? "unknown"})`,
+      );
       const suffix =
         typeof result.estimatedTokensAfter === "number"
           ? ` Estimated tokens after: ${result.estimatedTokensAfter}.`
@@ -128,6 +137,7 @@ export class PiRpcAgentAdapter implements AgentAdapter {
       await this.#emitAssistant(`Context compacted.${suffix}`);
     } catch (error) {
       const message = error instanceof Error ? error.message : String(error);
+      this.#logger.error(`event processing failed (session=${this.#agentSessionId} type=${event.type}):`, error);
       await this.#emitAssistant(`[pi-rpc error] ${message}`);
     }
   }

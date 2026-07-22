@@ -102,6 +102,7 @@ export class PiRpcClient {
   #detachStdoutReader: (() => void) | null = null;
   #settledWaiters: Array<{ resolve: () => void; reject: (error: Error) => void }> = [];
   #started = false;
+  #stopping = false;
   #exitError: Error | null = null;
   #eventListeners = new Set<(event: PiRpcEvent) => void>();
 
@@ -146,6 +147,7 @@ export class PiRpcClient {
       env: process.env,
       stdio: ["pipe", "pipe", "pipe"],
     });
+    this.#logger.info(`spawned pi process (pid=${child.pid} bin=${this.#options.bin} args=${args.join(" ")} cwd=${this.#options.cwd})`);
 
     this.#process = child;
     this.#started = true;
@@ -153,6 +155,7 @@ export class PiRpcClient {
 
     child.stderr.on("data", (chunk) => {
       this.#stderr += chunk.toString();
+      this.#logger.debug(`pi stderr: ${chunk.toString().trimEnd()}`);
     });
 
     child.once("error", (error) => {
@@ -186,6 +189,7 @@ export class PiRpcClient {
     const child = this.#process;
     if (!child) return;
 
+    this.#stopping = true;
     this.#detachStdoutReader?.();
     this.#detachStdoutReader = null;
 
@@ -201,6 +205,7 @@ export class PiRpcClient {
       child.kill("SIGTERM");
       setTimeout(() => {
         if (child.exitCode === null && child.signalCode === null) {
+          this.#logger.warn("pi process did not exit after SIGTERM, sending SIGKILL");
           child.kill("SIGKILL");
         }
         done();
@@ -271,6 +276,7 @@ export class PiRpcClient {
 
     const id = `req-${++this.#requestId}`;
     const payload = { ...command, id };
+    this.#logger.debug(`sending command (id=${id} type=${command.type})`);
 
     return new Promise<PiRpcResponse>((resolve, reject) => {
       this.#pendingRequests.set(id, { resolve, reject });
@@ -278,10 +284,13 @@ export class PiRpcClient {
       this.#process!.stdin.write(serializeJsonLine(payload), (error) => {
         if (!error) return;
         this.#pendingRequests.delete(id);
+        this.#logger.error(`failed to write command to pi RPC stdin (id=${id}):`, error);
         reject(new Error(`Failed to write to pi RPC stdin: ${error.message}`));
       });
     }).then((response) => {
+      this.#logger.debug(`received response (id=${id} type=${command.type} success=${response.success})`);
       if (!response.success) {
+        this.#logger.error(`pi RPC command failed (id=${id} type=${response.command}): ${response.error ?? "unknown error"}`);
         throw new Error(response.error ?? `pi RPC command failed: ${response.command}`);
       }
       return response;
@@ -300,15 +309,22 @@ export class PiRpcClient {
     if (payload.type === "response") {
       const response = payload as PiRpcResponse;
       const id = response.id;
-      if (!id) return;
+      if (!id) {
+        this.#logger.warn("ignoring RPC response without id:", JSON.stringify(response).slice(0, 500));
+        return;
+      }
       const pending = this.#pendingRequests.get(id);
-      if (!pending) return;
+      if (!pending) {
+        this.#logger.warn(`ignoring RPC response with unknown id (id=${id})`);
+        return;
+      }
       this.#pendingRequests.delete(id);
       pending.resolve(response);
       return;
     }
 
     const event = payload as PiRpcEvent;
+    this.#logger.debug(`received event (type=${event.type})`);
     for (const listener of this.#eventListeners) {
       listener(event);
     }
@@ -322,6 +338,12 @@ export class PiRpcClient {
   }
 
   #handleExitError(error: Error): void {
+    if (this.#stopping) {
+      this.#logger.debug(`pi process exited during stop: ${error.message}`);
+    } else {
+      this.#logger.error(error.message);
+    }
+    this.#stopping = false;
     this.#exitError = error;
     this.#process = null;
     this.#started = false;

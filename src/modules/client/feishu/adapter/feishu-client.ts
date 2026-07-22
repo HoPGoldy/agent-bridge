@@ -151,7 +151,9 @@ export class FeishuClient {
       },
     });
 
+    this.#logger.info(`starting websocket (domain=${this.#config.domain ?? "feishu"})`);
     await this.#wsClient.start({ eventDispatcher: dispatcher });
+    this.#logger.info("websocket started");
   }
 
   async disconnect(): Promise<void> {
@@ -163,8 +165,8 @@ export class FeishuClient {
     if (this.#wsClient) {
       try {
         this.#wsClient.close({ force: true });
-      } catch {
-        // ignore close errors
+      } catch (error) {
+        this.#logger.debug("ignored websocket close error:", error);
       }
       this.#wsClient = null;
     }
@@ -180,22 +182,29 @@ export class FeishuClient {
         content,
       },
     });
+    this.#logger.debug(`message sent (chatId=${chatId} length=${text.length})`);
   }
 
   async #handleMessage(data: FeishuMessagePayload): Promise<void> {
     const message = data.message;
     const sender = data.sender;
-    if (!message || !sender) return;
+    if (!message || !sender) {
+      this.#logger.warn("dropping event with missing message or sender:", JSON.stringify(data).slice(0, 500));
+      return;
+    }
 
     if (sender.sender_type === "app" || sender.sender_type === "bot") {
+      this.#logger.debug(`ignoring message from ${sender.sender_type} (messageId=${message.message_id ?? "unknown"})`);
       return;
     }
 
     if (message.create_time && this.#isExpired(message.create_time)) {
+      this.#logger.debug(`dropping expired message (messageId=${message.message_id ?? "unknown"} createTime=${message.create_time})`);
       return;
     }
 
     if (!this.#recordDedup(message.message_id)) {
+      this.#logger.debug(`dropping duplicate message (messageId=${message.message_id ?? "unknown"})`);
       return;
     }
 
@@ -206,11 +215,13 @@ export class FeishuClient {
       !message.chat_type ||
       !message.message_id
     ) {
+      this.#logger.warn("dropping message with missing fields:", JSON.stringify(message).slice(0, 500));
       return;
     }
 
     const text = parseTextContent(message.content, message.message_type, message.mentions ?? []);
     if (!text) {
+      this.#logger.debug(`dropping message with no text content (messageId=${message.message_id} messageType=${message.message_type})`);
       return;
     }
 
@@ -232,6 +243,7 @@ export class FeishuClient {
       const oldest = this.#dedup.keys().next().value;
       if (typeof oldest === "string") {
         this.#dedup.delete(oldest);
+        this.#logger.warn(`dedup cache exceeded ${DEDUP_MAX_ENTRIES} entries, evicted oldest (messageId=${oldest})`);
       }
     }
 
@@ -248,10 +260,15 @@ export class FeishuClient {
     if (this.#dedupTimer) return;
     this.#dedupTimer = setInterval(() => {
       const cutoff = now() - DEDUP_TTL_MS;
+      let evicted = 0;
       for (const [messageId, timestamp] of this.#dedup) {
         if (timestamp < cutoff) {
           this.#dedup.delete(messageId);
+          evicted += 1;
         }
+      }
+      if (evicted > 0) {
+        this.#logger.debug(`dedup sweep evicted ${evicted} entries (remaining=${this.#dedup.size})`);
       }
     }, DEDUP_SWEEP_INTERVAL_MS);
   }
