@@ -2,6 +2,7 @@ import process from "node:process";
 import { Command } from "commander";
 import type { AgentConfig, AgentModule, AppConfig, ChannelConfig, ClientConfig, ClientModule, ConfigAdapter } from "./types";
 import { createPromptContext } from "./config/prompt";
+import { removeSessionBindingStore } from "./config/session-bindings";
 import { getConfigPath, loadConfig, saveConfig } from "./config/store";
 import { runChannel } from "./core/channel-runner";
 import { getAgentModule, listAgentModules } from "./modules/agent";
@@ -117,6 +118,7 @@ async function removeChannel(channelName: string): Promise<void> {
 
   delete config.channels[channelName];
   await saveConfig(config);
+  await removeSessionBindingStore(channelName);
   console.log(`Removed channel ${channelName}`);
 }
 

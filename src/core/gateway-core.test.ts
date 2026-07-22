@@ -8,6 +8,7 @@ import type {
   ClientEgressEvent,
   ClientIngressEvent,
   IMAdapter,
+  SessionBindingStore,
 } from "../types";
 
 function sleep(ms: number): Promise<void> {
@@ -97,6 +98,20 @@ class FakeAgentAdapter implements AgentAdapter {
     };
     this.outputs.push(event);
     await this.#onOutput?.(event);
+  }
+}
+
+class FakeBindingStore implements SessionBindingStore {
+  readonly saved: Array<Record<string, string>> = [];
+
+  constructor(readonly initial: Record<string, string> = {}) {}
+
+  async load(): Promise<Record<string, string>> {
+    return this.initial;
+  }
+
+  async save(bindings: Record<string, string>): Promise<void> {
+    this.saved.push({ ...bindings });
   }
 }
 
@@ -201,6 +216,88 @@ describe("GatewayCore", () => {
     await sleep(30);
 
     expect(imAdapter.outputs.some((event) => event.text === "late reply after release")).toBe(false);
+  });
+
+  it("resumes the persisted agent session for a known client after restart", async () => {
+    const imAdapter = new FakeIMAdapter();
+    const bindingStore = new FakeBindingStore({ "client-1": "agent-1" });
+    const resumed: string[] = [];
+    let createCount = 0;
+    const resumedAdapters: FakeAgentAdapter[] = [];
+
+    const agentModule: AgentModule<Record<string, never>> = {
+      type: "fake",
+      async createAgentSession() {
+        createCount += 1;
+        return {
+          agentSessionId: "agent-new",
+          agentAdapter: new FakeAgentAdapter("agent-new"),
+        };
+      },
+      async resumeAgentSession({ agentSessionId }) {
+        resumed.push(agentSessionId);
+        const adapter = new FakeAgentAdapter(agentSessionId);
+        resumedAdapters.push(adapter);
+        return adapter;
+      },
+    };
+
+    const core = new GatewayCore({
+      imAdapter,
+      agentModule,
+      agentConfig: {},
+      agentIdleTimeoutMs: 60_000,
+      bindingStore,
+    });
+    running.push(core);
+    await core.start();
+
+    await imAdapter.emit({
+      type: "user.message",
+      clientSessionId: "client-1",
+      text: "hello again",
+    });
+
+    await waitFor(() => {
+      expect(resumed).toEqual(["agent-1"]);
+      expect(createCount).toBe(0);
+      expect(resumedAdapters[0]!.inputs).toEqual([{ type: "user.message", text: "hello again" }]);
+    });
+  });
+
+  it("persists the binding when a new agent session is created", async () => {
+    const imAdapter = new FakeIMAdapter();
+    const bindingStore = new FakeBindingStore();
+
+    const agentModule: AgentModule<Record<string, never>> = {
+      type: "fake",
+      async createAgentSession() {
+        return {
+          agentSessionId: "agent-1",
+          agentAdapter: new FakeAgentAdapter("agent-1"),
+        };
+      },
+    };
+
+    const core = new GatewayCore({
+      imAdapter,
+      agentModule,
+      agentConfig: {},
+      agentIdleTimeoutMs: 60_000,
+      bindingStore,
+    });
+    running.push(core);
+    await core.start();
+
+    await imAdapter.emit({
+      type: "user.message",
+      clientSessionId: "client-1",
+      text: "hello",
+    });
+
+    await waitFor(() => {
+      expect(bindingStore.saved.at(-1)).toEqual({ "client-1": "agent-1" });
+    });
   });
 
   it("returns a message when compact is requested without an active agent session", async () => {

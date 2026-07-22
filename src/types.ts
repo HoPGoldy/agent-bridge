@@ -138,6 +138,12 @@ export interface GatewayCoreOptions {
   agentModule: AgentModule<any>;
   agentConfig: AgentConfig["config"];
   agentIdleTimeoutMs: number;
+  bindingStore?: SessionBindingStore;
+}
+
+export interface SessionBindingStore {
+  load(): Promise<Record<string, string>>;
+  save(bindings: Record<string, string>): Promise<void>;
 }
 
 export interface RunChannelOptions {

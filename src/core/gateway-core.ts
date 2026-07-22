@@ -14,21 +14,30 @@ export class GatewayCore {
   readonly #agentModule: GatewayCoreOptions["agentModule"];
   readonly #agentConfig: GatewayCoreOptions["agentConfig"];
   readonly #agentIdleTimeoutMs: number;
+  readonly #bindingStore: GatewayCoreOptions["bindingStore"];
   readonly #logger: Logger = createLogger("core");
   readonly #clientToAgentSession = new Map<string, string>();
   readonly #agentRuntimes = new Map<string, AgentRuntime>();
   #started = false;
 
-  constructor({ imAdapter, agentModule, agentConfig, agentIdleTimeoutMs }: GatewayCoreOptions) {
+  constructor({ imAdapter, agentModule, agentConfig, agentIdleTimeoutMs, bindingStore }: GatewayCoreOptions) {
     this.#imAdapter = imAdapter;
     this.#agentModule = agentModule;
     this.#agentConfig = agentConfig;
     this.#agentIdleTimeoutMs = agentIdleTimeoutMs;
+    this.#bindingStore = bindingStore;
   }
 
   async start(): Promise<void> {
     if (this.#started) return;
     this.#started = true;
+
+    if (this.#bindingStore) {
+      const bindings = await this.#bindingStore.load();
+      for (const [clientSessionId, agentSessionId] of Object.entries(bindings)) {
+        this.#clientToAgentSession.set(clientSessionId, agentSessionId);
+      }
+    }
 
     await this.#imAdapter.start(async (event) => {
       try {
@@ -181,6 +190,18 @@ export class GatewayCore {
 
   #bindClientToAgent(clientSessionId: string, agentSessionId: string): void {
     this.#clientToAgentSession.set(clientSessionId, agentSessionId);
+    void this.#persistBindings();
+  }
+
+  async #persistBindings(): Promise<void> {
+    if (!this.#bindingStore) {
+      return;
+    }
+    try {
+      await this.#bindingStore.save(Object.fromEntries(this.#clientToAgentSession));
+    } catch (error) {
+      this.#logger.error("failed to persist session bindings:", error);
+    }
   }
 
   async #handleAgentOutput(event: AgentOutputEvent): Promise<void> {

@@ -1,6 +1,7 @@
 import type { ChannelRunner, RunChannelOptions } from "../types";
 import { GatewayCore } from "./gateway-core";
 import { createLogger } from "./logger";
+import { createFileSessionBindingStore, getSessionBindingStorePath } from "../config/session-bindings";
 import { getTypedAgentModule } from "../modules/agent";
 import { getTypedClientModule } from "../modules/client";
 
@@ -11,12 +12,14 @@ export async function runChannel({ channelName, channelConfig, defaults }: RunCh
   const agentModule = getTypedAgentModule(channelConfig.agent);
 
   const imAdapter = clientModule.createClientAdapter(channelConfig.client.config);
+  const bindingStore = createFileSessionBindingStore(getSessionBindingStorePath(channelName));
 
   const core = new GatewayCore({
     imAdapter,
     agentModule,
     agentConfig: channelConfig.agent.config,
     agentIdleTimeoutMs: defaults.agentIdleTimeoutMs,
+    bindingStore,
   });
 
   await core.start();

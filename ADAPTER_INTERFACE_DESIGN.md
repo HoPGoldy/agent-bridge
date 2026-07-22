@@ -326,7 +326,7 @@ Core 现在只负责：
 4. 处理 `command.session.new`
 5. 将 `command.session.compact` 路由给当前 active agent session
 6. 接收 `AgentOutputEvent`
-7. 通过 `agentSessionId -> clientSessionId` 反查目标 client
+7. 通过 `agentSessionId -> AgentRuntime -> clientSessionId` 反查目标 client
 8. 丢弃 stale agent session 的晚到输出
 
 Core 不负责：
@@ -346,12 +346,11 @@ Core 不负责：
 
 ## Core 状态模型
 
-Core 维护三类核心状态：
+Core 维护两类核心状态：
 
 ```ts
-clientSessionId -> agentSessionId
-agentSessionId -> clientSessionId
-agentSessionId -> AgentRuntime
+clientSessionId -> agentSessionId   // 持久化到磁盘（按 channel 一个 JSON 文件），重启后可 resume
+agentSessionId -> AgentRuntime      // 仅内存
 ```
 
 其中：
@@ -359,6 +358,7 @@ agentSessionId -> AgentRuntime
 ```ts
 interface AgentRuntime {
   agentSessionId: string;
+  clientSessionId: string; // 反向查找由 runtime 派生，不再单独维护 agentSessionId -> clientSessionId
   agentAdapter: AgentAdapter;
 }
 ```
@@ -366,7 +366,8 @@ interface AgentRuntime {
 说明：
 
 - 当前 active agent session 是按 `clientSessionId` 查到的
-- agent 输出回流时，通过 `agentSessionId -> clientSessionId` 反查要回哪个 client 会话
+- agent 输出回流时，通过 `agentSessionId -> AgentRuntime` 找到 runtime，再从 `runtime.clientSessionId` 反查目标 client 会话；runtime 已释放的输出直接丢弃
+- `clientSessionId -> agentSessionId` 绑定在变更时持久化，进程重启后重新加载，下一条消息走 `resumeAgentSession()` 恢复原会话
 
 ---
 
@@ -491,7 +492,7 @@ agentSessionId -> {
 当某个 agent runtime 因 idle timeout 被回收时：
 
 - 删除 `agentSessionId -> AgentRuntime`
-- 保留 `clientSessionId <-> agentSessionId` 映射
+- 保留 `clientSessionId -> agentSessionId` 映射
 
 后续如果该 `clientSessionId` 再收到新消息：
 
@@ -500,10 +501,8 @@ agentSessionId -> {
 
 如果发生退化创建，则 Core 必须：
 
-1. 删除旧的 `agentSessionId -> clientSessionId` 映射
-2. 更新 `clientSessionId -> newAgentSessionId`
-3. 建立 `newAgentSessionId -> clientSessionId`
-4. 用新的 runtime 替换旧绑定
+1. 更新 `clientSessionId -> newAgentSessionId`（旧 agent 的 runtime 已不存在，反向查找随之自动失效）
+2. 用新的 runtime 替换旧绑定
 
 这意味着：
 
