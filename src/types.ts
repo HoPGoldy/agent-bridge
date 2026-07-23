@@ -33,6 +33,14 @@ export interface OutboundAttachment {
   caption?: string;
 }
 
+type ToolProgressPayload = {
+  toolName: string;
+  toolCallId?: string;
+  toolInput?: unknown;
+  toolLabel?: string;
+  text?: string;
+};
+
 type AgentOutputPayload =
   | {
       type: "assistant.message";
@@ -43,21 +51,21 @@ type AgentOutputPayload =
       type: "assistant.thinking";
       text?: string;
     }
-  | {
+  | ({
       type: "assistant.tool.running";
-      toolName: string;
-      text?: string;
-    }
-  | {
+    } & ToolProgressPayload)
+  | ({
+      type: "assistant.tool.update";
+      partialResult?: unknown;
+    } & ToolProgressPayload)
+  | ({
       type: "assistant.tool.done";
-      toolName: string;
-      text?: string;
-    }
-  | {
+      result?: unknown;
+    } & ToolProgressPayload)
+  | ({
       type: "assistant.tool.error";
-      toolName: string;
-      text?: string;
-    }
+      result?: unknown;
+    } & ToolProgressPayload)
   | {
       type: "session.compacting";
       text?: string;

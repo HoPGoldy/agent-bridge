@@ -44,6 +44,68 @@ afterEach(() => {
 });
 
 describe("PiCodingAgentAdapter", () => {
+  it("forwards tool execution events with tool ids and labels", async () => {
+    const adapter = new PiCodingAgentAdapter({ agentSessionId: "agent-1" });
+    const outputs: AgentOutputEvent[] = [];
+
+    await adapter.start((event) => {
+      outputs.push(event);
+    });
+
+    rpcClients[0]?.emit({
+      type: "tool_execution_start",
+      toolCallId: "call-1",
+      toolName: "bash",
+      args: { command: "ls -la" },
+    });
+    rpcClients[0]?.emit({
+      type: "tool_execution_update",
+      toolCallId: "call-1",
+      toolName: "bash",
+      args: { command: "ls -la" },
+      partialResult: { content: [{ type: "text", text: "partial output" }] },
+    });
+    rpcClients[0]?.emit({
+      type: "tool_execution_end",
+      toolCallId: "call-1",
+      toolName: "bash",
+      result: { content: [{ type: "text", text: "done" }] },
+      isError: false,
+    });
+
+    expect(outputs).toEqual([
+      {
+        type: "assistant.tool.running",
+        agentSessionId: "agent-1",
+        toolName: "bash",
+        toolCallId: "call-1",
+        toolInput: { command: "ls -la" },
+        toolLabel: "ls -la",
+        text: "Running bash",
+      },
+      {
+        type: "assistant.tool.update",
+        agentSessionId: "agent-1",
+        toolName: "bash",
+        toolCallId: "call-1",
+        toolInput: { command: "ls -la" },
+        toolLabel: "ls -la",
+        partialResult: { content: [{ type: "text", text: "partial output" }] },
+        text: "Running bash",
+      },
+      {
+        type: "assistant.tool.done",
+        agentSessionId: "agent-1",
+        toolName: "bash",
+        toolCallId: "call-1",
+        toolInput: { command: "ls -la" },
+        toolLabel: "ls -la",
+        result: { content: [{ type: "text", text: "done" }] },
+        text: "Finished bash",
+      },
+    ]);
+  });
+
   it("forwards assistant text from Pi message_end text blocks", async () => {
     const adapter = new PiCodingAgentAdapter({ agentSessionId: "agent-1" });
     const outputs: AgentOutputEvent[] = [];

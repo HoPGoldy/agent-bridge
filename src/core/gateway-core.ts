@@ -278,6 +278,8 @@ export class GatewayCore {
         agentSessionId,
         clientSessionId,
         toolName: "toolName" in event ? event.toolName : undefined,
+        toolCallId: "toolCallId" in event ? event.toolCallId : undefined,
+        toolLabel: "toolLabel" in event ? event.toolLabel : undefined,
         text: event.text,
       });
     }
@@ -302,10 +304,18 @@ export class GatewayCore {
     event: AgentOutputEvent,
   ): event is Extract<
     AgentOutputEvent,
-    { type: "assistant.tool.running" | "assistant.tool.done" | "assistant.tool.error" | "session.compacting" }
+    {
+      type:
+        | "assistant.tool.running"
+        | "assistant.tool.update"
+        | "assistant.tool.done"
+        | "assistant.tool.error"
+        | "session.compacting";
+    }
   > {
     return (
       event.type === "assistant.tool.running" ||
+      event.type === "assistant.tool.update" ||
       event.type === "assistant.tool.done" ||
       event.type === "assistant.tool.error" ||
       event.type === "session.compacting"

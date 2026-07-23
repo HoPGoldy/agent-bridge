@@ -27,6 +27,7 @@ describe("ProgressRenderer", () => {
     const events: ClientInputEvent[] = [
       { type: "session.compacting", clientSessionId: "s1" },
       { type: "assistant.tool.running", clientSessionId: "s1", toolName: "bash" },
+      { type: "assistant.tool.update", clientSessionId: "s1", toolName: "bash" },
       { type: "assistant.tool.done", clientSessionId: "s1", toolName: "bash" },
       { type: "assistant.tool.error", clientSessionId: "s1", toolName: "bash" },
     ];
@@ -46,7 +47,7 @@ describe("ProgressRenderer", () => {
     });
   });
 
-  it("formats tool running/done/error and session.compacting lines", () => {
+  it("formats legacy tool running/done/error and session.compacting lines", () => {
     const renderer = new ProgressRenderer();
     const events: ProgressEvent[] = [
       { type: "assistant.tool.running", clientSessionId: "s1", toolName: "web_search" },
@@ -97,10 +98,58 @@ describe("ProgressRenderer", () => {
     expect(renderer3.getCurrentProgress().markdown).toBe("- Failed bash: permission denied");
   });
 
+  it("updates the same tool row in place when toolCallId is present", () => {
+    const renderer = new ProgressRenderer();
+
+    renderer.takeProgressEvent({
+      type: "assistant.tool.running",
+      clientSessionId: "s1",
+      toolName: "bash",
+      toolCallId: "call-1",
+      toolLabel: "ls -la",
+    });
+    expect(renderer.getCurrentProgress().markdown).toBe("- Running bash: ls -la");
+
+    renderer.takeProgressEvent({
+      type: "assistant.tool.update",
+      clientSessionId: "s1",
+      toolName: "bash",
+      toolCallId: "call-1",
+      toolLabel: "ls -la",
+    });
+    expect(renderer.getCurrentProgress().markdown).toBe("- Running bash: ls -la");
+
+    renderer.takeProgressEvent({
+      type: "assistant.tool.done",
+      clientSessionId: "s1",
+      toolName: "bash",
+      toolCallId: "call-1",
+      toolLabel: "ls -la",
+    });
+    expect(renderer.getCurrentProgress().markdown).toBe("- Finished bash: ls -la");
+  });
+
+  it("truncates long tool labels in rendered progress", () => {
+    const renderer = new ProgressRenderer();
+
+    renderer.takeProgressEvent({
+      type: "assistant.tool.running",
+      clientSessionId: "s1",
+      toolName: "bash",
+      toolCallId: "call-1",
+      toolLabel: "12345678901234567890",
+    });
+
+    expect(renderer.getCurrentProgress().markdown).toBe("- Running bash: 123456789012345…");
+  });
+
   it("tracks status across the most recent event", () => {
     const renderer = new ProgressRenderer();
 
     renderer.takeProgressEvent({ type: "assistant.tool.running", clientSessionId: "s1", toolName: "bash" });
+    expect(renderer.getCurrentProgress().status).toBe("running");
+
+    renderer.takeProgressEvent({ type: "assistant.tool.update", clientSessionId: "s1", toolName: "bash" });
     expect(renderer.getCurrentProgress().status).toBe("running");
 
     renderer.takeProgressEvent({ type: "assistant.tool.done", clientSessionId: "s1", toolName: "bash" });
@@ -108,6 +157,40 @@ describe("ProgressRenderer", () => {
 
     renderer.takeProgressEvent({ type: "assistant.tool.error", clientSessionId: "s1", toolName: "bash" });
     expect(renderer.getCurrentProgress().status).toBe("error");
+  });
+
+  it("moves an updated tool row to the end so recent activity stays visible", () => {
+    const renderer = new ProgressRenderer({ collapseThreshold: 2 });
+
+    renderer.takeProgressEvent({
+      type: "assistant.tool.running",
+      clientSessionId: "s1",
+      toolName: "a",
+      toolCallId: "call-a",
+    });
+    renderer.takeProgressEvent({
+      type: "assistant.tool.running",
+      clientSessionId: "s1",
+      toolName: "b",
+      toolCallId: "call-b",
+    });
+    renderer.takeProgressEvent({
+      type: "assistant.tool.running",
+      clientSessionId: "s1",
+      toolName: "c",
+      toolCallId: "call-c",
+    });
+
+    expect(renderer.getCurrentProgress().markdown).toBe(["- Collapsed 1 earlier updates.", "- Running b", "- Running c"].join("\n"));
+
+    renderer.takeProgressEvent({
+      type: "assistant.tool.done",
+      clientSessionId: "s1",
+      toolName: "a",
+      toolCallId: "call-a",
+    });
+
+    expect(renderer.getCurrentProgress().markdown).toBe(["- Collapsed 1 earlier updates.", "- Running c", "- Finished a"].join("\n"));
   });
 
   it("collapses lines beyond the default threshold of 10", () => {

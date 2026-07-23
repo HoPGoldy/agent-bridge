@@ -17,6 +17,8 @@ export class PiCodingAgentAdapter implements AgentAdapter {
   #onOutput: ((event: AgentOutputEvent) => Promise<void> | void) | null = null;
   #inputQueue: AgentInputEvent[] = [];
   #processing = false;
+  #toolLabelByCallId = new Map<string, string>();
+  #toolInputByCallId = new Map<string, unknown>();
 
   constructor({
     agentSessionId,
@@ -70,6 +72,8 @@ export class PiCodingAgentAdapter implements AgentAdapter {
 
   async stop(): Promise<void> {
     this.#inputQueue.length = 0;
+    this.#toolLabelByCallId.clear();
+    this.#toolInputByCallId.clear();
     await this.#client?.stop();
     this.#client = null;
     this.#processing = false;
@@ -208,10 +212,42 @@ export class PiCodingAgentAdapter implements AgentAdapter {
 
     if (rpcEvent.type === "tool_execution_start") {
       const toolName = typeof rpcEvent.toolName === "string" ? rpcEvent.toolName : "unknown";
+      const toolCallId = typeof rpcEvent.toolCallId === "string" ? rpcEvent.toolCallId : undefined;
+      const toolInput = "args" in rpcEvent ? rpcEvent.args : undefined;
+      const toolLabel = this.#summarizeToolLabel(toolName, toolInput);
+      if (toolCallId) {
+        if (toolLabel) this.#toolLabelByCallId.set(toolCallId, toolLabel);
+        if (toolInput !== undefined) this.#toolInputByCallId.set(toolCallId, toolInput);
+      }
       await this.#emitProgress({
         type: "assistant.tool.running",
         agentSessionId: this.#agentSessionId,
         toolName,
+        toolCallId,
+        toolInput,
+        toolLabel,
+        text: `Running ${toolName}`,
+      });
+      return;
+    }
+
+    if (rpcEvent.type === "tool_execution_update") {
+      const toolName = typeof rpcEvent.toolName === "string" ? rpcEvent.toolName : "unknown";
+      const toolCallId = typeof rpcEvent.toolCallId === "string" ? rpcEvent.toolCallId : undefined;
+      const toolInput = "args" in rpcEvent ? rpcEvent.args : this.#toolInputForCall(toolCallId);
+      const toolLabel = this.#toolLabelForCall(toolCallId, toolName, toolInput);
+      if (toolCallId) {
+        if (toolLabel) this.#toolLabelByCallId.set(toolCallId, toolLabel);
+        if (toolInput !== undefined) this.#toolInputByCallId.set(toolCallId, toolInput);
+      }
+      await this.#emitProgress({
+        type: "assistant.tool.update",
+        agentSessionId: this.#agentSessionId,
+        toolName,
+        toolCallId,
+        toolInput,
+        toolLabel,
+        partialResult: "partialResult" in rpcEvent ? rpcEvent.partialResult : undefined,
         text: `Running ${toolName}`,
       });
       return;
@@ -219,14 +255,93 @@ export class PiCodingAgentAdapter implements AgentAdapter {
 
     if (rpcEvent.type === "tool_execution_end") {
       const toolName = typeof rpcEvent.toolName === "string" ? rpcEvent.toolName : "unknown";
+      const toolCallId = typeof rpcEvent.toolCallId === "string" ? rpcEvent.toolCallId : undefined;
       const isError = Boolean(rpcEvent.isError);
+      const toolInput = this.#toolInputForCall(toolCallId);
+      const toolLabel = this.#toolLabelForCall(toolCallId, toolName, toolInput);
       await this.#emitProgress({
         type: isError ? "assistant.tool.error" : "assistant.tool.done",
         agentSessionId: this.#agentSessionId,
         toolName,
+        toolCallId,
+        toolInput,
+        toolLabel,
+        result: "result" in rpcEvent ? rpcEvent.result : undefined,
         text: isError ? `Failed ${toolName}` : `Finished ${toolName}`,
       });
+      if (toolCallId) {
+        this.#toolLabelByCallId.delete(toolCallId);
+        this.#toolInputByCallId.delete(toolCallId);
+      }
     }
+  }
+
+  #toolInputForCall(toolCallId: string | undefined): unknown {
+    return toolCallId ? this.#toolInputByCallId.get(toolCallId) : undefined;
+  }
+
+  #toolLabelForCall(toolCallId: string | undefined, toolName: string, toolInput: unknown): string | undefined {
+    return (toolCallId ? this.#toolLabelByCallId.get(toolCallId) : undefined) ?? this.#summarizeToolLabel(toolName, toolInput);
+  }
+
+  #summarizeToolLabel(toolName: string, toolInput: unknown): string | undefined {
+    if (!toolInput || typeof toolInput !== "object" || Array.isArray(toolInput)) {
+      return undefined;
+    }
+
+    const input = toolInput as Record<string, unknown>;
+    const stringField = (key: string): string | undefined => {
+      const value = input[key];
+      return typeof value === "string" && value.trim().length > 0 ? value.trim() : undefined;
+    };
+    const stringArrayField = (key: string): string[] | undefined => {
+      const value = input[key];
+      if (!Array.isArray(value)) return undefined;
+      const items = value.filter((item): item is string => typeof item === "string" && item.trim().length > 0);
+      return items.length > 0 ? items.map((item) => item.trim()) : undefined;
+    };
+
+    switch (toolName) {
+      case "bash":
+        return stringField("command");
+      case "read":
+      case "write":
+      case "edit":
+      case "find":
+      case "ls":
+        return stringField("path");
+      case "grep": {
+        const pattern = stringField("pattern");
+        const path = stringField("path");
+        if (pattern && path) return `${pattern} in ${path}`;
+        return pattern ?? path;
+      }
+      case "web_search": {
+        const query = stringField("query");
+        const queries = stringArrayField("queries");
+        return query ?? (queries ? queries.join(" | ") : undefined);
+      }
+      case "fetch_content": {
+        const url = stringField("url");
+        const urls = stringArrayField("urls");
+        return url ?? (urls ? urls.join(" | ") : undefined);
+      }
+      default:
+        return this.#truncate(this.#safeJson(toolInput), 120);
+    }
+  }
+
+  #safeJson(value: unknown): string | undefined {
+    try {
+      return JSON.stringify(value);
+    } catch {
+      return undefined;
+    }
+  }
+
+  #truncate(value: string | undefined, maxLength: number): string | undefined {
+    if (!value) return undefined;
+    return value.length > maxLength ? `${value.slice(0, maxLength - 1)}…` : value;
   }
 
   #isAssistantMessage(value: unknown): value is { role?: unknown; content?: unknown } {

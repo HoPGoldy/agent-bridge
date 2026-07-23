@@ -18,6 +18,7 @@ export interface RenderedProgress {
 }
 
 const DEFAULT_COLLAPSE_THRESHOLD = 10;
+const MAX_TOOL_LABEL_DISPLAY_LENGTH = 15;
 
 /** Rendered when no progress lines have been recorded yet. */
 export const NO_PROGRESS_MARKDOWN = "No progress yet.";
@@ -28,11 +29,24 @@ export const NO_PROGRESS_MARKDOWN = "No progress yet.";
  * markdown string. One instance tracks one turn's worth of progress;
  * callers should create a fresh instance when a new turn starts.
  */
+type ProgressEntry =
+  | {
+      kind: "line";
+      line: string;
+    }
+  | {
+      kind: "tool";
+      toolName: string;
+      toolLabel?: string;
+      status: "running" | "done" | "error";
+      text?: string;
+    };
+
 export class ProgressRenderer {
   readonly #collapseThreshold: number;
-  #lines: string[] = [];
+  #entries = new Map<string, ProgressEntry>();
+  #order: string[] = [];
   #status = "running";
-  #collapsedCount = 0;
 
   constructor(options: ProgressRendererOptions = {}) {
     this.#collapseThreshold = options.collapseThreshold ?? DEFAULT_COLLAPSE_THRESHOLD;
@@ -45,33 +59,87 @@ export class ProgressRenderer {
 
   /** Records a progress event, formatting it into a line and collapsing older lines if needed. */
   takeProgressEvent(event: ProgressEvent): void {
-    this.#lines.push(this.#formatProgressLine(event));
-    if (this.#lines.length > this.#collapseThreshold) {
-      const overflow = this.#lines.length - this.#collapseThreshold;
-      this.#collapsedCount += overflow;
-      this.#lines.splice(0, overflow);
+    const toolEntryId = this.#toolEntryId(event);
+    if (toolEntryId) {
+      this.#upsertToolEntry(toolEntryId, event);
+    } else {
+      this.#appendLineEntry(this.#formatProgressLine(event));
     }
     this.#status = this.#progressStatus(event);
   }
 
   /** Returns the current rendered markdown, status, and collapsed-line count. */
   getCurrentProgress(): RenderedProgress {
+    const collapsedCount = Math.max(0, this.#order.length - this.#collapseThreshold);
     return {
-      markdown: this.#renderMarkdown(),
+      markdown: this.#renderMarkdown(collapsedCount),
       status: this.#status,
-      collapsedCount: this.#collapsedCount,
+      collapsedCount,
     };
   }
 
-  #renderMarkdown(): string {
+  #renderMarkdown(collapsedCount: number): string {
     const contentLines: string[] = [];
-    if (this.#collapsedCount > 0) {
-      contentLines.push(`- Collapsed ${this.#collapsedCount} earlier updates.`);
+    if (collapsedCount > 0) {
+      contentLines.push(`- Collapsed ${collapsedCount} earlier updates.`);
     }
-    if (this.#lines.length > 0) {
-      contentLines.push(...this.#lines);
+    for (const id of this.#visibleOrder()) {
+      const entry = this.#entries.get(id);
+      if (!entry) continue;
+      contentLines.push(entry.kind === "line" ? entry.line : this.#formatToolEntry(entry));
     }
     return contentLines.length > 0 ? contentLines.join("\n") : NO_PROGRESS_MARKDOWN;
+  }
+
+  #visibleOrder(): string[] {
+    return this.#order.slice(-this.#collapseThreshold);
+  }
+
+  #appendLineEntry(line: string): void {
+    const id = `line:${this.#order.length}`;
+    this.#entries.set(id, { kind: "line", line });
+    this.#order.push(id);
+  }
+
+  #upsertToolEntry(id: string, event: ProgressEvent): void {
+    if (!this.#entries.has(id)) {
+      this.#order.push(id);
+    } else {
+      this.#order = this.#order.filter((entryId) => entryId !== id);
+      this.#order.push(id);
+    }
+
+    this.#entries.set(id, {
+      kind: "tool",
+      toolName: event.toolName,
+      toolLabel: event.toolLabel,
+      status: event.type === "assistant.tool.error" ? "error" : event.type === "assistant.tool.done" ? "done" : "running",
+      text: event.text,
+    });
+  }
+
+  #toolEntryId(event: ProgressEvent): string | null {
+    if (
+      event.type === "assistant.tool.running" ||
+      event.type === "assistant.tool.update" ||
+      event.type === "assistant.tool.done" ||
+      event.type === "assistant.tool.error"
+    ) {
+      return event.toolCallId ? `tool:${event.toolCallId}` : null;
+    }
+    return null;
+  }
+
+  #formatToolEntry(entry: Extract<ProgressEntry, { kind: "tool" }>): string {
+    const subject = this.#formatToolSubject(entry.toolName, entry.toolLabel);
+    switch (entry.status) {
+      case "running":
+        return `- Running ${subject}`;
+      case "done":
+        return `- Finished ${subject}`;
+      case "error":
+        return this.#formatToolErrorLine(subject, entry.text);
+    }
   }
 
   #formatProgressLine(event: ProgressEvent): string {
@@ -79,12 +147,27 @@ export class ProgressRenderer {
       case "session.compacting":
         return `- Compacting session${event.text ? `: ${event.text}` : ""}`;
       case "assistant.tool.running":
-        return `- Running ${event.toolName}`;
+      case "assistant.tool.update":
+        return `- Running ${this.#formatToolSubject(event.toolName, event.toolLabel)}`;
       case "assistant.tool.done":
-        return `- Finished ${event.toolName}`;
+        return `- Finished ${this.#formatToolSubject(event.toolName, event.toolLabel)}`;
       case "assistant.tool.error":
-        return this.#formatToolErrorLine(event.toolName, event.text);
+        return this.#formatToolErrorLine(this.#formatToolSubject(event.toolName, event.toolLabel), event.text);
     }
+  }
+
+  #formatToolSubject(toolName: string, toolLabel?: string): string {
+    const normalizedLabel = toolLabel?.trim();
+    if (!normalizedLabel) {
+      return toolName;
+    }
+    return `${toolName}: ${this.#truncateToolLabel(normalizedLabel)}`;
+  }
+
+  #truncateToolLabel(toolLabel: string): string {
+    return toolLabel.length > MAX_TOOL_LABEL_DISPLAY_LENGTH
+      ? `${toolLabel.slice(0, MAX_TOOL_LABEL_DISPLAY_LENGTH)}…`
+      : toolLabel;
   }
 
   #formatToolErrorLine(toolName: string, text?: string): string {
@@ -95,7 +178,12 @@ export class ProgressRenderer {
 
     const lowerText = normalizedText.toLowerCase();
     const lowerToolName = toolName.toLowerCase();
-    if (lowerText === lowerToolName || lowerText === `failed ${lowerToolName}`) {
+    if (
+      lowerText === lowerToolName ||
+      lowerText === `failed ${lowerToolName}` ||
+      lowerText === `running ${lowerToolName}` ||
+      lowerText === `finished ${lowerToolName}`
+    ) {
       return `- ${this.#humanizeToolError(toolName)}`;
     }
 
