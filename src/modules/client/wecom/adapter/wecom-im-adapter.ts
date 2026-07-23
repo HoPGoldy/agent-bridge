@@ -4,23 +4,13 @@ import { WecomClient } from "./wecom-client";
 import { buildWecomSessionId, parseWecomSessionId } from "./wecom-session";
 
 const MAX_TEXT_CHUNK = 4000;
-const PROGRESS_INTERVAL_MS = 60_000;
-const STARTING_MESSAGE = "I’m starting now — I’ll share a progress update in about a minute.";
-
-type ProgressFlushEvent = {
-  type: "$progress.flush";
-  clientSessionId: string;
-};
-
-type EgressEvent = ClientInputEvent | ProgressFlushEvent;
+const STARTING_MESSAGE = "Processing...";
 
 type ProgressState = {
   lines: string[];
   status: string;
   turnId: number;
   collapsedCount: number;
-  dirty: boolean;
-  interval: NodeJS.Timeout | null;
   announced: boolean;
 };
 
@@ -59,7 +49,7 @@ export class WecomIMAdapter implements IMAdapter {
   readonly #logger: Logger;
   #onOutput: ((event: ClientOutputEvent) => Promise<void> | void) | null = null;
   #client: WecomClient | null = null;
-  #egressQueue: EgressEvent[] = [];
+  #egressQueue: ClientInputEvent[] = [];
   #processing = false;
   #lastInboundMessageIdBySession = new Map<string, string>();
   #progressStateBySession = new Map<string, ProgressState>();
@@ -77,6 +67,12 @@ export class WecomIMAdapter implements IMAdapter {
 
   async #notifySendFailure(chatId: string, error: unknown): Promise<void> {
     if (!this.#client) {
+      return;
+    }
+    if (this.#client.isKicked()) {
+      // The connection is gone for good; a failure notification cannot be
+      // delivered either, so don't attempt one.
+      this.#logger.debug("skipping send-failure notification, connection was replaced");
       return;
     }
 
@@ -98,11 +94,21 @@ export class WecomIMAdapter implements IMAdapter {
   async start(onOutput: (event: ClientOutputEvent) => Promise<void> | void): Promise<void> {
     this.#onOutput = onOutput;
     this.#client = new WecomClient(this.#config, this.#logger);
+    this.#client.setOnKicked(() => {
+      this.#logger.error(
+        "this bot connection was replaced by a newer connection (another instance is running with the same bot credentials); " +
+          "this instance will keep running but can no longer receive or send messages — stop the other instance and restart this process to recover",
+      );
+    });
     this.#client.setOnMessage(async ({ chatId, chatType, text, messageId, mentionedBot }) => {
       if (!this.#onOutput) {
         this.#logger.warn(`dropping inbound message, adapter not ready (chatId=${chatId})`);
         return;
       }
+
+      this.#logger.info(
+        `adapter received inbound message (chatType=${chatType} chatId=${chatId} messageId=${messageId} mentionedBot=${mentionedBot} textLength=${text.trim().length})`,
+      );
 
       const clientSessionId = buildWecomSessionId(chatType, chatId);
 
@@ -139,16 +145,13 @@ export class WecomIMAdapter implements IMAdapter {
     });
 
     await this.#client.connect();
-    this.#logger.info(`adapter started (websocketUrl=${this.#config.websocketUrl ?? "wss://openws.work.weixin.qq.com"})`);
+    this.#logger.info(
+      `adapter started (websocketUrl=${this.#config.websocketUrl ?? "wss://openws.work.weixin.qq.com"})`,
+    );
   }
 
   async stop(): Promise<void> {
     this.#egressQueue.length = 0;
-    for (const state of this.#progressStateBySession.values()) {
-      if (state.interval) {
-        clearInterval(state.interval);
-      }
-    }
     this.#progressStateBySession.clear();
     if (this.#client) {
       await this.#client.disconnect();
@@ -186,18 +189,13 @@ export class WecomIMAdapter implements IMAdapter {
         try {
           const target = parseWecomSessionId(event.clientSessionId);
 
-          if (event.type === "$progress.flush") {
-            await this.#flushProgressSummary(target.chatId, event.clientSessionId);
-            continue;
-          }
-
           if (event.type !== "assistant.message") {
-            this.#recordProgressEvent(event);
+            await this.#handleProgressEvent(target.chatId, event);
             continue;
           }
 
-          this.#stopProgressTimer(event.clientSessionId);
           const replyToMessageId = this.#lastInboundMessageIdBySession.get(event.clientSessionId);
+          await this.#finishProgressMessage(target.chatId, event.clientSessionId, replyToMessageId);
           if (event.text.trim().length > 0) {
             const chunks = chunkText(event.text, MAX_TEXT_CHUNK);
             for (const [index, chunk] of chunks.entries()) {
@@ -233,76 +231,80 @@ export class WecomIMAdapter implements IMAdapter {
       return;
     }
 
-    await this.#client.sendText(chatId, STARTING_MESSAGE, messageId);
+    await this.#client.sendStreamText(chatId, STARTING_MESSAGE, {
+      replyToMessageId: messageId,
+      finish: false,
+    });
     state.announced = true;
   }
 
-  #recordProgressEvent(event: Exclude<ClientInputEvent, { type: "assistant.message" }>): void {
-    if (!this.#shouldRenderProgressEvent(event)) {
+  async #handleProgressEvent(
+    chatId: string,
+    event: Exclude<ClientInputEvent, { type: "assistant.message" }>,
+  ): Promise<void> {
+    if (!this.#client || !this.#shouldRenderProgressEvent(event)) {
       return;
     }
 
-    const state = this.#progressStateBySession.get(event.clientSessionId) ?? this.#createProgressState();
+    const state = this.#progressStateBySession.get(event.clientSessionId) ?? {
+      lines: [],
+      status: "running",
+      turnId: 0,
+      collapsedCount: 0,
+      announced: false,
+    };
     state.lines.push(this.#formatProgressLine(event));
     if (state.lines.length > 10) {
       state.collapsedCount += state.lines.length - 10;
       state.lines.splice(0, state.lines.length - 10);
     }
     state.status = this.#progressStatus(event);
-    state.dirty = true;
     this.#progressStateBySession.set(event.clientSessionId, state);
+
+    // Refresh the same stream message in place, like the feishu adapter
+    // updates its progress card.
+    const body = WecomIMAdapter.progressBody(state.lines, state.collapsedCount);
+    const replyToMessageId = this.#lastInboundMessageIdBySession.get(event.clientSessionId);
+    await this.#client.sendStreamText(chatId, body, {
+      replyToMessageId,
+      finish: false,
+    });
+    state.announced = true;
   }
 
-  async #flushProgressSummary(chatId: string, clientSessionId: string): Promise<void> {
+  async #finishProgressMessage(
+    chatId: string,
+    clientSessionId: string,
+    replyToMessageId?: string,
+  ): Promise<void> {
     const state = this.#progressStateBySession.get(clientSessionId);
-    if (!state || !state.dirty || !this.#client) {
+    if (!state || !state.announced || !this.#client) {
       return;
     }
+    this.#progressStateBySession.delete(clientSessionId);
 
-    const body = WecomIMAdapter.progressBody(state.lines, state.collapsedCount);
-    await this.#client.sendText(chatId, body);
-    state.dirty = false;
-  }
-
-  #queueProgressFlush(clientSessionId: string): void {
-    this.#egressQueue.push({ type: "$progress.flush", clientSessionId });
-    void this.#drainEgressQueue();
-  }
-
-  #createProgressState(previous?: ProgressState): ProgressState {
-    return {
-      lines: [],
-      status: "running",
-      turnId: (previous?.turnId ?? 0) + 1,
-      collapsedCount: 0,
-      dirty: false,
-      interval: null,
-      announced: false,
-    };
+    const body =
+      state.lines.length > 0
+        ? WecomIMAdapter.progressBody(state.lines, state.collapsedCount)
+        : STARTING_MESSAGE;
+    try {
+      await this.#client.sendStreamText(chatId, body, { replyToMessageId, finish: true });
+    } catch (error) {
+      // The stream may already have been auto-closed by the server (10 minute
+      // limit); the final answer is sent as a separate message regardless.
+      this.#logger.warn("failed to finish progress message:", error);
+    }
   }
 
   #resetProgressState(clientSessionId: string): void {
     const previous = this.#progressStateBySession.get(clientSessionId);
-    if (previous?.interval) {
-      clearInterval(previous.interval);
-    }
-    const state = this.#createProgressState(previous);
-    state.interval = setInterval(() => {
-      this.#queueProgressFlush(clientSessionId);
-    }, PROGRESS_INTERVAL_MS);
-    state.interval.unref?.();
-    this.#progressStateBySession.set(clientSessionId, state);
-  }
-
-  #stopProgressTimer(clientSessionId: string): void {
-    const state = this.#progressStateBySession.get(clientSessionId);
-    if (!state) {
-      return;
-    }
-    if (state.interval) {
-      clearInterval(state.interval);
-    }
-    this.#progressStateBySession.delete(clientSessionId);
+    this.#progressStateBySession.set(clientSessionId, {
+      lines: [],
+      status: "running",
+      turnId: (previous?.turnId ?? 0) + 1,
+      collapsedCount: 0,
+      announced: false,
+    });
   }
 
   #shouldRenderProgressEvent(event: Exclude<ClientInputEvent, { type: "assistant.message" }>): boolean {

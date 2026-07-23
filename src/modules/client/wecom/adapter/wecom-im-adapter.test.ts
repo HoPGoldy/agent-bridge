@@ -5,21 +5,34 @@ import { WecomIMAdapter } from "./wecom-im-adapter";
 
 type FakeClientInstance = {
   setOnMessage: (handler: (message: WecomInboundMessage) => Promise<void> | void) => void;
+  setOnKicked: (handler: () => void) => void;
+  isKicked: () => boolean;
   connect: () => Promise<void>;
   disconnect: () => Promise<void>;
   sendText: (chatId: string, text: string, replyToMessageId?: string) => Promise<void>;
+  sendStreamText: (
+    chatId: string,
+    text: string,
+    options?: { replyToMessageId?: string; finish?: boolean; feedbackId?: string },
+  ) => Promise<void>;
   sendAttachment: (chatId: string, attachment: unknown, replyToMessageId?: string) => Promise<void>;
 };
 
 const fakeClientState: {
   onMessage: ((message: WecomInboundMessage) => Promise<void> | void) | null;
+  onKicked: (() => void) | null;
+  kicked: boolean;
   sendText: ReturnType<typeof vi.fn>;
+  sendStreamText: ReturnType<typeof vi.fn>;
   connect: ReturnType<typeof vi.fn>;
   disconnect: ReturnType<typeof vi.fn>;
   sendAttachment: ReturnType<typeof vi.fn>;
 } = {
   onMessage: null,
+  onKicked: null,
+  kicked: false,
   sendText: vi.fn(async () => {}),
+  sendStreamText: vi.fn(async () => {}),
   connect: vi.fn(async () => {}),
   disconnect: vi.fn(async () => {}),
   sendAttachment: vi.fn(async () => {}),
@@ -32,9 +45,16 @@ vi.mock("./wecom-client", () => {
         setOnMessage(handler) {
           fakeClientState.onMessage = handler;
         },
+        setOnKicked(handler) {
+          fakeClientState.onKicked = handler;
+        },
+        isKicked() {
+          return fakeClientState.kicked;
+        },
         connect: fakeClientState.connect,
         disconnect: fakeClientState.disconnect,
         sendText: fakeClientState.sendText,
+        sendStreamText: fakeClientState.sendStreamText,
         sendAttachment: fakeClientState.sendAttachment,
       }),
     ),
@@ -43,8 +63,12 @@ vi.mock("./wecom-client", () => {
 
 function resetFakeClient(): void {
   fakeClientState.onMessage = null;
+  fakeClientState.onKicked = null;
+  fakeClientState.kicked = false;
   fakeClientState.sendText.mockReset();
   fakeClientState.sendText.mockImplementation(async () => {});
+  fakeClientState.sendStreamText.mockReset();
+  fakeClientState.sendStreamText.mockImplementation(async () => {});
   fakeClientState.connect.mockReset();
   fakeClientState.connect.mockImplementation(async () => {});
   fakeClientState.disconnect.mockReset();
@@ -93,7 +117,7 @@ describe("WecomIMAdapter", () => {
     expect(fakeClientState.sendText).not.toHaveBeenCalled();
   });
 
-  it("accepts direct messages and immediately acknowledges in English", async () => {
+  it("accepts direct messages and immediately acknowledges with a short message", async () => {
     const adapter = new WecomIMAdapter(
       {
         botId: "bot-id",
@@ -118,11 +142,10 @@ describe("WecomIMAdapter", () => {
       clientSessionId: "wecom:dm:user_1",
       text: "hello",
     });
-    expect(fakeClientState.sendText).toHaveBeenCalledWith(
-      "user_1",
-      "I’m starting now — I’ll share a progress update in about a minute.",
-      "msg-2",
-    );
+    expect(fakeClientState.sendStreamText).toHaveBeenCalledWith("user_1", "Processing...", {
+      replyToMessageId: "msg-2",
+      finish: false,
+    });
   });
 
   it("forwards /stop to the core as a command event", async () => {
@@ -151,7 +174,7 @@ describe("WecomIMAdapter", () => {
     });
   });
 
-  it("sends chunked replies sequentially and replies only on the first chunk", async () => {
+  it("finishes the progress message and sends chunked replies as separate messages", async () => {
     const adapter = new WecomIMAdapter(
       {
         botId: "bot-id",
@@ -165,13 +188,22 @@ describe("WecomIMAdapter", () => {
     let inFlight = 0;
     let maxInFlight = 0;
 
+    const track = async (label: string) => {
+      inFlight += 1;
+      maxInFlight = Math.max(maxInFlight, inFlight);
+      callOrder.push(label);
+      await Promise.resolve();
+      inFlight -= 1;
+    };
+
+    fakeClientState.sendStreamText.mockImplementation(
+      async (_chatId: string, text: string, options?: { replyToMessageId?: string; finish?: boolean }) => {
+        await track(`stream:${text}:${options?.finish ?? false}`);
+      },
+    );
     fakeClientState.sendText.mockImplementation(
       async (_chatId: string, text: string, replyToMessageId?: string) => {
-        inFlight += 1;
-        maxInFlight = Math.max(maxInFlight, inFlight);
-        callOrder.push(`${text.length}:${replyToMessageId ?? "none"}`);
-        await Promise.resolve();
-        inFlight -= 1;
+        await track(`text:${text.length}:${replyToMessageId ?? "none"}`);
       },
     );
 
@@ -184,6 +216,7 @@ describe("WecomIMAdapter", () => {
       mentionedBot: true,
     });
 
+    fakeClientState.sendStreamText.mockClear();
     fakeClientState.sendText.mockClear();
     callOrder.length = 0;
 
@@ -196,11 +229,18 @@ describe("WecomIMAdapter", () => {
 
     await waitFor(() => fakeClientState.sendText.mock.calls.length === 2);
 
+    expect(fakeClientState.sendStreamText).toHaveBeenCalledTimes(1);
+    expect(fakeClientState.sendStreamText).toHaveBeenCalledWith("group_1", "Processing...", {
+      replyToMessageId: "msg-3",
+      finish: true,
+    });
     expect(fakeClientState.sendText).toHaveBeenCalledTimes(2);
+    expect(fakeClientState.sendText.mock.calls[0]?.[1]).toHaveLength(4000);
     expect(fakeClientState.sendText.mock.calls[0]?.[2]).toBe("msg-3");
+    expect(fakeClientState.sendText.mock.calls[1]?.[1]).toHaveLength(50);
     expect(fakeClientState.sendText.mock.calls[1]?.[2]).toBeUndefined();
     expect(maxInFlight).toBe(1);
-    expect(callOrder).toEqual(["4000:msg-3", "50:none"]);
+    expect(callOrder).toEqual(["stream:Processing...:true", "text:4000:msg-3", "text:50:none"]);
   });
 
   it("notifies the user when delivery fails", async () => {
@@ -243,7 +283,45 @@ describe("WecomIMAdapter", () => {
     expect(fakeClientState.sendText.mock.calls[1]?.[1]).toContain("field validation failed");
   });
 
-  it("sends one progress summary per minute using the same body text as feishu", async () => {
+  it("skips the failure notification when the connection was replaced", async () => {
+    const adapter = new WecomIMAdapter(
+      {
+        botId: "bot-id",
+        secret: "secret",
+        requireMentionInGroup: true,
+      },
+      createLogger("test"),
+    );
+    const onOutput = vi.fn(async () => {});
+
+    await adapter.start(onOutput);
+    await fakeClientState.onMessage?.({
+      chatId: "group_1",
+      chatType: "group",
+      messageId: "msg-kicked-1",
+      text: "hello",
+      mentionedBot: true,
+    });
+
+    fakeClientState.kicked = true;
+    fakeClientState.sendStreamText.mockClear();
+    fakeClientState.sendText.mockClear();
+    fakeClientState.sendText.mockRejectedValue(new Error("WebSocket not connected"));
+
+    await adapter.input({
+      type: "assistant.message",
+      clientSessionId: "wecom:group:group_1",
+      text: "reply body",
+    });
+
+    await waitFor(() => fakeClientState.sendText.mock.calls.length === 1);
+    // Give the drain loop a chance to (wrongly) attempt the notification.
+    await new Promise((resolve) => setTimeout(resolve, 10));
+
+    expect(fakeClientState.sendText).toHaveBeenCalledTimes(1);
+  });
+
+  it("refreshes the same progress stream using the same body text as feishu", async () => {
     vi.useFakeTimers();
 
     const adapter = new WecomIMAdapter(
@@ -264,7 +342,7 @@ describe("WecomIMAdapter", () => {
       mentionedBot: false,
     });
 
-    fakeClientState.sendText.mockClear();
+    fakeClientState.sendStreamText.mockClear();
 
     await adapter.input({
       type: "assistant.thinking",
@@ -293,18 +371,18 @@ describe("WecomIMAdapter", () => {
       text: "Failed bash",
     });
 
-    await vi.advanceTimersByTimeAsync(59_000);
-    expect(fakeClientState.sendText).not.toHaveBeenCalled();
+    await waitFor(() => fakeClientState.sendStreamText.mock.calls.length === 3);
 
-    await vi.advanceTimersByTimeAsync(1_000);
-    await waitFor(() => fakeClientState.sendText.mock.calls.length === 1);
-
-    expect(fakeClientState.sendText.mock.calls[0]?.[1]).toBe(
+    expect(fakeClientState.sendStreamText.mock.calls[2]?.[1]).toBe(
       ["- Running web_search", "- Finished bash", "- Failed bash"].join("\n"),
     );
+    expect(fakeClientState.sendStreamText.mock.calls[2]?.[2]).toEqual({
+      replyToMessageId: "msg-progress-1",
+      finish: false,
+    });
   });
 
-  it("shows a collapsed-updates summary after more than ten progress entries", async () => {
+  it("shows a collapsed-updates summary while refreshing the same progress stream", async () => {
     vi.useFakeTimers();
 
     const adapter = new WecomIMAdapter(
@@ -325,7 +403,7 @@ describe("WecomIMAdapter", () => {
       mentionedBot: false,
     });
 
-    fakeClientState.sendText.mockClear();
+    fakeClientState.sendStreamText.mockClear();
 
     for (let index = 1; index <= 12; index += 1) {
       await adapter.input({
@@ -337,10 +415,9 @@ describe("WecomIMAdapter", () => {
       });
     }
 
-    await vi.advanceTimersByTimeAsync(60_000);
-    await waitFor(() => fakeClientState.sendText.mock.calls.length === 1);
+    await waitFor(() => fakeClientState.sendStreamText.mock.calls.length === 12);
 
-    expect(fakeClientState.sendText.mock.calls[0]?.[1]).toBe(
+    expect(fakeClientState.sendStreamText.mock.calls[11]?.[1]).toBe(
       [
         "- Collapsed 2 earlier updates.",
         "- Running tool_3",
@@ -355,6 +432,10 @@ describe("WecomIMAdapter", () => {
         "- Running tool_12",
       ].join("\n"),
     );
+    expect(fakeClientState.sendStreamText.mock.calls[11]?.[2]).toEqual({
+      replyToMessageId: "msg-collapse",
+      finish: false,
+    });
   });
 
   it("sends attachments after the text reply", async () => {
@@ -376,7 +457,7 @@ describe("WecomIMAdapter", () => {
       mentionedBot: false,
     });
 
-    fakeClientState.sendText.mockClear();
+    fakeClientState.sendStreamText.mockClear();
 
     await adapter.input({
       type: "assistant.message",
@@ -386,10 +467,12 @@ describe("WecomIMAdapter", () => {
     });
 
     await waitFor(
-      () => fakeClientState.sendText.mock.calls.length === 1 && fakeClientState.sendAttachment.mock.calls.length === 1,
+      () =>
+        fakeClientState.sendStreamText.mock.calls.length === 1 &&
+        fakeClientState.sendAttachment.mock.calls.length === 1,
     );
 
-    expect(fakeClientState.sendText.mock.invocationCallOrder[0]).toBeLessThan(
+    expect(fakeClientState.sendStreamText.mock.invocationCallOrder[0]).toBeLessThan(
       fakeClientState.sendAttachment.mock.invocationCallOrder[0],
     );
   });
