@@ -2,6 +2,13 @@
 
 All notable changes to this project will be documented in this file. See [commit-and-tag-version](https://github.com/absolute-version/commit-and-tag-version) for commit guidelines.
 
+## [0.2.1](https://github.com/HoPGoldy/agent-bridge/compare/v0.2.0...v0.2.1) (2026-07-23)
+
+
+### Bug Fixes
+
+* **ci:** pin pnpm via packageManager and switch CI workflow to pnpm ([44ac5d6](https://github.com/HoPGoldy/agent-bridge/commit/44ac5d6fbe91ec610f1bd0044b8aea1cc9c4de21))
+
 ## [0.2.0](https://github.com/HoPGoldy/agent-bridge/compare/v0.1.2...v0.2.0) (2026-07-23)
 
 ## [0.1.2](https://github.com/HoPGoldy/agent-bridge/compare/v0.1.1...v0.1.2) (2026-07-23)
