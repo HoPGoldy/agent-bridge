@@ -452,6 +452,57 @@ describe("WeixinIMAdapter", () => {
     expect(fakeClientState.sendText.mock.calls.at(-1)?.[1]).toBe("after cooldown");
   });
 
+  it("localizes rate-limit cooldown notices in Chinese", async () => {
+    vi.useFakeTimers();
+
+    const adapter = new WeixinIMAdapter(
+      {
+        accountId: "bot-account",
+        token: "bot-token",
+      },
+      createLogger("test"),
+      { channelName: "demo-channel", language: "zh-CN" },
+    );
+
+    await adapter.start(async () => {});
+    await fakeClientState.onMessage?.({
+      chatId: "wxid_user_zh",
+      chatType: "dm",
+      messageId: "msg-rate-limit-zh",
+      text: "你好",
+      mentionedBot: false,
+    });
+
+    fakeClientState.sendText.mockClear();
+    fakeClientState.sendText
+      .mockRejectedValueOnce(new Error("frequency limit"))
+      .mockResolvedValueOnce(undefined)
+      .mockRejectedValueOnce(new Error("frequency limit"))
+      .mockResolvedValueOnce(undefined)
+      .mockResolvedValueOnce(undefined);
+
+    await adapter.input({
+      type: "assistant.message",
+      clientSessionId: "weixin:dm:wxid_user_zh",
+      text: "first",
+    });
+    await adapter.input({
+      type: "assistant.message",
+      clientSessionId: "weixin:dm:wxid_user_zh",
+      text: "second",
+    });
+    await adapter.input({
+      type: "assistant.message",
+      clientSessionId: "weixin:dm:wxid_user_zh",
+      text: "third",
+    });
+
+    const sentTexts = fakeClientState.sendText.mock.calls.map((call) => call[1]);
+    expect(sentTexts[1]).toContain("[agent-bridge 错误] 消息发送失败");
+    expect(sentTexts[3]).toContain("[agent-bridge 错误] 消息发送失败");
+    expect(sentTexts[4]).toContain("微信发送因限流已进入冷却，请稍后再试。");
+  });
+
   it("treats stale-session send failures separately from rate limits", async () => {
     const adapter = new WeixinIMAdapter(
       {

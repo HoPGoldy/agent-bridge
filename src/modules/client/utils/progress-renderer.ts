@@ -1,8 +1,10 @@
+import { getTranslator, type Translator } from "../../../i18n";
 import type { ClientInputEvent } from "../../../types";
 
 export interface ProgressRendererOptions {
   /** Number of recent progress lines to keep before collapsing older ones. Defaults to 10. */
   collapseThreshold?: number;
+  t?: Translator;
 }
 
 /** The subset of `ClientInputEvent` that represents a renderable progress update. */
@@ -15,13 +17,11 @@ export interface RenderedProgress {
   markdown: string;
   status: string;
   collapsedCount: number;
+  isEmpty: boolean;
 }
 
 const DEFAULT_COLLAPSE_THRESHOLD = 10;
 const MAX_TOOL_LABEL_DISPLAY_LENGTH = 15;
-
-/** Rendered when no progress lines have been recorded yet. */
-export const NO_PROGRESS_MARKDOWN = "No progress yet.";
 
 /**
  * Accumulates agent progress events (tool running/done/error, session
@@ -44,12 +44,14 @@ type ProgressEntry =
 
 export class ProgressRenderer {
   readonly #collapseThreshold: number;
+  readonly #t: Translator;
   #entries = new Map<string, ProgressEntry>();
   #order: string[] = [];
   #status = "running";
 
   constructor(options: ProgressRendererOptions = {}) {
     this.#collapseThreshold = options.collapseThreshold ?? DEFAULT_COLLAPSE_THRESHOLD;
+    this.#t = options.t ?? getTranslator("en-US");
   }
 
   /** Whether `event` should be recorded as progress (excludes assistant messages and thinking). */
@@ -75,20 +77,21 @@ export class ProgressRenderer {
       markdown: this.#renderMarkdown(collapsedCount),
       status: this.#status,
       collapsedCount,
+      isEmpty: this.#order.length === 0,
     };
   }
 
   #renderMarkdown(collapsedCount: number): string {
     const contentLines: string[] = [];
     if (collapsedCount > 0) {
-      contentLines.push(`- Collapsed ${collapsedCount} earlier updates.`);
+      contentLines.push(`- ${this.#t("progress.collapsed", { count: collapsedCount })}`);
     }
     for (const id of this.#visibleOrder()) {
       const entry = this.#entries.get(id);
       if (!entry) continue;
       contentLines.push(entry.kind === "line" ? entry.line : this.#formatToolEntry(entry));
     }
-    return contentLines.length > 0 ? contentLines.join("\n") : NO_PROGRESS_MARKDOWN;
+    return contentLines.length > 0 ? contentLines.join("\n") : this.#t("progress.noProgress");
   }
 
   #visibleOrder(): string[] {
@@ -131,9 +134,9 @@ export class ProgressRenderer {
     const subject = this.#formatToolSubject(entry.toolName, entry.toolLabel);
     switch (entry.status) {
       case "running":
-        return `- Running ${subject}`;
+        return `- ${this.#t("progress.running", { subject })}`;
       case "done":
-        return `- Finished ${subject}`;
+        return `- ${this.#t("progress.finished", { subject })}`;
       case "error":
         return this.#formatToolErrorLine(subject, entry.text);
     }
@@ -142,12 +145,16 @@ export class ProgressRenderer {
   #formatProgressLine(event: ProgressEvent): string {
     switch (event.type) {
       case "session.compacting":
-        return `- Compacting session${event.text ? `: ${event.text}` : ""}`;
+        return `- ${
+          event.text
+            ? this.#t("progress.compactingWithDetail", { detail: event.text })
+            : this.#t("progress.compacting")
+        }`;
       case "assistant.tool.running":
       case "assistant.tool.update":
-        return `- Running ${this.#formatToolSubject(event.toolName, event.toolLabel)}`;
+        return `- ${this.#t("progress.running", { subject: this.#formatToolSubject(event.toolName, event.toolLabel) })}`;
       case "assistant.tool.done":
-        return `- Finished ${this.#formatToolSubject(event.toolName, event.toolLabel)}`;
+        return `- ${this.#t("progress.finished", { subject: this.#formatToolSubject(event.toolName, event.toolLabel) })}`;
       case "assistant.tool.error":
         return this.#formatToolErrorLine(this.#formatToolSubject(event.toolName, event.toolLabel), event.text);
     }
@@ -177,18 +184,18 @@ export class ProgressRenderer {
     const lowerToolName = toolName.toLowerCase();
     if (
       lowerText === lowerToolName ||
-      lowerText === `failed ${lowerToolName}` ||
-      lowerText === `running ${lowerToolName}` ||
-      lowerText === `finished ${lowerToolName}`
+      lowerText === this.#t("progress.failed", { subject: toolName }).toLowerCase() ||
+      lowerText === this.#t("progress.running", { subject: toolName }).toLowerCase() ||
+      lowerText === this.#t("progress.finished", { subject: toolName }).toLowerCase()
     ) {
       return `- ${this.#humanizeToolError(toolName)}`;
     }
 
-    return `- ${this.#humanizeToolError(toolName)}: ${normalizedText}`;
+    return `- ${this.#t("progress.failedWithDetail", { subject: toolName, detail: normalizedText })}`;
   }
 
   #humanizeToolError(toolName: string): string {
-    return `Failed ${toolName}`;
+    return this.#t("progress.failed", { subject: toolName });
   }
 
   #progressStatus(event: ProgressEvent): string {

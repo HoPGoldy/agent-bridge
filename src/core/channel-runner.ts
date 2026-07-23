@@ -10,8 +10,12 @@ const logger = createLogger("runner");
 export async function runChannel({ channelName, channelConfig, defaults }: RunChannelOptions): Promise<ChannelRunner> {
   const clientModule = getTypedClientModule(channelConfig.client);
   const agentModule = getTypedAgentModule(channelConfig.agent);
+  const common = {
+    channelName,
+    language: channelConfig.common.language,
+  };
 
-  const imAdapter = clientModule.createClientAdapter(channelConfig.client.config);
+  const imAdapter = clientModule.createClientAdapter({ config: channelConfig.client.config, common });
   const bindingStore = createFileSessionBindingStore(getSessionBindingStorePath(channelName));
 
   const core = new GatewayCore({
@@ -20,6 +24,7 @@ export async function runChannel({ channelName, channelConfig, defaults }: RunCh
     agentConfig: channelConfig.agent.config,
     agentIdleTimeoutMs: defaults.agentIdleTimeoutMs,
     bindingStore,
+    common,
   });
 
   await core.start();

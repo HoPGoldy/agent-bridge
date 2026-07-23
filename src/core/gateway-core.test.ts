@@ -5,6 +5,7 @@ import type {
   AgentInputEvent,
   AgentModule,
   AgentOutputEvent,
+  ChannelCommonContext,
   ClientInputEvent,
   ClientOutputEvent,
   IMAdapter,
@@ -128,6 +129,100 @@ describe("GatewayCore", () => {
     while (running.length > 0) {
       await running.pop()!.stop();
     }
+  });
+
+  it("passes the channel common context to agent session lifecycle calls", async () => {
+    const imAdapter = new FakeIMAdapter();
+    const bindingStore = new FakeBindingStore({ "client-1": "agent-1" });
+    const createArgs: Array<{ common: ChannelCommonContext }> = [];
+    const resumeArgs: Array<{ common: ChannelCommonContext; agentSessionId: string }> = [];
+
+    const agentModule: AgentModule<Record<string, never>> = {
+      type: "fake",
+      async createAgentSession(args) {
+        createArgs.push(args as { common: ChannelCommonContext });
+        return {
+          agentSessionId: "agent-new",
+          agentAdapter: new FakeAgentAdapter("agent-new"),
+        };
+      },
+      async resumeAgentSession(args) {
+        resumeArgs.push(args as { common: ChannelCommonContext; agentSessionId: string });
+        return new FakeAgentAdapter(args.agentSessionId);
+      },
+    };
+
+    const common: ChannelCommonContext = {
+      channelName: "demo-channel",
+      language: "zh-CN",
+    };
+
+    const core = new GatewayCore({
+      imAdapter,
+      agentModule,
+      agentConfig: {},
+      agentIdleTimeoutMs: 60_000,
+      bindingStore,
+      common,
+    });
+    running.push(core);
+    await core.start();
+
+    await imAdapter.emit({
+      type: "user.message",
+      clientSessionId: "client-1",
+      text: "resume me",
+    });
+    await imAdapter.emit({
+      type: "user.message",
+      clientSessionId: "client-2",
+      text: "create me",
+    });
+
+    await waitFor(() => {
+      expect(resumeArgs).toEqual([{ common, agentSessionId: "agent-1", config: {} }]);
+      expect(createArgs).toEqual([{ common, config: {} }]);
+    });
+  });
+
+  it("localizes fixed gateway messages with the configured channel language", async () => {
+    const imAdapter = new FakeIMAdapter();
+
+    const agentModule: AgentModule<Record<string, never>> = {
+      type: "fake",
+      async createAgentSession() {
+        return {
+          agentSessionId: "agent-1",
+          agentAdapter: new FakeAgentAdapter("agent-1"),
+        };
+      },
+    };
+
+    const core = new GatewayCore({
+      imAdapter,
+      agentModule,
+      agentConfig: {},
+      agentIdleTimeoutMs: 60_000,
+      common: {
+        channelName: "demo-channel",
+        language: "zh-CN",
+      },
+    });
+    running.push(core);
+    await core.start();
+
+    await imAdapter.emit({
+      type: "command.session.stop",
+      clientSessionId: "client-1",
+    });
+
+    await waitFor(() => {
+      expect(imAdapter.outputs).toContainEqual({
+        type: "assistant.message",
+        clientSessionId: "client-1",
+        text: "当前没有可停止的智能体会话。",
+      });
+    });
   });
 
   it("drops late output from an old agent session after command.session.new", async () => {

@@ -1,10 +1,12 @@
 import type {
   AgentAdapter,
   AgentOutputEvent,
+  ChannelCommonContext,
   ClientInputEvent,
   ClientOutputEvent,
   GatewayCoreOptions,
 } from "../types";
+import { getTranslatorForCommon, type Translator } from "../i18n";
 import { createLogger, type Logger } from "./logger";
 
 interface AgentRuntime {
@@ -21,17 +23,21 @@ export class GatewayCore {
   readonly #agentConfig: GatewayCoreOptions["agentConfig"];
   readonly #agentIdleTimeoutMs: number;
   readonly #bindingStore: GatewayCoreOptions["bindingStore"];
+  readonly #common?: ChannelCommonContext;
+  readonly #t: Translator;
   readonly #logger: Logger = createLogger("core");
   readonly #clientToAgentSession = new Map<string, string>();
   readonly #agentRuntimes = new Map<string, AgentRuntime>();
   #started = false;
 
-  constructor({ imAdapter, agentModule, agentConfig, agentIdleTimeoutMs, bindingStore }: GatewayCoreOptions) {
+  constructor({ imAdapter, agentModule, agentConfig, agentIdleTimeoutMs, bindingStore, common }: GatewayCoreOptions) {
     this.#imAdapter = imAdapter;
     this.#agentModule = agentModule;
     this.#agentConfig = agentConfig;
     this.#agentIdleTimeoutMs = agentIdleTimeoutMs;
     this.#bindingStore = bindingStore;
+    this.#common = common;
+    this.#t = getTranslatorForCommon(common);
   }
 
   async start(): Promise<void> {
@@ -99,7 +105,7 @@ export class GatewayCore {
       await this.#deliverClientInput({
         type: "assistant.message",
         clientSessionId,
-        text: "No active agent session to compact.",
+        text: this.#t("gateway.noActiveSessionToCompact"),
       });
       return;
     }
@@ -116,7 +122,7 @@ export class GatewayCore {
       await this.#deliverClientInput({
         type: "assistant.message",
         clientSessionId,
-        text: "No active agent session to stop.",
+        text: this.#t("gateway.noActiveSessionToStop"),
       });
       return;
     }
@@ -127,7 +133,7 @@ export class GatewayCore {
       await this.#deliverClientInput({
         type: "assistant.message",
         clientSessionId,
-        text: "This agent session cannot be stopped right now.",
+        text: this.#t("gateway.sessionCannotBeStopped"),
       });
       return;
     }
@@ -136,7 +142,7 @@ export class GatewayCore {
       await this.#deliverClientInput({
         type: "assistant.message",
         clientSessionId,
-        text: "No active agent run to stop.",
+        text: this.#t("gateway.noActiveRunToStop"),
       });
       return;
     }
@@ -158,7 +164,7 @@ export class GatewayCore {
     await this.#deliverClientInput({
       type: "assistant.message",
       clientSessionId,
-      text: "Started a new session.",
+      text: this.#t("gateway.startedNewSession"),
     });
   }
 
@@ -199,6 +205,7 @@ export class GatewayCore {
     if (this.#agentModule.resumeAgentSession) {
       const agentAdapter = await this.#agentModule.resumeAgentSession({
         config: this.#agentConfig,
+        common: this.#common ?? { channelName: "", language: "en-US" },
         agentSessionId,
       });
       return this.#startRuntime(clientSessionId, agentSessionId, agentAdapter);
@@ -212,6 +219,7 @@ export class GatewayCore {
   async #createRuntimeForClient(clientSessionId: string): Promise<AgentRuntime> {
     const { agentSessionId, agentAdapter } = await this.#agentModule.createAgentSession({
       config: this.#agentConfig,
+      common: this.#common ?? { channelName: "", language: "en-US" },
     });
     return this.#startRuntime(clientSessionId, agentSessionId, agentAdapter);
   }

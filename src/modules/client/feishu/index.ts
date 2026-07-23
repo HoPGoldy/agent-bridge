@@ -54,7 +54,7 @@ function createFeishuConfigCollector(): ConfigAdapter<FeishuClientConfig> {
 export const feishuClientModule: ClientModule<FeishuClientConfig> = {
   type: "feishu",
   createConfigCollector: createFeishuConfigCollector,
-  createClientAdapter(config) {
-    return new FeishuIMAdapter(config);
+  createClientAdapter({ config, common }) {
+    return new FeishuIMAdapter(config, undefined, common);
   },
 };

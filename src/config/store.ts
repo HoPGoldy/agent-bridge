@@ -1,22 +1,37 @@
 import { mkdir, readFile, writeFile } from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
-import type { AppConfig, ChannelConfig } from "../types";
+import type { AppConfig, ChannelConfig, ChannelCommonConfig, LocaleCode } from "../types";
+import { DEFAULT_LOCALE } from "../i18n";
 import { DEFAULTS } from "./defaults";
 
 const CONFIG_DIR = path.join(os.homedir(), ".config", "agent-bridge");
 const CONFIG_PATH = path.join(CONFIG_DIR, "config.json");
 
+type RawChannelConfig = Omit<ChannelConfig, "common"> & {
+  common?: Partial<ChannelCommonConfig>;
+};
+
 type RawAppConfig = {
-  channels?: Record<string, ChannelConfig>;
+  channels?: Record<string, RawChannelConfig>;
   defaults?: Partial<AppConfig["defaults"]>;
 };
 
-function normalizeChannelConfig(channel: ChannelConfig): ChannelConfig {
+function normalizeLanguage(language: unknown): LocaleCode {
+  return language === "en-US" || language === "zh-CN" ? language : DEFAULT_LOCALE;
+}
+
+function normalizeChannelConfig(channel: RawChannelConfig): ChannelConfig {
   if (!channel.client || !channel.agent) {
     throw new Error("Invalid channel config shape");
   }
-  return channel;
+  return {
+    common: {
+      language: normalizeLanguage(channel.common?.language),
+    },
+    client: channel.client,
+    agent: channel.agent,
+  };
 }
 
 function mergeDefaults(config: RawAppConfig = {}): AppConfig {

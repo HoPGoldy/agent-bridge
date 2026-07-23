@@ -148,6 +148,49 @@ describe("WecomIMAdapter", () => {
     });
   });
 
+  it("localizes the starting message and delivery failure notice in Chinese", async () => {
+    const adapter = new WecomIMAdapter(
+      {
+        botId: "bot-id",
+        secret: "secret",
+        requireMentionInGroup: true,
+      },
+      createLogger("test"),
+      { channelName: "demo-channel", language: "zh-CN" },
+    );
+    const onOutput = vi.fn(async () => {});
+
+    await adapter.start(onOutput);
+    await fakeClientState.onMessage?.({
+      chatId: "group_zh",
+      chatType: "group",
+      messageId: "msg-zh-1",
+      text: "你好",
+      mentionedBot: true,
+    });
+
+    expect(fakeClientState.sendStreamText).toHaveBeenCalledWith("group_zh", "正在处理中...", {
+      replyToMessageId: "msg-zh-1",
+      finish: false,
+    });
+
+    fakeClientState.sendText.mockClear();
+    fakeClientState.sendText
+      .mockRejectedValueOnce(new Error("field validation failed"))
+      .mockResolvedValueOnce(undefined);
+
+    await adapter.input({
+      type: "assistant.message",
+      clientSessionId: "wecom:group:group_zh",
+      text: "reply body",
+    });
+
+    await waitFor(() => fakeClientState.sendText.mock.calls.length === 2);
+
+    expect(fakeClientState.sendText.mock.calls[1]?.[1]).toContain("[agent-bridge 错误] 消息发送失败");
+    expect(fakeClientState.sendText.mock.calls[1]?.[1]).toContain("field validation failed");
+  });
+
   it("forwards /stop to the core as a command event", async () => {
     const adapter = new WecomIMAdapter(
       {

@@ -1,4 +1,5 @@
-import type { ClientInputEvent, ClientOutputEvent, FeishuClientConfig, IMAdapter } from "../../../../types";
+import type { ChannelCommonContext, ClientInputEvent, ClientOutputEvent, FeishuClientConfig, IMAdapter } from "../../../../types";
+import { formatSendFailureNotice, getTranslatorForCommon, type Translator } from "../../../../i18n";
 import { createLogger, type Logger } from "../../../../core/logger";
 import { ProgressRenderer } from "../../utils/progress-renderer";
 import { parseSlashCommand } from "../../utils/slash-commands";
@@ -40,6 +41,7 @@ function chunkText(text: string, maxLen: number): string[] {
 export class FeishuIMAdapter implements IMAdapter {
   readonly #config: FeishuClientConfig;
   readonly #logger: Logger;
+  readonly #t: Translator;
   #onOutput: ((event: ClientOutputEvent) => Promise<void> | void) | null = null;
   #client: FeishuClient | null = null;
   #egressQueue: ClientInputEvent[] = [];
@@ -74,7 +76,7 @@ export class FeishuIMAdapter implements IMAdapter {
     }
 
     const message = error instanceof Error ? error.message : String(error);
-    const text = `[agent-bridge error] Message delivery failed\n\n${message}`;
+    const text = formatSendFailureNotice(this.#t, message);
 
     try {
       await this.#client.sendText(chatId, text);
@@ -83,9 +85,14 @@ export class FeishuIMAdapter implements IMAdapter {
     }
   }
 
-  constructor(config: FeishuClientConfig, logger: Logger = createLogger("feishu")) {
+  constructor(
+    config: FeishuClientConfig,
+    logger: Logger = createLogger("feishu"),
+    common?: ChannelCommonContext,
+  ) {
     this.#config = config;
     this.#logger = logger;
+    this.#t = getTranslatorForCommon(common);
   }
 
   async start(onOutput: (event: ClientOutputEvent) => Promise<void> | void): Promise<void> {
@@ -219,7 +226,7 @@ export class FeishuIMAdapter implements IMAdapter {
     }
 
     const state = this.#progressStateBySession.get(event.clientSessionId) ?? {
-      renderer: new ProgressRenderer(),
+      renderer: new ProgressRenderer({ t: this.#t }),
       messageId: null,
       creating: false,
     };
@@ -254,7 +261,7 @@ export class FeishuIMAdapter implements IMAdapter {
 
   #resetProgressState(clientSessionId: string): void {
     this.#progressStateBySession.set(clientSessionId, {
-      renderer: new ProgressRenderer(),
+      renderer: new ProgressRenderer({ t: this.#t }),
       messageId: null,
       creating: false,
     });

@@ -1,5 +1,6 @@
 import { describe, expect, it } from "vitest";
-import { NO_PROGRESS_MARKDOWN, ProgressRenderer, type ProgressEvent } from "./progress-renderer";
+import { getTranslator } from "../../../i18n";
+import { ProgressRenderer, type ProgressEvent } from "./progress-renderer";
 import type { ClientInputEvent } from "../../../types";
 
 describe("ProgressRenderer", () => {
@@ -37,18 +38,30 @@ describe("ProgressRenderer", () => {
     }
   });
 
-  it("renders a placeholder when no progress has been recorded", () => {
-    const renderer = new ProgressRenderer();
+  it("renders an English placeholder when no progress has been recorded", () => {
+    const renderer = new ProgressRenderer({ t: getTranslator("en-US") });
 
     expect(renderer.getCurrentProgress()).toEqual({
-      markdown: NO_PROGRESS_MARKDOWN,
+      markdown: "No progress yet.",
       status: "running",
       collapsedCount: 0,
+      isEmpty: true,
     });
   });
 
-  it("formats legacy tool running/done/error and session.compacting lines", () => {
-    const renderer = new ProgressRenderer();
+  it("renders a Chinese placeholder when no progress has been recorded", () => {
+    const renderer = new ProgressRenderer({ t: getTranslator("zh-CN") });
+
+    expect(renderer.getCurrentProgress()).toEqual({
+      markdown: "暂无进度。",
+      status: "running",
+      collapsedCount: 0,
+      isEmpty: true,
+    });
+  });
+
+  it("formats legacy tool running/done/error and session.compacting lines in English", () => {
+    const renderer = new ProgressRenderer({ t: getTranslator("en-US") });
     const events: ProgressEvent[] = [
       { type: "assistant.tool.running", clientSessionId: "s1", toolName: "web_search" },
       { type: "assistant.tool.done", clientSessionId: "s1", toolName: "bash" },
@@ -74,12 +87,12 @@ describe("ProgressRenderer", () => {
   });
 
   it("dedupes redundant error text and falls back to a humanized message", () => {
-    const renderer = new ProgressRenderer();
+    const renderer = new ProgressRenderer({ t: getTranslator("en-US") });
 
     renderer.takeProgressEvent({ type: "assistant.tool.error", clientSessionId: "s1", toolName: "bash" });
     expect(renderer.getCurrentProgress().markdown).toBe("- Failed bash");
 
-    const renderer2 = new ProgressRenderer();
+    const renderer2 = new ProgressRenderer({ t: getTranslator("en-US") });
     renderer2.takeProgressEvent({
       type: "assistant.tool.error",
       clientSessionId: "s1",
@@ -88,7 +101,7 @@ describe("ProgressRenderer", () => {
     });
     expect(renderer2.getCurrentProgress().markdown).toBe("- Failed bash");
 
-    const renderer3 = new ProgressRenderer();
+    const renderer3 = new ProgressRenderer({ t: getTranslator("en-US") });
     renderer3.takeProgressEvent({
       type: "assistant.tool.error",
       clientSessionId: "s1",
@@ -99,7 +112,7 @@ describe("ProgressRenderer", () => {
   });
 
   it("renders tool labels on error lines without appending a redundant generic failure suffix", () => {
-    const renderer = new ProgressRenderer();
+    const renderer = new ProgressRenderer({ t: getTranslator("en-US") });
 
     renderer.takeProgressEvent({
       type: "assistant.tool.error",
@@ -113,7 +126,7 @@ describe("ProgressRenderer", () => {
   });
 
   it("updates the same tool row in place when toolCallId is present", () => {
-    const renderer = new ProgressRenderer();
+    const renderer = new ProgressRenderer({ t: getTranslator("en-US") });
 
     renderer.takeProgressEvent({
       type: "assistant.tool.running",
@@ -144,7 +157,7 @@ describe("ProgressRenderer", () => {
   });
 
   it("truncates long tool labels in rendered progress", () => {
-    const renderer = new ProgressRenderer();
+    const renderer = new ProgressRenderer({ t: getTranslator("en-US") });
 
     renderer.takeProgressEvent({
       type: "assistant.tool.running",
@@ -158,7 +171,7 @@ describe("ProgressRenderer", () => {
   });
 
   it("tracks status across the most recent event", () => {
-    const renderer = new ProgressRenderer();
+    const renderer = new ProgressRenderer({ t: getTranslator("en-US") });
 
     renderer.takeProgressEvent({ type: "assistant.tool.running", clientSessionId: "s1", toolName: "bash" });
     expect(renderer.getCurrentProgress().status).toBe("running");
@@ -174,7 +187,7 @@ describe("ProgressRenderer", () => {
   });
 
   it("keeps tool row order stable when a tool status updates", () => {
-    const renderer = new ProgressRenderer();
+    const renderer = new ProgressRenderer({ t: getTranslator("en-US") });
 
     renderer.takeProgressEvent({
       type: "assistant.tool.running",
@@ -208,7 +221,7 @@ describe("ProgressRenderer", () => {
   });
 
   it("collapses lines beyond the default threshold of 10", () => {
-    const renderer = new ProgressRenderer();
+    const renderer = new ProgressRenderer({ t: getTranslator("en-US") });
 
     for (let index = 1; index <= 12; index += 1) {
       renderer.takeProgressEvent({
@@ -238,7 +251,7 @@ describe("ProgressRenderer", () => {
   });
 
   it("honors a custom collapseThreshold", () => {
-    const renderer = new ProgressRenderer({ collapseThreshold: 2 });
+    const renderer = new ProgressRenderer({ collapseThreshold: 2, t: getTranslator("en-US") });
 
     renderer.takeProgressEvent({ type: "assistant.tool.running", clientSessionId: "s1", toolName: "a" });
     renderer.takeProgressEvent({ type: "assistant.tool.running", clientSessionId: "s1", toolName: "b" });
@@ -248,6 +261,26 @@ describe("ProgressRenderer", () => {
     expect(progress.collapsedCount).toBe(1);
     expect(progress.markdown).toBe(
       ["- Collapsed 1 earlier updates.", "- Running b", "- Running c"].join("\n"),
+    );
+  });
+
+  it("renders progress lines in Chinese when configured", () => {
+    const renderer = new ProgressRenderer({ t: getTranslator("zh-CN") });
+    const events: ProgressEvent[] = [
+      { type: "assistant.tool.running", clientSessionId: "s1", toolName: "web_search" },
+      { type: "assistant.tool.done", clientSessionId: "s1", toolName: "bash" },
+      { type: "assistant.tool.error", clientSessionId: "s1", toolName: "read", toolLabel: "/tmp/demo.txt" },
+      { type: "session.compacting", clientSessionId: "s1", text: "压缩上下文" },
+    ];
+
+    for (const event of events) {
+      renderer.takeProgressEvent(event);
+    }
+
+    expect(renderer.getCurrentProgress().markdown).toBe(
+      ["- 正在执行 web_search", "- 已完成 bash", "- read: /tmp/demo.txt 执行失败", "- 正在压缩会话: 压缩上下文"].join(
+        "\n",
+      ),
     );
   });
 });

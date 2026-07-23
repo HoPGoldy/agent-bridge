@@ -50,7 +50,7 @@ function createWecomConfigCollector(): ConfigAdapter<WecomClientConfig> {
 export const wecomClientModule: ClientModule<WecomClientConfig> = {
   type: "wecom",
   createConfigCollector: createWecomConfigCollector,
-  createClientAdapter(config) {
-    return new WecomIMAdapter(config);
+  createClientAdapter({ config, common }) {
+    return new WecomIMAdapter(config, undefined, common);
   },
 };

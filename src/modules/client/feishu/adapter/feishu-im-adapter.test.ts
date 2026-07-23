@@ -267,6 +267,42 @@ describe("FeishuIMAdapter", () => {
     expect(fakeClientState.sendText.mock.calls[1]?.[1]).toContain("field validation failed");
   });
 
+  it("localizes the delivery failure notice in Chinese", async () => {
+    const adapter = new FeishuIMAdapter(
+      {
+        appId: "cli_xxx",
+        appSecret: "secret",
+        requireMentionInGroup: true,
+      },
+      createLogger("test"),
+      { channelName: "demo-channel", language: "zh-CN" },
+    );
+
+    fakeClientState.sendText
+      .mockRejectedValueOnce(new Error("field validation failed"))
+      .mockResolvedValueOnce(undefined);
+
+    await adapter.start(async () => {});
+    await fakeClientState.onMessage?.({
+      chatId: "oc_group_zh",
+      chatType: "group",
+      messageId: "msg-zh-1",
+      text: "@bot 你好",
+      mentionedBot: true,
+    });
+
+    await adapter.input({
+      type: "assistant.message",
+      clientSessionId: "feishu:group:oc_group_zh",
+      text: "reply body",
+    });
+
+    await waitFor(() => fakeClientState.sendText.mock.calls.length === 2);
+
+    expect(fakeClientState.sendText.mock.calls[1]?.[1]).toContain("[agent-bridge 错误] 消息发送失败");
+    expect(fakeClientState.sendText.mock.calls[1]?.[1]).toContain("field validation failed");
+  });
+
   it("renders progress cards with friendly labels and skips thinking events", async () => {
     const adapter = new FeishuIMAdapter(
       {

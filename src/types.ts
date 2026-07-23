@@ -121,20 +121,34 @@ export interface ConfigAdapter<TConfig = unknown> {
   summarize?(config: TConfig): string;
 }
 
+export type LocaleCode = "zh-CN" | "en-US";
+
+export interface ChannelCommonConfig {
+  language: LocaleCode;
+}
+
+export interface ChannelCommonContext extends ChannelCommonConfig {
+  channelName: string;
+}
+
 export interface ClientModule<TConfig = unknown> {
   readonly type: string;
   createConfigCollector?: () => ConfigAdapter<TConfig>;
-  createClientAdapter(config: TConfig): IMAdapter;
+  createClientAdapter(args: { config: TConfig; common: ChannelCommonContext }): IMAdapter;
 }
 
 export interface AgentModule<TConfig = unknown> {
   readonly type: string;
   createConfigCollector?: () => ConfigAdapter<TConfig>;
-  createAgentSession(args: { config: TConfig }): Promise<{
+  createAgentSession(args: { config: TConfig; common: ChannelCommonContext }): Promise<{
     agentSessionId: string;
     agentAdapter: AgentAdapter;
   }>;
-  resumeAgentSession?(args: { config: TConfig; agentSessionId: string }): Promise<AgentAdapter>;
+  resumeAgentSession?(args: {
+    config: TConfig;
+    common: ChannelCommonContext;
+    agentSessionId: string;
+  }): Promise<AgentAdapter>;
 }
 
 export interface FeishuClientConfig {
@@ -187,6 +201,7 @@ export type AgentConfig = {
 };
 
 export interface ChannelConfig {
+  common: ChannelCommonConfig;
   client: ClientConfig;
   agent: AgentConfig;
 }
@@ -210,6 +225,7 @@ export interface GatewayCoreOptions {
   agentConfig: AgentConfig["config"];
   agentIdleTimeoutMs: number;
   bindingStore?: SessionBindingStore;
+  common?: ChannelCommonContext;
 }
 
 export interface SessionBindingStore {

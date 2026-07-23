@@ -51,16 +51,16 @@ function createPiCodingAgentConfigCollector(): ConfigAdapter<PiCodingAgentConfig
 export const piCodingAgentModule: AgentModule<PiCodingAgentConfig> = {
   type: "pi-coding-agent",
   createConfigCollector: createPiCodingAgentConfigCollector,
-  async createAgentSession({ config }) {
+  async createAgentSession({ config, common }) {
     const agentSessionId = `pi-coding-agent:${randomUUID()}`;
-    logger.info(`creating agent session ${agentSessionId}`);
+    logger.info(`creating agent session ${agentSessionId} for channel ${common.channelName}`);
     return {
       agentSessionId,
       agentAdapter: buildAdapter(config, agentSessionId),
     };
   },
-  async resumeAgentSession({ config, agentSessionId }) {
-    logger.info(`resuming agent session ${agentSessionId}`);
+  async resumeAgentSession({ config, common, agentSessionId }) {
+    logger.info(`resuming agent session ${agentSessionId} for channel ${common.channelName}`);
     return buildAdapter(config, agentSessionId);
   },
 };

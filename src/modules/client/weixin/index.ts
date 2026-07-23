@@ -46,7 +46,7 @@ function createWeixinConfigCollector(): ConfigAdapter<WeixinClientConfig> {
 export const weixinClientModule: ClientModule<WeixinClientConfig> = {
   type: "weixin",
   createConfigCollector: createWeixinConfigCollector,
-  createClientAdapter(config) {
-    return new WeixinIMAdapter(config);
+  createClientAdapter({ config, common }) {
+    return new WeixinIMAdapter(config, undefined, common);
   },
 };

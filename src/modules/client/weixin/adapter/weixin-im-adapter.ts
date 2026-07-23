@@ -1,4 +1,11 @@
-import type { ClientInputEvent, ClientOutputEvent, IMAdapter, WeixinClientConfig } from "../../../../types";
+import type {
+  ChannelCommonContext,
+  ClientInputEvent,
+  ClientOutputEvent,
+  IMAdapter,
+  WeixinClientConfig,
+} from "../../../../types";
+import { formatSendFailureNotice, getTranslatorForCommon, type Translator } from "../../../../i18n";
 import { createLogger, type Logger } from "../../../../core/logger";
 import { ProgressRenderer } from "../../utils/progress-renderer";
 import { parseSlashCommand } from "../../utils/slash-commands";
@@ -59,6 +66,7 @@ function chunkText(text: string, maxLen: number): string[] {
 export class WeixinIMAdapter implements IMAdapter {
   readonly #config: WeixinClientConfig;
   readonly #logger: Logger;
+  readonly #t: Translator;
   #onOutput: ((event: ClientOutputEvent) => Promise<void> | void) | null = null;
   #client: WeixinClient | null = null;
   #egressQueue: EgressEvent[] = [];
@@ -70,9 +78,14 @@ export class WeixinIMAdapter implements IMAdapter {
   #rateLimitEvents: number[] = [];
   #rateLimitCircuitUntil = 0;
 
-  constructor(config: WeixinClientConfig, logger: Logger = createLogger("weixin")) {
+  constructor(
+    config: WeixinClientConfig,
+    logger: Logger = createLogger("weixin"),
+    common?: ChannelCommonContext,
+  ) {
     this.#config = config;
     this.#logger = logger;
+    this.#t = getTranslatorForCommon(common);
   }
 
   async start(onOutput: (event: ClientOutputEvent) => Promise<void> | void): Promise<void> {
@@ -237,7 +250,7 @@ export class WeixinIMAdapter implements IMAdapter {
     }
 
     const message = error instanceof Error ? error.message : String(error);
-    const text = `[agent-bridge error] Message delivery failed\n\n${message}`;
+    const text = formatSendFailureNotice(this.#t, message);
 
     try {
       await this.#client.sendText(chatId, text);
@@ -253,7 +266,7 @@ export class WeixinIMAdapter implements IMAdapter {
 
     const now = Date.now();
     if (this.#rateLimitCircuitUntil > now) {
-      throw new Error("Weixin send is cooling down after rate limiting. Please try again shortly.");
+      throw new Error(this.#t("client.weixinCooldown"));
     }
     if (this.#rateLimitCircuitUntil !== 0 && this.#rateLimitCircuitUntil <= now) {
       this.#rateLimitCircuitUntil = 0;
@@ -270,7 +283,7 @@ export class WeixinIMAdapter implements IMAdapter {
       if (this.#isRateLimitError(error)) {
         this.#recordRateLimitEvent(now);
         if (this.#rateLimitCircuitUntil > now) {
-          throw new Error("Weixin send is cooling down after rate limiting. Please try again shortly.");
+          throw new Error(this.#t("client.weixinCooldown"));
         }
       }
       throw error;
@@ -305,7 +318,7 @@ export class WeixinIMAdapter implements IMAdapter {
 
   #createProgressState(): ProgressState {
     return {
-      renderer: new ProgressRenderer(),
+      renderer: new ProgressRenderer({ t: this.#t }),
       dirty: false,
       interval: null,
     };

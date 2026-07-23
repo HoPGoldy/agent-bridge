@@ -1,12 +1,18 @@
-import type { ClientInputEvent, ClientOutputEvent, IMAdapter, WecomClientConfig } from "../../../../types";
+import type {
+  ChannelCommonContext,
+  ClientInputEvent,
+  ClientOutputEvent,
+  IMAdapter,
+  WecomClientConfig,
+} from "../../../../types";
+import { formatSendFailureNotice, getTranslatorForCommon, type Translator } from "../../../../i18n";
 import { createLogger, type Logger } from "../../../../core/logger";
-import { NO_PROGRESS_MARKDOWN, ProgressRenderer } from "../../utils/progress-renderer";
+import { ProgressRenderer } from "../../utils/progress-renderer";
 import { parseSlashCommand } from "../../utils/slash-commands";
 import { WecomClient } from "./wecom-client";
 import { buildWecomSessionId, parseWecomSessionId } from "./wecom-session";
 
 const MAX_TEXT_CHUNK = 4000;
-const STARTING_MESSAGE = "Processing...";
 
 type ProgressState = {
   renderer: ProgressRenderer;
@@ -46,6 +52,7 @@ function chunkText(text: string, maxLen: number): string[] {
 export class WecomIMAdapter implements IMAdapter {
   readonly #config: WecomClientConfig;
   readonly #logger: Logger;
+  readonly #t: Translator;
   #onOutput: ((event: ClientOutputEvent) => Promise<void> | void) | null = null;
   #client: WecomClient | null = null;
   #egressQueue: ClientInputEvent[] = [];
@@ -65,7 +72,7 @@ export class WecomIMAdapter implements IMAdapter {
     }
 
     const message = error instanceof Error ? error.message : String(error);
-    const text = `[agent-bridge error] Message delivery failed\n\n${message}`;
+    const text = formatSendFailureNotice(this.#t, message);
 
     try {
       await this.#client.sendText(chatId, text);
@@ -74,9 +81,14 @@ export class WecomIMAdapter implements IMAdapter {
     }
   }
 
-  constructor(config: WecomClientConfig, logger: Logger = createLogger("wecom")) {
+  constructor(
+    config: WecomClientConfig,
+    logger: Logger = createLogger("wecom"),
+    common?: ChannelCommonContext,
+  ) {
     this.#config = config;
     this.#logger = logger;
+    this.#t = getTranslatorForCommon(common);
   }
 
   async start(onOutput: (event: ClientOutputEvent) => Promise<void> | void): Promise<void> {
@@ -212,7 +224,7 @@ export class WecomIMAdapter implements IMAdapter {
       return;
     }
 
-    await this.#client.sendStreamText(chatId, STARTING_MESSAGE, {
+    await this.#client.sendStreamText(chatId, this.#t("client.processing"), {
       replyToMessageId: messageId,
       finish: false,
     });
@@ -228,7 +240,7 @@ export class WecomIMAdapter implements IMAdapter {
     }
 
     const state = this.#progressStateBySession.get(event.clientSessionId) ?? {
-      renderer: new ProgressRenderer(),
+      renderer: new ProgressRenderer({ t: this.#t }),
       announced: false,
     };
     this.#progressStateBySession.set(event.clientSessionId, state);
@@ -261,7 +273,7 @@ export class WecomIMAdapter implements IMAdapter {
     this.#progressStateBySession.delete(clientSessionId);
 
     const progress = state.renderer.getCurrentProgress();
-    const body = progress.markdown === NO_PROGRESS_MARKDOWN ? STARTING_MESSAGE : progress.markdown;
+    const body = progress.isEmpty ? this.#t("client.processing") : progress.markdown;
     try {
       await this.#client.sendStreamText(chatId, body, { replyToMessageId, finish: true });
     } catch (error) {
@@ -273,7 +285,7 @@ export class WecomIMAdapter implements IMAdapter {
 
   #resetProgressState(clientSessionId: string): void {
     this.#progressStateBySession.set(clientSessionId, {
-      renderer: new ProgressRenderer(),
+      renderer: new ProgressRenderer({ t: this.#t }),
       announced: false,
     });
   }

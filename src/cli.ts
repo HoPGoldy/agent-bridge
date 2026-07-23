@@ -4,6 +4,7 @@ import type {
   AgentConfig,
   AgentModule,
   AppConfig,
+  ChannelCommonConfig,
   ChannelConfig,
   ClientConfig,
   ClientModule,
@@ -47,6 +48,17 @@ async function collectModuleConfig<TConfig>(
   return config;
 }
 
+async function collectCommonChannelConfig(ctx: ReturnType<typeof createPromptContext>): Promise<ChannelCommonConfig> {
+  const language = await ctx.select("Channel language", [
+    { label: "English (en-US)", value: "en-US" },
+    { label: "中文 (zh-CN)", value: "zh-CN" },
+  ]);
+
+  return {
+    language: language as ChannelCommonConfig["language"],
+  };
+}
+
 async function addChannel(config: AppConfig): Promise<void> {
   const ctx = createPromptContext();
   try {
@@ -58,6 +70,8 @@ async function addChannel(config: AppConfig): Promise<void> {
         return null;
       },
     });
+
+    const commonConfig = await collectCommonChannelConfig(ctx);
 
     const clientType = await selectModuleType("Select client module", listClientModules(), ctx);
     const clientModule = getClientModule(clientType);
@@ -74,6 +88,7 @@ async function addChannel(config: AppConfig): Promise<void> {
     const agentConfig = await collectModuleConfig(agentModule, ctx);
 
     config.channels[name] = {
+      common: commonConfig,
       client: {
         type: clientType,
         config: clientConfig,
