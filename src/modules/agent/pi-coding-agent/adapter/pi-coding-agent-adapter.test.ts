@@ -73,4 +73,26 @@ describe("PiCodingAgentAdapter", () => {
       },
     ]);
   });
+
+  it("ignores assistant message_end without visible text or attachments", async () => {
+    const adapter = new PiCodingAgentAdapter({ agentSessionId: "agent-1" });
+    const outputs: AgentOutputEvent[] = [];
+
+    await adapter.start((event) => {
+      outputs.push(event);
+    });
+
+    rpcClients[0]?.emit({
+      type: "message_end",
+      message: {
+        role: "assistant",
+        content: [
+          { type: "thinking", thinking: "internal" },
+          { type: "toolCall", id: "call-1", name: "Read", arguments: {} },
+        ],
+      },
+    });
+
+    expect(outputs).toEqual([]);
+  });
 });

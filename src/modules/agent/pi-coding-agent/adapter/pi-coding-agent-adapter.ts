@@ -186,11 +186,21 @@ export class PiCodingAgentAdapter implements AgentAdapter {
     if (rpcEvent.type === "message_end") {
       const message = rpcEvent.message;
       if (this.#isAssistantMessage(message)) {
+        this.#logger.debug(`assistant message_end content shape (session=${this.#agentSessionId})`, {
+          contentType: Array.isArray(message.content) ? "array" : typeof message.content,
+          contentPreview: this.#summarizeContentShape(message.content),
+        });
         const rawText = this.#extractMessageText(message.content);
+        const { text, attachments } = extractMediaMarkers(rawText);
         this.#logger.debug(
-          `assistant message_end received (session=${this.#agentSessionId} textLength=${rawText.length})`,
+          `assistant message_end received (session=${this.#agentSessionId} textLength=${rawText.length} attachmentCount=${attachments.length})`,
         );
-        const { text, attachments } = extractMediaMarkers(rawText || "(pi returned no assistant text)");
+        if (!text.trim() && attachments.length === 0) {
+          this.#logger.debug(
+            `ignoring assistant message_end without visible content (session=${this.#agentSessionId})`,
+          );
+          return;
+        }
         await this.#emitAssistant(text, attachments);
       }
       return;
@@ -267,5 +277,29 @@ export class PiCodingAgentAdapter implements AgentAdapter {
 
     const candidate = value as { type?: unknown; text?: unknown };
     return candidate.type === "text" && typeof candidate.text === "string";
+  }
+
+  #summarizeContentShape(content: unknown): unknown {
+    if (typeof content === "string") {
+      return { kind: "string", length: content.length, preview: content.slice(0, 200) };
+    }
+
+    if (!Array.isArray(content)) {
+      return { kind: typeof content };
+    }
+
+    return content.slice(0, 10).map((block) => {
+      if (!block || typeof block !== "object") {
+        return { kind: typeof block };
+      }
+
+      const candidate = block as { type?: unknown; text?: unknown; content?: unknown; mimeType?: unknown };
+      return {
+        type: candidate.type,
+        textLength: typeof candidate.text === "string" ? candidate.text.length : undefined,
+        contentType: Array.isArray(candidate.content) ? "array" : typeof candidate.content,
+        mimeType: candidate.mimeType,
+      };
+    });
   }
 }
