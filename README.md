@@ -6,15 +6,28 @@
 [![Node.js](https://img.shields.io/badge/node-%3E%3D22-339933?style=flat-square&logo=node.js&logoColor=white)](https://nodejs.org/)
 [![License: MIT](https://img.shields.io/badge/license-MIT-2ea44f?style=flat-square)](#license)
 
-`agent-bridge` connects IM channel (feishu, weixin, weicom...) to local coding agent (pi, codex, opencode...) using a dual-adapter architecture.
+`agent-bridge` connects IM channel (feishu, weixin, wecom...) to local coding agent (pi, codex, opencode...) using a dual-adapter architecture.
 
 The design stays intentionally simple and compact: no harness layer, no extra tools, no extra skills, just forwarding messages from IM to the local agent.
 
 ## Current support
 
-Client side: `FeiShu`.
+Client side:
 
-Agent side: `PI Coding Agent`.
+| Platform | Image/file in | Image/file out | Emoji | Dynamic progress |
+| --- | --- | --- | --- | --- |
+| Feishu / Lark | ✅ | ✅ | ✅ | ✅ |
+| WeCom | ✅ | ✅ | — | ✅ |
+| Weixin | ✅ | ✅ | — | — |
+
+Agent side:
+
+| Platform |
+| --- |
+| PI Coding Agent |
+
+- **Emoji** = platform-native emoji / reaction capability currently used by the bridge.
+- **Dynamic progress** = progress shown before the final answer arrives.
 
 The current built-in support is intentionally small, but the architecture is designed for straightforward horizontal extension. The project will primarily maintain the integrations used in practice today, and contributions for additional client or agent adapters are welcome through forks and PRs.
 
