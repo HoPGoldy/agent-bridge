@@ -263,6 +263,48 @@ describe("WeixinIMAdapter", () => {
     expect(fakeClientState.stopTyping).toHaveBeenCalledWith("wxid_user_1");
   });
 
+  it("keeps refreshing typing every ten seconds until the final reply is delivered", async () => {
+    vi.useFakeTimers();
+
+    const adapter = new WeixinIMAdapter(
+      {
+        accountId: "bot-account",
+        token: "bot-token",
+      },
+      createLogger("test"),
+    );
+    const onOutput = vi.fn(async (_event: ClientOutputEvent) => {});
+
+    await adapter.start(onOutput);
+    await fakeClientState.onMessage?.({
+      chatId: "wxid_user_1",
+      chatType: "dm",
+      messageId: "msg-typing-refresh",
+      text: "hello",
+      mentionedBot: false,
+    });
+
+    expect(fakeClientState.sendTyping).toHaveBeenCalledTimes(1);
+    expect(fakeClientState.sendText).not.toHaveBeenCalledWith("wxid_user_1", "Received.");
+
+    await vi.advanceTimersByTimeAsync(10_000);
+    expect(fakeClientState.sendTyping).toHaveBeenCalledTimes(2);
+
+    await vi.advanceTimersByTimeAsync(10_000);
+    expect(fakeClientState.sendTyping).toHaveBeenCalledTimes(3);
+
+    await adapter.input({
+      type: "assistant.message",
+      clientSessionId: "weixin:dm:wxid_user_1",
+      text: "final reply",
+    });
+
+    expect(fakeClientState.stopTyping).toHaveBeenCalledWith("wxid_user_1");
+
+    await vi.advanceTimersByTimeAsync(20_000);
+    expect(fakeClientState.sendTyping).toHaveBeenCalledTimes(3);
+  });
+
   it("sends one progress summary per minute when progress changes", async () => {
     vi.useFakeTimers();
 

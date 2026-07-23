@@ -6,6 +6,7 @@ import { buildWeixinSessionId, parseWeixinSessionId } from "./weixin-session";
 const MAX_TEXT_CHUNK = 2000;
 const PROGRESS_INTERVAL_MS = 60_000;
 const MESSAGE_DEDUP_TTL_MS = 5 * 60_000;
+const TYPING_REFRESH_INTERVAL_MS = 10_000;
 const RATE_LIMIT_WINDOW_MS = 60_000;
 const RATE_LIMIT_THRESHOLD = 2;
 const RATE_LIMIT_COOLDOWN_MS = 60_000;
@@ -64,6 +65,7 @@ export class WeixinIMAdapter implements IMAdapter {
   #egressQueue: EgressEvent[] = [];
   #processing = false;
   #progressStateBySession = new Map<string, ProgressState>();
+  #typingHeartbeatBySession = new Map<string, NodeJS.Timeout>();
   #recentInboundMessageIds = new Map<string, number>();
   #recentInboundContentKeys = new Map<string, number>();
   #rateLimitEvents: number[] = [];
@@ -96,7 +98,6 @@ export class WeixinIMAdapter implements IMAdapter {
       }
 
       this.#resetProgressState(clientSessionId);
-      await this.#client?.sendTyping(chatId);
 
       const normalizedText = text.trim();
       if (normalizedText === "/new") {
@@ -111,6 +112,9 @@ export class WeixinIMAdapter implements IMAdapter {
         await this.#onOutput({ type: "command.session.stop", clientSessionId });
         return;
       }
+
+      await this.#client?.sendTyping(chatId);
+      this.#startTypingHeartbeat(clientSessionId, chatId);
 
       await this.#onOutput({
         type: "user.message",
@@ -131,6 +135,10 @@ export class WeixinIMAdapter implements IMAdapter {
       }
     }
     this.#progressStateBySession.clear();
+    for (const timer of this.#typingHeartbeatBySession.values()) {
+      clearInterval(timer);
+    }
+    this.#typingHeartbeatBySession.clear();
     if (this.#client) {
       await this.#client.disconnect();
       this.#client = null;
@@ -192,11 +200,13 @@ export class WeixinIMAdapter implements IMAdapter {
               await this.#notifySendFailure(target.chatId, attachmentError);
             }
           }
+          this.#stopTypingHeartbeat(event.clientSessionId);
           await this.#client.stopTyping(target.chatId);
         } catch (error) {
           this.#logger.error("failed to send egress event:", error);
           try {
             const target = parseWeixinSessionId(event.clientSessionId);
+            this.#stopTypingHeartbeat(event.clientSessionId);
             await this.#client.stopTyping(target.chatId);
             await this.#notifySendFailure(target.chatId, error);
           } catch (notifyError) {
@@ -207,6 +217,24 @@ export class WeixinIMAdapter implements IMAdapter {
     } finally {
       this.#processing = false;
     }
+  }
+
+  #startTypingHeartbeat(clientSessionId: string, chatId: string): void {
+    this.#stopTypingHeartbeat(clientSessionId);
+    const timer = setInterval(() => {
+      void this.#client?.sendTyping(chatId);
+    }, TYPING_REFRESH_INTERVAL_MS);
+    timer.unref?.();
+    this.#typingHeartbeatBySession.set(clientSessionId, timer);
+  }
+
+  #stopTypingHeartbeat(clientSessionId: string): void {
+    const timer = this.#typingHeartbeatBySession.get(clientSessionId);
+    if (!timer) {
+      return;
+    }
+    clearInterval(timer);
+    this.#typingHeartbeatBySession.delete(clientSessionId);
   }
 
   async #notifySendFailure(chatId: string, error: unknown): Promise<void> {
