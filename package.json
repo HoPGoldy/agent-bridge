@@ -3,6 +3,7 @@
   "version": "0.2.0",
   "private": false,
   "description": "IM to Agent bridge with dual-adapter architecture",
+  "packageManager": "pnpm@10.33.0",
   "keywords": [
     "im",
     "bridge",
