@@ -1,5 +1,7 @@
 import type { ClientInputEvent, ClientOutputEvent, IMAdapter, WeixinClientConfig } from "../../../../types";
 import { createLogger, type Logger } from "../../../../core/logger";
+import { ProgressRenderer } from "../../utils/progress-renderer";
+import { parseSlashCommand } from "../../utils/slash-commands";
 import { WeixinClient } from "./weixin-client";
 import { buildWeixinSessionId, parseWeixinSessionId } from "./weixin-session";
 
@@ -19,10 +21,7 @@ type ProgressFlushEvent = {
 type EgressEvent = ClientInputEvent | ProgressFlushEvent;
 
 type ProgressState = {
-  lines: string[];
-  status: string;
-  turnId: number;
-  collapsedCount: number;
+  renderer: ProgressRenderer;
   dirty: boolean;
   interval: NodeJS.Timeout | null;
 };
@@ -88,7 +87,9 @@ export class WeixinIMAdapter implements IMAdapter {
       const clientSessionId = buildWeixinSessionId(chatType, chatId);
 
       if (this.#isDuplicateInbound(chatId, messageId, text)) {
-        this.#logger.debug(`dropping duplicate inbound message (session=${clientSessionId} messageId=${messageId})`);
+        this.#logger.debug(
+          `dropping duplicate inbound message (session=${clientSessionId} messageId=${messageId})`,
+        );
         return;
       }
 
@@ -100,16 +101,9 @@ export class WeixinIMAdapter implements IMAdapter {
       this.#resetProgressState(clientSessionId);
 
       const normalizedText = text.trim();
-      if (normalizedText === "/new") {
-        await this.#onOutput({ type: "command.session.new", clientSessionId });
-        return;
-      }
-      if (normalizedText === "/compact") {
-        await this.#onOutput({ type: "command.session.compact", clientSessionId });
-        return;
-      }
-      if (normalizedText === "/stop") {
-        await this.#onOutput({ type: "command.session.stop", clientSessionId });
+      const commandEvent = parseSlashCommand(normalizedText, clientSessionId);
+      if (commandEvent) {
+        await this.#onOutput(commandEvent);
         return;
       }
 
@@ -283,31 +277,15 @@ export class WeixinIMAdapter implements IMAdapter {
     }
   }
 
-  static progressBody(lines: string[], collapsedCount: number): string {
-    const contentLines: string[] = [];
-    if (collapsedCount > 0) {
-      contentLines.push(`- Collapsed ${collapsedCount} earlier updates.`);
-    }
-    if (lines.length > 0) {
-      contentLines.push(...lines);
-    }
-    return contentLines.length > 0 ? contentLines.join("\n") : "No progress yet.";
-  }
-
   #recordProgressEvent(event: Exclude<ClientInputEvent, { type: "assistant.message" }>): void {
-    if (!this.#shouldRenderProgressEvent(event)) {
+    const state = this.#progressStateBySession.get(event.clientSessionId) ?? this.#createProgressState();
+    this.#progressStateBySession.set(event.clientSessionId, state);
+
+    if (!state.renderer.isProgressEvent(event)) {
       return;
     }
-
-    const state = this.#progressStateBySession.get(event.clientSessionId) ?? this.#createProgressState();
-    state.lines.push(this.#formatProgressLine(event));
-    if (state.lines.length > 10) {
-      state.collapsedCount += state.lines.length - 10;
-      state.lines.splice(0, state.lines.length - 10);
-    }
-    state.status = this.#progressStatus(event);
+    state.renderer.takeProgressEvent(event);
     state.dirty = true;
-    this.#progressStateBySession.set(event.clientSessionId, state);
   }
 
   async #flushProgressSummary(chatId: string, clientSessionId: string): Promise<void> {
@@ -316,7 +294,7 @@ export class WeixinIMAdapter implements IMAdapter {
       return;
     }
 
-    await this.#sendTextWithProtection(chatId, WeixinIMAdapter.progressBody(state.lines, state.collapsedCount));
+    await this.#sendTextWithProtection(chatId, state.renderer.getCurrentProgress().markdown);
     state.dirty = false;
   }
 
@@ -325,12 +303,9 @@ export class WeixinIMAdapter implements IMAdapter {
     void this.#drainEgressQueue();
   }
 
-  #createProgressState(previous?: ProgressState): ProgressState {
+  #createProgressState(): ProgressState {
     return {
-      lines: [],
-      status: "running",
-      turnId: (previous?.turnId ?? 0) + 1,
-      collapsedCount: 0,
+      renderer: new ProgressRenderer(),
       dirty: false,
       interval: null,
     };
@@ -341,7 +316,7 @@ export class WeixinIMAdapter implements IMAdapter {
     if (previous?.interval) {
       clearInterval(previous.interval);
     }
-    const state = this.#createProgressState(previous);
+    const state = this.#createProgressState();
     state.interval = setInterval(() => {
       this.#queueProgressFlush(clientSessionId);
     }, PROGRESS_INTERVAL_MS);
@@ -358,55 +333,6 @@ export class WeixinIMAdapter implements IMAdapter {
       clearInterval(state.interval);
     }
     this.#progressStateBySession.delete(clientSessionId);
-  }
-
-  #shouldRenderProgressEvent(event: Exclude<ClientInputEvent, { type: "assistant.message" }>): boolean {
-    return event.type !== "assistant.thinking";
-  }
-
-  #formatProgressLine(event: Exclude<ClientInputEvent, { type: "assistant.message" }>): string {
-    switch (event.type) {
-      case "assistant.thinking":
-        return "";
-      case "session.compacting":
-        return `- Compacting session${event.text ? `: ${event.text}` : ""}`;
-      case "assistant.tool.running":
-        return `- Running ${event.toolName}`;
-      case "assistant.tool.done":
-        return `- Finished ${event.toolName}`;
-      case "assistant.tool.error":
-        return this.#formatToolErrorLine(event.toolName, event.text);
-    }
-  }
-
-  #formatToolErrorLine(toolName: string, text?: string): string {
-    const normalizedText = text?.trim();
-    if (!normalizedText) {
-      return `- ${this.#humanizeToolError(toolName)}`;
-    }
-
-    const lowerText = normalizedText.toLowerCase();
-    const lowerToolName = toolName.toLowerCase();
-    if (lowerText === lowerToolName || lowerText === `failed ${lowerToolName}`) {
-      return `- ${this.#humanizeToolError(toolName)}`;
-    }
-
-    return `- ${this.#humanizeToolError(toolName)}: ${normalizedText}`;
-  }
-
-  #humanizeToolError(toolName: string): string {
-    return `Failed ${toolName}`;
-  }
-
-  #progressStatus(event: Exclude<ClientInputEvent, { type: "assistant.message" }>): string {
-    switch (event.type) {
-      case "assistant.tool.error":
-        return "error";
-      case "assistant.tool.done":
-        return "done";
-      default:
-        return "running";
-    }
   }
 
   #isDuplicateInbound(chatId: string, messageId: string, text: string): boolean {
@@ -449,7 +375,9 @@ export class WeixinIMAdapter implements IMAdapter {
   }
 
   #recordRateLimitEvent(now: number): void {
-    this.#rateLimitEvents = this.#rateLimitEvents.filter((timestamp) => now - timestamp < RATE_LIMIT_WINDOW_MS);
+    this.#rateLimitEvents = this.#rateLimitEvents.filter(
+      (timestamp) => now - timestamp < RATE_LIMIT_WINDOW_MS,
+    );
     this.#rateLimitEvents.push(now);
     if (this.#rateLimitEvents.length >= RATE_LIMIT_THRESHOLD) {
       this.#rateLimitCircuitUntil = now + RATE_LIMIT_COOLDOWN_MS;
@@ -469,7 +397,9 @@ export class WeixinIMAdapter implements IMAdapter {
     if (this.#isStaleSessionError(error)) {
       return false;
     }
-    return message.includes("frequency limit") || message.includes("rate limit") || message.includes("freq limit");
+    return (
+      message.includes("frequency limit") || message.includes("rate limit") || message.includes("freq limit")
+    );
   }
 
   #isStaleSessionError(error: unknown): boolean {

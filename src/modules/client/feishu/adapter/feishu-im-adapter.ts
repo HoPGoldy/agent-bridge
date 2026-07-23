@@ -1,5 +1,7 @@
 import type { ClientInputEvent, ClientOutputEvent, FeishuClientConfig, IMAdapter } from "../../../../types";
 import { createLogger, type Logger } from "../../../../core/logger";
+import { ProgressRenderer } from "../../utils/progress-renderer";
+import { parseSlashCommand } from "../../utils/slash-commands";
 import { FeishuClient } from "./feishu-client";
 import { buildFeishuSessionId, parseFeishuSessionId } from "./feishu-session";
 
@@ -46,38 +48,24 @@ export class FeishuIMAdapter implements IMAdapter {
   #progressStateBySession = new Map<
     string,
     {
+      renderer: ProgressRenderer;
       messageId: string | null;
       creating: boolean;
-      lines: string[];
-      status: string;
-      turnId: number;
-      collapsedCount: number;
     }
   >();
 
-  static buildProgressCard(lines: string[], _status: string, collapsedCount = 0): Record<string, unknown> {
+  static buildProgressCard(markdown: string): Record<string, unknown> {
     return {
       schema: "2.0",
       body: {
         elements: [
           {
             tag: "markdown",
-            content: FeishuIMAdapter.progressBody(lines, collapsedCount),
+            content: markdown,
           },
         ],
       },
     };
-  }
-
-  static progressBody(lines: string[], collapsedCount: number): string {
-    const contentLines: string[] = [];
-    if (collapsedCount > 0) {
-      contentLines.push(`- Collapsed ${collapsedCount} earlier updates.`);
-    }
-    if (lines.length > 0) {
-      contentLines.push(...lines);
-    }
-    return contentLines.length > 0 ? contentLines.join("\n") : "No progress yet.";
   }
 
   async #notifySendFailure(chatId: string, error: unknown): Promise<void> {
@@ -123,30 +111,10 @@ export class FeishuIMAdapter implements IMAdapter {
       await this.#client?.startTyping(chatId, messageId);
       const normalizedText = text.trim();
 
-      if (normalizedText === "/new") {
-        this.#logger.info(`received command /new (session=${clientSessionId})`);
-        await this.#onOutput({
-          type: "command.session.new",
-          clientSessionId,
-        });
-        return;
-      }
-
-      if (normalizedText === "/compact") {
-        this.#logger.info(`received command /compact (session=${clientSessionId})`);
-        await this.#onOutput({
-          type: "command.session.compact",
-          clientSessionId,
-        });
-        return;
-      }
-
-      if (normalizedText === "/stop") {
-        this.#logger.info(`received command /stop (session=${clientSessionId})`);
-        await this.#onOutput({
-          type: "command.session.stop",
-          clientSessionId,
-        });
+      const commandEvent = parseSlashCommand(normalizedText, clientSessionId);
+      if (commandEvent) {
+        this.#logger.info(`received command ${normalizedText} (session=${clientSessionId})`);
+        await this.#onOutput(commandEvent);
         return;
       }
 
@@ -250,28 +218,19 @@ export class FeishuIMAdapter implements IMAdapter {
       return;
     }
 
-    if (!this.#shouldRenderProgressEvent(event)) {
-      return;
-    }
-
     const state = this.#progressStateBySession.get(event.clientSessionId) ?? {
+      renderer: new ProgressRenderer(),
       messageId: null,
       creating: false,
-      lines: [],
-      status: "running",
-      turnId: 0,
-      collapsedCount: 0,
     };
-
-    state.lines.push(this.#formatProgressLine(event));
-    if (state.lines.length > 10) {
-      state.collapsedCount += state.lines.length - 10;
-      state.lines.splice(0, state.lines.length - 10);
-    }
-    state.status = this.#progressStatus(event);
     this.#progressStateBySession.set(event.clientSessionId, state);
 
-    const card = FeishuIMAdapter.buildProgressCard(state.lines, state.status, state.collapsedCount);
+    if (!state.renderer.isProgressEvent(event)) {
+      return;
+    }
+    state.renderer.takeProgressEvent(event);
+
+    const card = FeishuIMAdapter.buildProgressCard(state.renderer.getCurrentProgress().markdown);
     if (state.messageId) {
       await this.#client.updateCard(state.messageId, card);
       return;
@@ -293,64 +252,11 @@ export class FeishuIMAdapter implements IMAdapter {
     }
   }
 
-  #shouldRenderProgressEvent(event: Exclude<ClientInputEvent, { type: "assistant.message" }>): boolean {
-    return event.type !== "assistant.thinking";
-  }
-
   #resetProgressState(clientSessionId: string): void {
-    const previous = this.#progressStateBySession.get(clientSessionId);
     this.#progressStateBySession.set(clientSessionId, {
+      renderer: new ProgressRenderer(),
       messageId: null,
       creating: false,
-      lines: [],
-      status: "running",
-      turnId: (previous?.turnId ?? 0) + 1,
-      collapsedCount: 0,
     });
-  }
-
-  #formatProgressLine(event: Exclude<ClientInputEvent, { type: "assistant.message" }>): string {
-    switch (event.type) {
-      case "assistant.thinking":
-        return "";
-      case "session.compacting":
-        return `- Compacting session${event.text ? `: ${event.text}` : ""}`;
-      case "assistant.tool.running":
-        return `- Running ${event.toolName}`;
-      case "assistant.tool.done":
-        return `- Finished ${event.toolName}`;
-      case "assistant.tool.error":
-        return this.#formatToolErrorLine(event.toolName, event.text);
-    }
-  }
-
-  #formatToolErrorLine(toolName: string, text?: string): string {
-    const normalizedText = text?.trim();
-    if (!normalizedText) {
-      return `- ${this.#humanizeToolError(toolName)}`;
-    }
-
-    const lowerText = normalizedText.toLowerCase();
-    const lowerToolName = toolName.toLowerCase();
-    if (lowerText === lowerToolName || lowerText === `failed ${lowerToolName}`) {
-      return `- ${this.#humanizeToolError(toolName)}`;
-    }
-
-    return `- ${this.#humanizeToolError(toolName)}: ${normalizedText}`;
-  }
-
-  #humanizeToolError(toolName: string): string {
-    return `Failed ${toolName}`;
-  }
-
-  #progressStatus(event: Exclude<ClientInputEvent, { type: "assistant.message" }>): string {
-    switch (event.type) {
-      case "assistant.tool.error":
-        return "error";
-      case "assistant.tool.done":
-        return "done";
-      default:
-        return "running";
-    }
   }
 }

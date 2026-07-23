@@ -1,5 +1,7 @@
 import type { ClientInputEvent, ClientOutputEvent, IMAdapter, WecomClientConfig } from "../../../../types";
 import { createLogger, type Logger } from "../../../../core/logger";
+import { NO_PROGRESS_MARKDOWN, ProgressRenderer } from "../../utils/progress-renderer";
+import { parseSlashCommand } from "../../utils/slash-commands";
 import { WecomClient } from "./wecom-client";
 import { buildWecomSessionId, parseWecomSessionId } from "./wecom-session";
 
@@ -7,10 +9,7 @@ const MAX_TEXT_CHUNK = 4000;
 const STARTING_MESSAGE = "Processing...";
 
 type ProgressState = {
-  lines: string[];
-  status: string;
-  turnId: number;
-  collapsedCount: number;
+  renderer: ProgressRenderer;
   announced: boolean;
 };
 
@@ -53,17 +52,6 @@ export class WecomIMAdapter implements IMAdapter {
   #processing = false;
   #lastInboundMessageIdBySession = new Map<string, string>();
   #progressStateBySession = new Map<string, ProgressState>();
-
-  static progressBody(lines: string[], collapsedCount: number): string {
-    const contentLines: string[] = [];
-    if (collapsedCount > 0) {
-      contentLines.push(`- Collapsed ${collapsedCount} earlier updates.`);
-    }
-    if (lines.length > 0) {
-      contentLines.push(...lines);
-    }
-    return contentLines.length > 0 ? contentLines.join("\n") : "No progress yet.";
-  }
 
   async #notifySendFailure(chatId: string, error: unknown): Promise<void> {
     if (!this.#client) {
@@ -120,16 +108,9 @@ export class WecomIMAdapter implements IMAdapter {
       }
 
       const normalizedText = text.trim();
-      if (normalizedText === "/new") {
-        await this.#onOutput({ type: "command.session.new", clientSessionId });
-        return;
-      }
-      if (normalizedText === "/compact") {
-        await this.#onOutput({ type: "command.session.compact", clientSessionId });
-        return;
-      }
-      if (normalizedText === "/stop") {
-        await this.#onOutput({ type: "command.session.stop", clientSessionId });
+      const commandEvent = parseSlashCommand(normalizedText, clientSessionId);
+      if (commandEvent) {
+        await this.#onOutput(commandEvent);
         return;
       }
 
@@ -242,28 +223,24 @@ export class WecomIMAdapter implements IMAdapter {
     chatId: string,
     event: Exclude<ClientInputEvent, { type: "assistant.message" }>,
   ): Promise<void> {
-    if (!this.#client || !this.#shouldRenderProgressEvent(event)) {
+    if (!this.#client) {
       return;
     }
 
     const state = this.#progressStateBySession.get(event.clientSessionId) ?? {
-      lines: [],
-      status: "running",
-      turnId: 0,
-      collapsedCount: 0,
+      renderer: new ProgressRenderer(),
       announced: false,
     };
-    state.lines.push(this.#formatProgressLine(event));
-    if (state.lines.length > 10) {
-      state.collapsedCount += state.lines.length - 10;
-      state.lines.splice(0, state.lines.length - 10);
-    }
-    state.status = this.#progressStatus(event);
     this.#progressStateBySession.set(event.clientSessionId, state);
+
+    if (!state.renderer.isProgressEvent(event)) {
+      return;
+    }
+    state.renderer.takeProgressEvent(event);
 
     // Refresh the same stream message in place, like the feishu adapter
     // updates its progress card.
-    const body = WecomIMAdapter.progressBody(state.lines, state.collapsedCount);
+    const body = state.renderer.getCurrentProgress().markdown;
     const replyToMessageId = this.#lastInboundMessageIdBySession.get(event.clientSessionId);
     await this.#client.sendStreamText(chatId, body, {
       replyToMessageId,
@@ -283,10 +260,8 @@ export class WecomIMAdapter implements IMAdapter {
     }
     this.#progressStateBySession.delete(clientSessionId);
 
-    const body =
-      state.lines.length > 0
-        ? WecomIMAdapter.progressBody(state.lines, state.collapsedCount)
-        : STARTING_MESSAGE;
+    const progress = state.renderer.getCurrentProgress();
+    const body = progress.markdown === NO_PROGRESS_MARKDOWN ? STARTING_MESSAGE : progress.markdown;
     try {
       await this.#client.sendStreamText(chatId, body, { replyToMessageId, finish: true });
     } catch (error) {
@@ -297,62 +272,9 @@ export class WecomIMAdapter implements IMAdapter {
   }
 
   #resetProgressState(clientSessionId: string): void {
-    const previous = this.#progressStateBySession.get(clientSessionId);
     this.#progressStateBySession.set(clientSessionId, {
-      lines: [],
-      status: "running",
-      turnId: (previous?.turnId ?? 0) + 1,
-      collapsedCount: 0,
+      renderer: new ProgressRenderer(),
       announced: false,
     });
-  }
-
-  #shouldRenderProgressEvent(event: Exclude<ClientInputEvent, { type: "assistant.message" }>): boolean {
-    return event.type !== "assistant.thinking";
-  }
-
-  #formatProgressLine(event: Exclude<ClientInputEvent, { type: "assistant.message" }>): string {
-    switch (event.type) {
-      case "assistant.thinking":
-        return "";
-      case "session.compacting":
-        return `- Compacting session${event.text ? `: ${event.text}` : ""}`;
-      case "assistant.tool.running":
-        return `- Running ${event.toolName}`;
-      case "assistant.tool.done":
-        return `- Finished ${event.toolName}`;
-      case "assistant.tool.error":
-        return this.#formatToolErrorLine(event.toolName, event.text);
-    }
-  }
-
-  #formatToolErrorLine(toolName: string, text?: string): string {
-    const normalizedText = text?.trim();
-    if (!normalizedText) {
-      return `- ${this.#humanizeToolError(toolName)}`;
-    }
-
-    const lowerText = normalizedText.toLowerCase();
-    const lowerToolName = toolName.toLowerCase();
-    if (lowerText === lowerToolName || lowerText === `failed ${lowerToolName}`) {
-      return `- ${this.#humanizeToolError(toolName)}`;
-    }
-
-    return `- ${this.#humanizeToolError(toolName)}: ${normalizedText}`;
-  }
-
-  #humanizeToolError(toolName: string): string {
-    return `Failed ${toolName}`;
-  }
-
-  #progressStatus(event: Exclude<ClientInputEvent, { type: "assistant.message" }>): string {
-    switch (event.type) {
-      case "assistant.tool.error":
-        return "error";
-      case "assistant.tool.done":
-        return "done";
-      default:
-        return "running";
-    }
   }
 }
