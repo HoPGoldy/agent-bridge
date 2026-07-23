@@ -2,7 +2,7 @@
   "name": "@hopgoldy/agent-bridge",
   "version": "0.1.1",
   "private": false,
-  "description": "IM to Pi bridge with dual-adapter architecture",
+  "description": "IM to Agent bridge with dual-adapter architecture",
   "keywords": [
     "im",
     "bridge",

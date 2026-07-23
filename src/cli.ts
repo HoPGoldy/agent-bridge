@@ -166,7 +166,7 @@ async function startChannel(channelName: string): Promise<void> {
 export async function runCli(argv = process.argv): Promise<void> {
   const program = new Command();
 
-  program.name("agent-bridge").description("IM to Pi bridge CLI").version("0.1.0");
+  program.name("agent-bridge").description("IM to Agent bridge CLI").version("0.1.0");
 
   program
     .command("add")
