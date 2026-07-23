@@ -1,6 +1,6 @@
 {
   "name": "@hopgoldy/agent-bridge",
-  "version": "0.1.2",
+  "version": "0.2.0",
   "private": false,
   "description": "IM to Agent bridge with dual-adapter architecture",
   "keywords": [
