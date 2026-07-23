@@ -1,8 +1,10 @@
 import type { ClientConfig, ClientModule } from "../../types";
 import { feishuClientModule } from "./feishu";
+import { wecomClientModule } from "./wecom";
 
 const registry = new Map<string, ClientModule<any>>([
   [feishuClientModule.type, feishuClientModule],
+  [wecomClientModule.type, wecomClientModule],
 ]);
 
 export function listClientModules(): ClientModule<any>[] {

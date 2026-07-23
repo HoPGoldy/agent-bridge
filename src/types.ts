@@ -138,6 +138,13 @@ export interface FeishuClientConfig {
   requireMentionInGroup?: boolean;
 }
 
+export interface WecomClientConfig {
+  botId: string;
+  secret: string;
+  websocketUrl?: string;
+  requireMentionInGroup?: boolean;
+}
+
 export interface PiCodingAgentConfig {
   bin?: string;
   sessionDir?: string;
@@ -145,10 +152,15 @@ export interface PiCodingAgentConfig {
   extraArgs?: string[];
 }
 
-export type ClientConfig = {
-  type: "feishu";
-  config: FeishuClientConfig;
-};
+export type ClientConfig =
+  | {
+      type: "feishu";
+      config: FeishuClientConfig;
+    }
+  | {
+      type: "wecom";
+      config: WecomClientConfig;
+    };
 
 export type AgentConfig = {
   type: "pi-coding-agent";
@@ -195,6 +207,15 @@ export interface RunChannelOptions {
 export interface FeishuInboundMessage {
   chatId: string;
   chatType: "p2p" | "group";
+  messageId: string;
+  text: string;
+  mentionedBot?: boolean;
+  raw?: unknown;
+}
+
+export interface WecomInboundMessage {
+  chatId: string;
+  chatType: "dm" | "group";
   messageId: string;
   text: string;
   mentionedBot?: boolean;
