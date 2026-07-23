@@ -145,6 +145,13 @@ export interface WecomClientConfig {
   requireMentionInGroup?: boolean;
 }
 
+export interface WeixinClientConfig {
+  accountId: string;
+  token: string;
+  baseUrl?: string;
+  cdnBaseUrl?: string;
+}
+
 export interface PiCodingAgentConfig {
   bin?: string;
   sessionDir?: string;
@@ -160,6 +167,10 @@ export type ClientConfig =
   | {
       type: "wecom";
       config: WecomClientConfig;
+    }
+  | {
+      type: "weixin";
+      config: WeixinClientConfig;
     };
 
 export type AgentConfig = {
@@ -214,6 +225,15 @@ export interface FeishuInboundMessage {
 }
 
 export interface WecomInboundMessage {
+  chatId: string;
+  chatType: "dm" | "group";
+  messageId: string;
+  text: string;
+  mentionedBot?: boolean;
+  raw?: unknown;
+}
+
+export interface WeixinInboundMessage {
   chatId: string;
   chatType: "dm" | "group";
   messageId: string;
