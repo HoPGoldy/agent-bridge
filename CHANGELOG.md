@@ -2,6 +2,19 @@
 
 All notable changes to this project will be documented in this file. See [commit-and-tag-version](https://github.com/absolute-version/commit-and-tag-version) for commit guidelines.
 
+## [0.3.1](https://github.com/HoPGoldy/agent-bridge/compare/v0.2.1...v0.3.1) (2026-07-23)
+
+
+### Features
+
+* add slash command aliases ([4d2491e](https://github.com/HoPGoldy/agent-bridge/commit/4d2491e7b22332b33efb438affd226955a7681c5))
+* enrich tool progress events ([11200e3](https://github.com/HoPGoldy/agent-bridge/commit/11200e3e7d0f2c87ac34e7878bf80f432cd87cc1))
+
+
+### Bug Fixes
+
+* keep tool progress order stable ([22a7308](https://github.com/HoPGoldy/agent-bridge/commit/22a73088980f6ce0894f5732223c71a98eaffcaf))
+
 ## [0.3.0](https://github.com/HoPGoldy/agent-bridge/compare/v0.2.1...v0.3.0) (2026-07-23)
 
 
