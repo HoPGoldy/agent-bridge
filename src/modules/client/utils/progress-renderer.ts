@@ -104,9 +104,6 @@ export class ProgressRenderer {
   #upsertToolEntry(id: string, event: ProgressEvent): void {
     if (!this.#entries.has(id)) {
       this.#order.push(id);
-    } else {
-      this.#order = this.#order.filter((entryId) => entryId !== id);
-      this.#order.push(id);
     }
 
     this.#entries.set(id, {

@@ -159,8 +159,8 @@ describe("ProgressRenderer", () => {
     expect(renderer.getCurrentProgress().status).toBe("error");
   });
 
-  it("moves an updated tool row to the end so recent activity stays visible", () => {
-    const renderer = new ProgressRenderer({ collapseThreshold: 2 });
+  it("keeps tool row order stable when a tool status updates", () => {
+    const renderer = new ProgressRenderer();
 
     renderer.takeProgressEvent({
       type: "assistant.tool.running",
@@ -181,16 +181,16 @@ describe("ProgressRenderer", () => {
       toolCallId: "call-c",
     });
 
-    expect(renderer.getCurrentProgress().markdown).toBe(["- Collapsed 1 earlier updates.", "- Running b", "- Running c"].join("\n"));
-
     renderer.takeProgressEvent({
       type: "assistant.tool.done",
       clientSessionId: "s1",
-      toolName: "a",
-      toolCallId: "call-a",
+      toolName: "b",
+      toolCallId: "call-b",
     });
 
-    expect(renderer.getCurrentProgress().markdown).toBe(["- Collapsed 1 earlier updates.", "- Running c", "- Finished a"].join("\n"));
+    expect(renderer.getCurrentProgress().markdown).toBe(
+      ["- Running a", "- Finished b", "- Running c"].join("\n"),
+    );
   });
 
   it("collapses lines beyond the default threshold of 10", () => {
