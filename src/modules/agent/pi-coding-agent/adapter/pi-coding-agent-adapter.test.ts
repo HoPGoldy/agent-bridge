@@ -106,6 +106,51 @@ describe("PiCodingAgentAdapter", () => {
     ]);
   });
 
+  it("omits redundant generic text for tool execution errors", async () => {
+    const adapter = new PiCodingAgentAdapter({ agentSessionId: "agent-1" });
+    const outputs: AgentOutputEvent[] = [];
+
+    await adapter.start((event) => {
+      outputs.push(event);
+    });
+
+    rpcClients[0]?.emit({
+      type: "tool_execution_start",
+      toolCallId: "call-err-1",
+      toolName: "read",
+      args: { path: "/tmp/demo.txt" },
+    });
+    rpcClients[0]?.emit({
+      type: "tool_execution_end",
+      toolCallId: "call-err-1",
+      toolName: "read",
+      result: { error: "ENOENT" },
+      isError: true,
+    });
+
+    expect(outputs).toEqual([
+      {
+        type: "assistant.tool.running",
+        agentSessionId: "agent-1",
+        toolName: "read",
+        toolCallId: "call-err-1",
+        toolInput: { path: "/tmp/demo.txt" },
+        toolLabel: "/tmp/demo.txt",
+        text: "Running read",
+      },
+      {
+        type: "assistant.tool.error",
+        agentSessionId: "agent-1",
+        toolName: "read",
+        toolCallId: "call-err-1",
+        toolInput: { path: "/tmp/demo.txt" },
+        toolLabel: "/tmp/demo.txt",
+        result: { error: "ENOENT" },
+        text: undefined,
+      },
+    ]);
+  });
+
   it("forwards assistant text from Pi message_end text blocks", async () => {
     const adapter = new PiCodingAgentAdapter({ agentSessionId: "agent-1" });
     const outputs: AgentOutputEvent[] = [];

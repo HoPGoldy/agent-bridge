@@ -267,7 +267,7 @@ export class PiCodingAgentAdapter implements AgentAdapter {
         toolInput,
         toolLabel,
         result: "result" in rpcEvent ? rpcEvent.result : undefined,
-        text: isError ? `Failed ${toolName}` : `Finished ${toolName}`,
+        text: isError ? undefined : `Finished ${toolName}`,
       });
       if (toolCallId) {
         this.#toolLabelByCallId.delete(toolCallId);

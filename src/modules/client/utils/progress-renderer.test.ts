@@ -98,6 +98,20 @@ describe("ProgressRenderer", () => {
     expect(renderer3.getCurrentProgress().markdown).toBe("- Failed bash: permission denied");
   });
 
+  it("renders tool labels on error lines without appending a redundant generic failure suffix", () => {
+    const renderer = new ProgressRenderer();
+
+    renderer.takeProgressEvent({
+      type: "assistant.tool.error",
+      clientSessionId: "s1",
+      toolName: "read",
+      toolCallId: "call-1",
+      toolLabel: "/home/leefoundy/demo.txt",
+    });
+
+    expect(renderer.getCurrentProgress().markdown).toBe("- Failed read: /home/leefoundy…");
+  });
+
   it("updates the same tool row in place when toolCallId is present", () => {
     const renderer = new ProgressRenderer();
 
