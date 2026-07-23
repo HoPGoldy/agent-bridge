@@ -2,6 +2,22 @@
 
 All notable changes to this project will be documented in this file. See [commit-and-tag-version](https://github.com/absolute-version/commit-and-tag-version) for commit guidelines.
 
+## [0.1.2](https://github.com/HoPGoldy/agent-bridge/compare/v0.1.1...v0.1.2) (2026-07-23)
+
+
+### Features
+
+* add wecom client adapter ([b78e46f](https://github.com/HoPGoldy/agent-bridge/commit/b78e46f1ce9ead0169caa718b629a28d6e421dc1))
+
+
+### Bug Fixes
+
+* forward pi assistant message_end text ([563f3eb](https://github.com/HoPGoldy/agent-bridge/commit/563f3ebf5df64bdf3a143ccd92cb29f3b370d9cb))
+* ignore empty pi assistant message_end ([f333886](https://github.com/HoPGoldy/agent-bridge/commit/f3338860cac74fbedc4456e6d736e58b32f7ea65))
+* rename generic CLI description from IM to Pi bridge to IM to Agent bridge ([af6e99b](https://github.com/HoPGoldy/agent-bridge/commit/af6e99b76276ad51ce0564b773c91da1e566b651))
+* **types:** resolve ChannelConfig union assignment and add qrcode-terminal types ([2985ec6](https://github.com/HoPGoldy/agent-bridge/commit/2985ec60fef9589a7109486cdf8e0a34dcc6731c))
+* **wecom:** use sdk stream replies for progress ([b316c19](https://github.com/HoPGoldy/agent-bridge/commit/b316c19fee5b7fefe66af1f6273e7ef36a3aba65))
+
 ## 0.1.1 (2026-07-22)
 
 
