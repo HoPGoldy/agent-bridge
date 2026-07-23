@@ -123,20 +123,12 @@ export class PiCodingAgentAdapter implements AgentAdapter {
     try {
       if (event.type === "user.message") {
         this.#logger.info(`sending prompt to agent (session=${this.#agentSessionId})`);
-        const startedAt = Date.now();
         await this.#emitProgress({
           type: "assistant.thinking",
           agentSessionId: this.#agentSessionId,
           text: "Processing request",
         });
         await this.#client.prompt(event.text);
-        await this.#client.waitForSettled();
-        const rawText = await this.#client.getLastAssistantText();
-        const { text, attachments } = extractMediaMarkers(rawText ?? "(pi returned no assistant text)");
-        this.#logger.debug(
-          `prompt settled (session=${this.#agentSessionId} durationMs=${Date.now() - startedAt} replyLength=${text.length} attachments=${attachments.length})`,
-        );
-        await this.#emitAssistant(text, attachments);
         return;
       }
 
@@ -191,6 +183,19 @@ export class PiCodingAgentAdapter implements AgentAdapter {
       return;
     }
 
+    if (rpcEvent.type === "message_end") {
+      const message = rpcEvent.message;
+      if (this.#isAssistantMessage(message)) {
+        const rawText = this.#extractMessageText(message.content);
+        this.#logger.debug(
+          `assistant message_end received (session=${this.#agentSessionId} textLength=${rawText.length})`,
+        );
+        const { text, attachments } = extractMediaMarkers(rawText || "(pi returned no assistant text)");
+        await this.#emitAssistant(text, attachments);
+      }
+      return;
+    }
+
     if (rpcEvent.type === "tool_execution_start") {
       const toolName = typeof rpcEvent.toolName === "string" ? rpcEvent.toolName : "unknown";
       await this.#emitProgress({
@@ -212,5 +217,55 @@ export class PiCodingAgentAdapter implements AgentAdapter {
         text: isError ? `Failed ${toolName}` : `Finished ${toolName}`,
       });
     }
+  }
+
+  #isAssistantMessage(value: unknown): value is { role?: unknown; content?: unknown } {
+    if (!value || typeof value !== "object") {
+      return false;
+    }
+
+    return (value as { role?: unknown }).role === "assistant";
+  }
+
+  #extractMessageText(content: unknown): string {
+    if (typeof content === "string") {
+      return content;
+    }
+
+    if (this.#isTextBlock(content)) {
+      return content.text;
+    }
+
+    if (!Array.isArray(content)) {
+      return "";
+    }
+
+    const textParts: string[] = [];
+    for (const block of content) {
+      if (this.#isTextBlock(block)) {
+        textParts.push(block.text);
+        continue;
+      }
+
+      if (!block || typeof block !== "object") {
+        continue;
+      }
+
+      const candidate = block as { content?: unknown };
+      if (typeof candidate.content === "string") {
+        textParts.push(candidate.content);
+      }
+    }
+
+    return textParts.join("");
+  }
+
+  #isTextBlock(value: unknown): value is { type: "text"; text: string } {
+    if (!value || typeof value !== "object") {
+      return false;
+    }
+
+    const candidate = value as { type?: unknown; text?: unknown };
+    return candidate.type === "text" && typeof candidate.text === "string";
   }
 }

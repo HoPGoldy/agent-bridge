@@ -241,12 +241,6 @@ export class PiRpcClient {
     return data ?? {};
   }
 
-  async getLastAssistantText(): Promise<string | null> {
-    const response = await this.#send({ type: "get_last_assistant_text" });
-    const data = response.data as { text?: string | null } | undefined;
-    return data?.text ?? null;
-  }
-
   async getState(): Promise<{ sessionName?: string }> {
     const response = await this.#send({ type: "get_state" });
     return (response.data as { sessionName?: string } | undefined) ?? {};
@@ -254,29 +248,6 @@ export class PiRpcClient {
 
   async setSessionName(name: string): Promise<void> {
     await this.#send({ type: "set_session_name", name });
-  }
-
-  waitForSettled(timeoutMs = 10 * 60 * 1000): Promise<void> {
-    if (!this.#process) {
-      return Promise.reject(new Error("pi RPC client is not running"));
-    }
-
-    return new Promise<void>((resolve, reject) => {
-      const timeout = setTimeout(() => {
-        reject(new Error(`Timed out waiting for pi agent to settle after ${timeoutMs}ms`));
-      }, timeoutMs);
-
-      this.#settledWaiters.push({
-        resolve: () => {
-          clearTimeout(timeout);
-          resolve();
-        },
-        reject: (error) => {
-          clearTimeout(timeout);
-          reject(error);
-        },
-      });
-    });
   }
 
   async #send(command: PiRpcCommand): Promise<PiRpcResponse> {
