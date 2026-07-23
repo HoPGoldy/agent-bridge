@@ -14,22 +14,20 @@ The design stays intentionally simple and compact: no harness layer, no extra to
 
 Client side:
 
-| Platform | Image/file in | Image/file out | Emoji | Dynamic progress |
-| --- | --- | --- | --- | --- |
-| Feishu / Lark | ✅ | ✅ | ✅ | ✅ |
-| WeCom | ✅ | ✅ | — | ✅ |
-| Weixin | ✅ | ✅ | — | — |
-
-Agent side:
-
-| Platform |
-| --- |
-| PI Coding Agent |
+| Platform      | Image/file in | Image/file out | Emoji | Dynamic progress |
+| ------------- | ------------- | -------------- | ----- | ---------------- |
+| Feishu / Lark | ✅            | ✅             | ✅    | ✅               |
+| WeCom         | ✅            | ✅             | —     | ✅               |
+| Weixin        | ✅            | ✅             | —     | —                |
 
 - **Emoji** = platform-native emoji / reaction capability currently used by the bridge.
 - **Dynamic progress** = progress shown before the final answer arrives.
 
-The current built-in support is intentionally small, but the architecture is designed for straightforward horizontal extension. The project will primarily maintain the integrations used in practice today, and contributions for additional client or agent adapters are welcome through forks and PRs.
+Agent side:
+
+- `PI Coding Agent`
+
+> The current built-in support is intentionally small, but the architecture is designed for straightforward horizontal extension. The project will primarily maintain the integrations used in practice today, and contributions for additional client or agent adapters are welcome through forks and PRs.
 
 ## Quick Start
 
