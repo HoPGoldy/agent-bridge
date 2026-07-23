@@ -24,8 +24,12 @@ describe("parseSlashCommand", () => {
     });
   });
 
-  it("parses /stop into a command.session.stop event", () => {
+  it("parses /stop and /s into a command.session.stop event", () => {
     expect(parseSlashCommand("/stop", "session-1")).toEqual({
+      type: "command.session.stop",
+      clientSessionId: "session-1",
+    });
+    expect(parseSlashCommand("/s", "session-1")).toEqual({
       type: "command.session.stop",
       clientSessionId: "session-1",
     });
@@ -42,6 +46,10 @@ describe("parseSlashCommand", () => {
     });
     expect(parseSlashCommand("/Compact", "session-1")).toEqual({
       type: "command.session.compact",
+      clientSessionId: "session-1",
+    });
+    expect(parseSlashCommand("/S", "session-1")).toEqual({
+      type: "command.session.stop",
       clientSessionId: "session-1",
     });
   });

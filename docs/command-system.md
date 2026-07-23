@@ -17,6 +17,7 @@ All client adapters use the same command parser, so the command behavior is cons
 | `/compact` | Ask the current agent session to compact its context | `command.session.compact` |
 | `/c` | Alias of `/compact` | `command.session.compact` |
 | `/stop` | Stop the current in-flight agent run, if the agent supports stopping | `command.session.stop` |
+| `/s` | Alias of `/stop` | `command.session.stop` |
 
 ## How parsing works
 
@@ -33,9 +34,11 @@ That means these are valid:
 - `/compact`
 - `/c`
 - `/stop`
+- `/s`
 - `/New`
 - `/Compact`
 - `/C`
+- `/S`
 
 And these are **not** treated as commands:
 
@@ -78,7 +81,7 @@ No active agent session to compact.
 
 ### `/stop`
 
-`/stop` asks the current agent adapter to abort the active run.
+`/stop` and `/s` ask the current agent adapter to abort the active run.
 
 If there is no active session, or no active run to stop, the bridge returns a short explanatory message instead of failing silently.
 

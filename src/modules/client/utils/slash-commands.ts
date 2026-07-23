@@ -2,7 +2,7 @@ import type { ClientOutputEvent } from "../../../types";
 
 /**
  * Parses a trimmed inbound text as one of the standard agent-bridge slash
- * commands (`/new`, `/n`, `/compact`, `/c`, `/stop`) and returns the
+ * commands (`/new`, `/n`, `/compact`, `/c`, `/stop`, `/s`) and returns the
  * corresponding `ClientOutputEvent`, or `null` if `text` is not a recognized
  * command and should be treated as a regular user message.
  */
@@ -15,6 +15,7 @@ export function parseSlashCommand(text: string, clientSessionId: string): Client
     case "/c":
       return { type: "command.session.compact", clientSessionId };
     case "/stop":
+    case "/s":
       return { type: "command.session.stop", clientSessionId };
     default:
       return null;
