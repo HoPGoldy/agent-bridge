@@ -30,6 +30,9 @@ importers:
       '@types/node':
         specifier: ^24.3.0
         version: 24.13.3
+      '@types/qrcode-terminal':
+        specifier: ^0.12.2
+        version: 0.12.2
       '@vitest/coverage-v8':
         specifier: ^3.2.7
         version: 3.2.7(vitest@3.2.7(@types/node@24.13.3)(tsx@4.23.1)(yaml@2.9.0))
@@ -627,6 +630,9 @@ packages:
 
   '@types/normalize-package-data@2.4.4':
     resolution: {integrity: sha512-37i+OaWTh9qeK4LSHPsyRC7NahnGotNuZvjLSgcPzblpHB3rrCJxAOgI5gCdKm7coonsaX1Of0ILiTcnZjbfxA==}
+
+  '@types/qrcode-terminal@0.12.2':
+    resolution: {integrity: sha512-v+RcIEJ+Uhd6ygSQ0u5YYY7ZM+la7GgPbs0V/7l/kFs2uO4S8BcIUEMoP7za4DNIqNnUD5npf0A/7kBhrCKG5Q==}
 
   '@vitest/coverage-v8@3.2.7':
     resolution: {integrity: sha512-NEGWJS2XNu2PfRLQwOO3CTKj1tTETxNBdk454vDxVBhxJYhPaA/eS0nAI0c+1El1P7a60z8+i+ZrQoGESweGKg==}
@@ -2409,6 +2415,8 @@ snapshots:
       undici-types: 7.18.2
 
   '@types/normalize-package-data@2.4.4': {}
+
+  '@types/qrcode-terminal@0.12.2': {}
 
   '@vitest/coverage-v8@3.2.7(vitest@3.2.7(@types/node@24.13.3)(tsx@4.23.1)(yaml@2.9.0))':
     dependencies:

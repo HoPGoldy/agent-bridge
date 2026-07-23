@@ -1,6 +1,14 @@
 import process from "node:process";
 import { Command } from "commander";
-import type { AgentConfig, AgentModule, AppConfig, ChannelConfig, ClientConfig, ClientModule, ConfigAdapter } from "./types";
+import type {
+  AgentConfig,
+  AgentModule,
+  AppConfig,
+  ChannelConfig,
+  ClientConfig,
+  ClientModule,
+  ConfigAdapter,
+} from "./types";
 import { createPromptContext } from "./config/prompt";
 import { removeSessionBindingStore } from "./config/session-bindings";
 import { getConfigPath, loadConfig, saveConfig } from "./config/store";
@@ -67,13 +75,13 @@ async function addChannel(config: AppConfig): Promise<void> {
 
     config.channels[name] = {
       client: {
-        type: clientType as ClientConfig["type"],
-        config: clientConfig as ClientConfig["config"],
-      },
+        type: clientType,
+        config: clientConfig,
+      } as ClientConfig,
       agent: {
-        type: agentType as AgentConfig["type"],
-        config: agentConfig as AgentConfig["config"],
-      },
+        type: agentType,
+        config: agentConfig,
+      } as AgentConfig,
     } satisfies ChannelConfig;
     await saveConfig(config);
     console.log(`Saved channel ${name} to ${getConfigPath()}`);
