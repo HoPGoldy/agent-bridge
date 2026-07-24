@@ -18,6 +18,8 @@ All client adapters use the same command parser, so the command behavior is cons
 | `/c` | Alias of `/compact` | `command.session.compact` |
 | `/stop` | Stop the current in-flight agent run, if the agent supports stopping | `command.session.stop` |
 | `/s` | Alias of `/stop` | `command.session.stop` |
+| `/help` | Show the built-in command help for the current client locale | Local client-side help response |
+| `/h` | Alias of `/help` | Local client-side help response |
 
 ## How parsing works
 
@@ -39,11 +41,16 @@ That means these are valid:
 - `/Compact`
 - `/C`
 - `/S`
+- `/help`
+- `/h`
+- `/HELP`
+- `/H`
 
 And these are **not** treated as commands:
 
 - `/new please`
 - `/compact now`
+- `/help me`
 - `hello /n`
 - `-n`
 - `-c`
@@ -85,15 +92,29 @@ No active agent session to compact.
 
 If there is no active session, or no active run to stop, the bridge returns a short explanatory message instead of failing silently.
 
+### `/help`
+
+`/help` and `/h` are handled locally by the client adapter and return a built-in help message in the configured channel language.
+
+This help text currently lists:
+
+- `/new` (`/n`)
+- `/compact` (`/c`)
+- `/stop` (`/s`)
+- `/help` (`/h`)
+
+Because this is local client-side help, it does **not** create an agent session, does **not** send anything to `GatewayCore`, and does **not** invoke the agent.
+
 ## Adapter-level note
 
-Client adapters should not implement their own command grammar unless there is a very strong platform-specific reason.
+Client adapters should not implement their own platform-specific command grammar unless there is a very strong reason.
 
 The intended design is:
 
 - platform adapters normalize inbound text
-- adapters call the shared parser
+- adapters first check the shared local-help helper for `/help` / `/h`
+- adapters then call the shared parser for session-control commands
 - the parser emits standard `agent-bridge` events
-- `GatewayCore` handles the actual session behavior
+- `GatewayCore` handles the actual session behavior for parsed commands
 
-This keeps command semantics identical across all supported IM platforms.
+This keeps command semantics identical across all supported IM platforms while still allowing `/help` to remain a local UI-facing response.

@@ -78,6 +78,8 @@ agent-bridge remove <channel-name>
 
 Config file: `~/.config/agent-bridge/config.json`
 
+Architecture overview: [`docs/architecture-design.md`](./docs/architecture-design.md)
+
 Command usage across IM adapters: [`docs/command-system.md`](./docs/command-system.md)
 
 ## Development
