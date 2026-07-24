@@ -9,6 +9,7 @@ import { formatSendFailureNotice, getTranslatorForCommon, type Translator } from
 import { createLogger, type Logger } from "../../../../core/logger";
 import { ProgressRenderer } from "../../utils/progress-renderer";
 import { parseSlashCommand, resolveHelpMarkdown } from "../../utils/slash-commands";
+import { renderStatusMarkdown } from "../../utils/status-markdown";
 import { WeixinClient } from "./weixin-client";
 import { buildWeixinSessionId, parseWeixinSessionId } from "./weixin-session";
 
@@ -193,6 +194,12 @@ export class WeixinIMAdapter implements IMAdapter {
           }
 
           if (event.type !== "assistant.message") {
+            const statusMarkdown = renderStatusMarkdown(event, this.#t);
+            if (statusMarkdown) {
+              await this.#sendTextWithProtection(target.chatId, statusMarkdown);
+              continue;
+            }
+
             this.#recordProgressEvent(event);
             continue;
           }

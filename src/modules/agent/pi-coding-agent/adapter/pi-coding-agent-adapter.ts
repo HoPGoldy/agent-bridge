@@ -1,4 +1,10 @@
-import type { AgentAdapter, AgentInputEvent, AgentOutputEvent, OutboundAttachment } from "../../../../types";
+import type {
+  AgentAdapter,
+  AgentInputEvent,
+  AgentOutputEvent,
+  AgentSessionStatus,
+  OutboundAttachment,
+} from "../../../../types";
 import { createLogger, type Logger } from "../../../../core/logger";
 import { extractMediaMarkers } from "../media-marker";
 import { PiRpcClient } from "./pi-rpc-client";
@@ -100,6 +106,29 @@ export class PiCodingAgentAdapter implements AgentAdapter {
 
   async isBusy(): Promise<boolean> {
     return this.#processing || this.#inputQueue.length > 0;
+  }
+
+  async getStatus(): Promise<AgentSessionStatus> {
+    if (!this.#client) {
+      throw new Error("PiCodingAgentAdapter is not started");
+    }
+
+    const [state, stats] = await Promise.all([this.#client.getState(), this.#client.getSessionStats()]);
+    const contextUsage = stats.contextUsage;
+
+    return {
+      sessionId: state.sessionId ?? this.#agentSessionId,
+      provider: state.model?.provider,
+      modelId: state.model?.id,
+      thinkingLevel: state.thinkingLevel,
+      context: contextUsage
+        ? {
+            tokens: contextUsage.tokens ?? null,
+            contextWindow: contextUsage.contextWindow ?? null,
+            percent: contextUsage.percent ?? null,
+          }
+        : undefined,
+    };
   }
 
   async #drainInputQueue(): Promise<void> {

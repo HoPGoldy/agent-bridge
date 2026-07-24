@@ -63,6 +63,8 @@ class FakeAgentAdapter implements AgentAdapter {
   stopCount = 0;
   abortCount = 0;
   busy = false;
+  statusResult?: import("../types").AgentSessionStatus;
+  statusError?: Error;
   #onOutput: ((event: AgentOutputEvent) => Promise<void> | void) | null = null;
 
   constructor(readonly agentSessionId: string) {}
@@ -90,6 +92,16 @@ class FakeAgentAdapter implements AgentAdapter {
 
   async isBusy(): Promise<boolean> {
     return this.busy;
+  }
+
+  async getStatus(): Promise<import("../types").AgentSessionStatus> {
+    if (this.statusError) {
+      throw this.statusError;
+    }
+    if (!this.statusResult) {
+      throw new Error("status not configured");
+    }
+    return this.statusResult;
   }
 
   async emitAssistant(text: string): Promise<void> {
@@ -513,6 +525,158 @@ describe("GatewayCore", () => {
         type: "assistant.message",
         clientSessionId: "client-1",
         text: "No active agent session to stop.",
+      });
+    });
+  });
+
+  it("forwards agent session status info back to the client adapter", async () => {
+    const imAdapter = new FakeIMAdapter();
+    const createdAdapters: FakeAgentAdapter[] = [];
+
+    const agentModule: AgentModule<Record<string, never>> = {
+      type: "fake",
+      async createAgentSession() {
+        const agentSessionId = `agent-${createdAdapters.length + 1}`;
+        const agentAdapter = new FakeAgentAdapter(agentSessionId);
+        agentAdapter.statusResult = {
+          sessionId: agentSessionId,
+          provider: "anthropic",
+          modelId: "claude-sonnet-4-5",
+          thinkingLevel: "medium",
+          context: {
+            tokens: 60_000,
+            contextWindow: 200_000,
+            percent: 30,
+          },
+        };
+        createdAdapters.push(agentAdapter);
+        return { agentSessionId, agentAdapter };
+      },
+    };
+
+    const core = new GatewayCore({
+      imAdapter,
+      agentModule,
+      agentConfig: {},
+      agentIdleTimeoutMs: 60_000,
+    });
+    running.push(core);
+    await core.start();
+
+    await imAdapter.emit({
+      type: "user.message",
+      clientSessionId: "client-1",
+      text: "hello",
+    });
+
+    await waitFor(() => {
+      expect(createdAdapters).toHaveLength(1);
+    });
+
+    await imAdapter.emit({
+      type: "command.session.status",
+      clientSessionId: "client-1",
+    });
+
+    await waitFor(() => {
+      expect(imAdapter.outputs.at(-1)).toEqual({
+        type: "agent.status.info",
+        clientSessionId: "client-1",
+        status: {
+          sessionId: "agent-1",
+          provider: "anthropic",
+          modelId: "claude-sonnet-4-5",
+          thinkingLevel: "medium",
+          context: {
+            tokens: 60_000,
+            contextWindow: 200_000,
+            percent: 30,
+          },
+        },
+      });
+    });
+  });
+
+  it("emits a generic unavailable error event when no active agent session exists for /status", async () => {
+    const imAdapter = new FakeIMAdapter();
+
+    const agentModule: AgentModule<Record<string, never>> = {
+      type: "fake",
+      async createAgentSession() {
+        return {
+          agentSessionId: "agent-1",
+          agentAdapter: new FakeAgentAdapter("agent-1"),
+        };
+      },
+    };
+
+    const core = new GatewayCore({
+      imAdapter,
+      agentModule,
+      agentConfig: {},
+      agentIdleTimeoutMs: 60_000,
+    });
+    running.push(core);
+    await core.start();
+
+    await imAdapter.emit({
+      type: "command.session.status",
+      clientSessionId: "client-1",
+    });
+
+    await waitFor(() => {
+      expect(imAdapter.outputs.at(-1)).toEqual({
+        type: "error",
+        clientSessionId: "client-1",
+        kind: "agent.status.unavailable",
+      });
+    });
+  });
+
+  it("emits a generic unavailable error event with detail when status lookup fails", async () => {
+    const imAdapter = new FakeIMAdapter();
+    const createdAdapters: FakeAgentAdapter[] = [];
+
+    const agentModule: AgentModule<Record<string, never>> = {
+      type: "fake",
+      async createAgentSession() {
+        const agentAdapter = new FakeAgentAdapter("agent-1");
+        agentAdapter.statusError = new Error("RPC timeout");
+        createdAdapters.push(agentAdapter);
+        return { agentSessionId: "agent-1", agentAdapter };
+      },
+    };
+
+    const core = new GatewayCore({
+      imAdapter,
+      agentModule,
+      agentConfig: {},
+      agentIdleTimeoutMs: 60_000,
+    });
+    running.push(core);
+    await core.start();
+
+    await imAdapter.emit({
+      type: "user.message",
+      clientSessionId: "client-1",
+      text: "hello",
+    });
+
+    await waitFor(() => {
+      expect(createdAdapters).toHaveLength(1);
+    });
+
+    await imAdapter.emit({
+      type: "command.session.status",
+      clientSessionId: "client-1",
+    });
+
+    await waitFor(() => {
+      expect(imAdapter.outputs.at(-1)).toEqual({
+        type: "error",
+        clientSessionId: "client-1",
+        kind: "agent.status.unavailable",
+        detail: "RPC timeout",
       });
     });
   });

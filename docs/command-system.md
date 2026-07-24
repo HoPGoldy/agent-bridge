@@ -18,6 +18,8 @@ All client adapters use the same command parser, so the command behavior is cons
 | `/c` | Alias of `/compact` | `command.session.compact` |
 | `/stop` | Stop the current in-flight agent run, if the agent supports stopping | `command.session.stop` |
 | `/s` | Alias of `/stop` | `command.session.stop` |
+| `/status` | Query the current agent session runtime status | `command.session.status` |
+| `/st` | Alias of `/status` | `command.session.status` |
 | `/help` | Show the built-in command help for the current client locale | Local client-side help response |
 | `/h` | Alias of `/help` | Local client-side help response |
 
@@ -37,10 +39,14 @@ That means these are valid:
 - `/c`
 - `/stop`
 - `/s`
+- `/status`
+- `/st`
 - `/New`
 - `/Compact`
 - `/C`
 - `/S`
+- `/Status`
+- `/ST`
 - `/help`
 - `/h`
 - `/HELP`
@@ -50,6 +56,7 @@ And these are **not** treated as commands:
 
 - `/new please`
 - `/compact now`
+- `/status now`
 - `/help me`
 - `hello /n`
 - `-n`
@@ -92,6 +99,26 @@ No active agent session to compact.
 
 If there is no active session, or no active run to stop, the bridge returns a short explanatory message instead of failing silently.
 
+### `/status`
+
+`/status` and `/st` query the current agent session runtime state.
+
+When available, the response includes structured status information such as:
+
+- current session id
+- current model
+- thinking level
+- current context usage
+
+Architecturally, this is a session/runtime command, not a normal user message:
+
+- client adapters parse `/status` / `/st` into `command.session.status`
+- `GatewayCore` routes the request to the active agent runtime
+- the agent adapter returns structured status data
+- the client adapter renders that structured data into localized markdown/text for the IM platform
+
+If there is no active agent session, or the current agent adapter cannot provide runtime status, the bridge returns a structured unavailable/error event and the client adapter renders it for the user.
+
 ### `/help`
 
 `/help` and `/h` are handled locally by the client adapter and return a built-in help message in the configured channel language.
@@ -101,6 +128,7 @@ This help text currently lists:
 - `/new` (`/n`)
 - `/compact` (`/c`)
 - `/stop` (`/s`)
+- `/status` (`/st`)
 - `/help` (`/h`)
 
 Because this is local client-side help, it does **not** create an agent session, does **not** send anything to `GatewayCore`, and does **not** invoke the agent.
@@ -115,6 +143,7 @@ The intended design is:
 - adapters first check the shared local-help helper for `/help` / `/h`
 - adapters then call the shared parser for session-control commands
 - the parser emits standard `agent-bridge` events
-- `GatewayCore` handles the actual session behavior for parsed commands
+- `GatewayCore` routes those commands to the correct agent session or emits a structured unavailable/error result
+- client adapters render user-facing status/help output locally
 
-This keeps command semantics identical across all supported IM platforms while still allowing `/help` to remain a local UI-facing response.
+This keeps command semantics identical across all supported IM platforms while still allowing `/help` to remain a local UI-facing response and `/status` to remain a structured runtime query.

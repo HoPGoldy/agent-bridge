@@ -15,6 +15,10 @@ export type ClientOutputEvent =
   | {
       type: "command.session.stop";
       clientSessionId: string;
+    }
+  | {
+      type: "command.session.status";
+      clientSessionId: string;
     };
 
 export type AgentInputEvent =
@@ -31,6 +35,18 @@ export interface OutboundAttachment {
   filePath: string;
   fileName?: string;
   caption?: string;
+}
+
+export interface AgentSessionStatus {
+  sessionId: string;
+  provider?: string;
+  modelId?: string;
+  thinkingLevel?: string;
+  context?: {
+    tokens: number | null;
+    contextWindow: number | null;
+    percent: number | null;
+  };
 }
 
 type ToolProgressPayload = {
@@ -50,6 +66,15 @@ type AgentOutputPayload =
   | {
       type: "assistant.thinking";
       text?: string;
+    }
+  | {
+      type: "agent.status.info";
+      status: AgentSessionStatus;
+    }
+  | {
+      type: "error";
+      kind: string;
+      detail?: string;
     }
   | ({
       type: "assistant.tool.running";
@@ -92,6 +117,7 @@ export interface AgentAdapter {
   start(onOutput: (event: AgentOutputEvent) => Promise<void> | void): Promise<void>;
   stop(): Promise<void>;
   abort?(): Promise<void>;
+  getStatus?(): Promise<AgentSessionStatus>;
   input(event: AgentInputEvent): Promise<void>;
   isBusy(): Promise<boolean>;
 }

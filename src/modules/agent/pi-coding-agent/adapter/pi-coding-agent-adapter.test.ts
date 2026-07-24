@@ -5,6 +5,17 @@ const rpcClients: Array<{
   emit: (event: { type: string; [key: string]: unknown }) => void;
 }> = [];
 
+let mockedState: {
+  sessionId?: string;
+  sessionName?: string;
+  model?: { provider?: string; id?: string };
+  thinkingLevel?: string;
+} = { sessionId: "agent-1", sessionName: "agent-1" };
+
+let mockedSessionStats: {
+  contextUsage?: { tokens?: number | null; contextWindow?: number | null; percent?: number | null };
+} = {};
+
 vi.mock("./pi-rpc-client", () => {
   return {
     PiRpcClient: class FakePiRpcClient {
@@ -33,6 +44,23 @@ vi.mock("./pi-rpc-client", () => {
       async compact(): Promise<{ estimatedTokensAfter?: number; summary?: string }> {
         return {};
       }
+
+      async getState(): Promise<{
+        sessionId?: string;
+        sessionName?: string;
+        model?: { provider?: string; id?: string };
+        thinkingLevel?: string;
+      }> {
+        return mockedState;
+      }
+
+      async getSessionStats(): Promise<{
+        contextUsage?: { tokens?: number | null; contextWindow?: number | null; percent?: number | null };
+      }> {
+        return mockedSessionStats;
+      }
+
+      async setSessionName(): Promise<void> {}
     },
   };
 });
@@ -41,6 +69,8 @@ import { PiCodingAgentAdapter } from "./pi-coding-agent-adapter";
 
 afterEach(() => {
   rpcClients.length = 0;
+  mockedState = { sessionId: "agent-1", sessionName: "agent-1" };
+  mockedSessionStats = {};
 });
 
 describe("PiCodingAgentAdapter", () => {
@@ -149,6 +179,42 @@ describe("PiCodingAgentAdapter", () => {
         text: undefined,
       },
     ]);
+  });
+
+  it("returns structured session status from Pi RPC state and session stats", async () => {
+    mockedState = {
+      sessionId: "pi-session-1",
+      sessionName: "agent-1",
+      model: {
+        provider: "anthropic",
+        id: "claude-sonnet-4-5",
+      },
+      thinkingLevel: "medium",
+    };
+    mockedSessionStats = {
+      contextUsage: {
+        tokens: 60_000,
+        contextWindow: 200_000,
+        percent: 30,
+      },
+    };
+
+    const adapter = new PiCodingAgentAdapter({ agentSessionId: "agent-1" });
+
+    await adapter.start(() => {});
+    const status = await adapter.getStatus?.();
+
+    expect(status).toEqual({
+      sessionId: "pi-session-1",
+      provider: "anthropic",
+      modelId: "claude-sonnet-4-5",
+      thinkingLevel: "medium",
+      context: {
+        tokens: 60_000,
+        contextWindow: 200_000,
+        percent: 30,
+      },
+    });
   });
 
   it("forwards assistant text from Pi message_end text blocks", async () => {

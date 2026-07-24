@@ -3,6 +3,7 @@ import { formatSendFailureNotice, getTranslatorForCommon, type Translator } from
 import { createLogger, type Logger } from "../../../../core/logger";
 import { ProgressRenderer } from "../../utils/progress-renderer";
 import { parseSlashCommand, resolveHelpMarkdown } from "../../utils/slash-commands";
+import { renderStatusMarkdown } from "../../utils/status-markdown";
 import { FeishuClient } from "./feishu-client";
 import { buildFeishuSessionId, parseFeishuSessionId } from "./feishu-session";
 
@@ -185,6 +186,12 @@ export class FeishuIMAdapter implements IMAdapter {
           const target = parseFeishuSessionId(event.clientSessionId);
 
           if (event.type !== "assistant.message") {
+            const statusMarkdown = renderStatusMarkdown(event, this.#t);
+            if (statusMarkdown) {
+              await this.#client.sendText(target.chatId, statusMarkdown);
+              continue;
+            }
+
             await this.#handleProgressEvent(target.chatId, event);
             continue;
           }

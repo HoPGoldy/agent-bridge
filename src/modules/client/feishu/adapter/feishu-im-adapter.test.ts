@@ -176,6 +176,33 @@ describe("FeishuIMAdapter", () => {
     expect(fakeClientState.startTyping).not.toHaveBeenCalled();
   });
 
+  it("forwards /status to the core as a command event", async () => {
+    const adapter = new FeishuIMAdapter(
+      {
+        appId: "cli_xxx",
+        appSecret: "secret",
+        requireMentionInGroup: true,
+      },
+      createLogger("test"),
+    );
+    const onOutput = vi.fn(async (_event: ClientOutputEvent) => {});
+
+    await adapter.start(onOutput);
+    await fakeClientState.onMessage?.({
+      chatId: "oc_dm",
+      chatType: "p2p",
+      messageId: "msg-status",
+      text: "/status",
+      mentionedBot: false,
+    });
+
+    expect(onOutput).toHaveBeenCalledWith({
+      type: "command.session.status",
+      clientSessionId: "feishu:dm:oc_dm",
+    });
+    expect(fakeClientState.startTyping).not.toHaveBeenCalled();
+  });
+
   it("forwards /stop to the core as a command event", async () => {
     const adapter = new FeishuIMAdapter(
       {
@@ -330,6 +357,36 @@ describe("FeishuIMAdapter", () => {
 
     expect(fakeClientState.sendText.mock.calls[1]?.[1]).toContain("[agent-bridge 错误] 消息发送失败");
     expect(fakeClientState.sendText.mock.calls[1]?.[1]).toContain("field validation failed");
+  });
+
+  it("renders structured status info as a localized text reply", async () => {
+    const adapter = new FeishuIMAdapter(
+      {
+        appId: "cli_xxx",
+        appSecret: "secret",
+        requireMentionInGroup: true,
+      },
+      createLogger("test"),
+    );
+
+    await adapter.start(async () => {});
+    await adapter.input({
+      type: "agent.status.info",
+      clientSessionId: "feishu:dm:oc_dm",
+      status: {
+        sessionId: "agent-1",
+        provider: "anthropic",
+        modelId: "claude-sonnet-4-5",
+        thinkingLevel: "medium",
+        context: {
+          tokens: 60000,
+          contextWindow: 200000,
+          percent: 30,
+        },
+      },
+    });
+
+    expect(fakeClientState.sendText).toHaveBeenCalledWith("oc_dm", expect.stringContaining("Current session status"));
   });
 
   it("renders progress cards with friendly labels and skips thinking events", async () => {

@@ -19,9 +19,16 @@ const resources = {
       client: {
         processing: "Processing...",
         helpMessage:
-          "Available commands:\n\n- `/new` (`/n`) - Start a new agent session\n- `/compact` (`/c`) - Compact the current session context\n- `/stop` (`/s`) - Stop the active agent run\n- `/help` (`/h`) - Show this help message",
+          "Available commands:\n\n- `/new` (`/n`) - Start a new agent session\n- `/compact` (`/c`) - Compact the current session context\n- `/stop` (`/s`) - Stop the active agent run\n- `/status` (`/st`) - Show the current agent session status\n- `/help` (`/h`) - Show this help message",
         messageDeliveryFailedTitle: "[agent-bridge error] Message delivery failed",
         weixinCooldown: "Weixin send is cooling down after rate limiting. Please try again shortly.",
+        statusTitle: "Current session status",
+        statusSessionId: "Session ID",
+        statusModel: "Model",
+        statusThinkingLevel: "Thinking level",
+        statusContext: "Context",
+        statusUnavailable: "Current session status is unavailable.",
+        statusUnavailableValue: "Unavailable",
       },
       gateway: {
         noActiveSessionToCompact: "No active agent session to compact.",
@@ -47,9 +54,16 @@ const resources = {
       client: {
         processing: "正在处理中...",
         helpMessage:
-          "可用命令：\n\n- `/new` (`/n`) - 开始一个新会话\n- `/compact` (`/c`) - 压缩当前会话上下文\n- `/stop` (`/s`) - 停止当前正在运行的任务\n- `/help` (`/h`) - 查看这条帮助信息",
+          "可用命令：\n\n- `/new` (`/n`) - 开始一个新会话\n- `/compact` (`/c`) - 压缩当前会话上下文\n- `/stop` (`/s`) - 停止当前正在运行的任务\n- `/status` (`/st`) - 查看当前智能体会话状态\n- `/help` (`/h`) - 查看这条帮助信息",
         messageDeliveryFailedTitle: "[agent-bridge 错误] 消息发送失败",
         weixinCooldown: "微信发送因限流已进入冷却，请稍后再试。",
+        statusTitle: "当前会话状态",
+        statusSessionId: "Session ID",
+        statusModel: "模型",
+        statusThinkingLevel: "思考等级",
+        statusContext: "上下文",
+        statusUnavailable: "当前无法获取会话状态。",
+        statusUnavailableValue: "暂不可用",
       },
       gateway: {
         noActiveSessionToCompact: "当前没有可压缩的智能体会话。",

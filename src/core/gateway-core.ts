@@ -87,6 +87,11 @@ export class GatewayCore {
       return;
     }
 
+    if (event.type === "command.session.status") {
+      await this.#handleSessionStatus(event.clientSessionId);
+      return;
+    }
+
     await this.#handleUserMessage(event.clientSessionId, event.text);
   }
 
@@ -148,6 +153,46 @@ export class GatewayCore {
     }
 
     await runtime.agentAdapter.abort();
+  }
+
+  async #handleSessionStatus(clientSessionId: string): Promise<void> {
+    const runtime = await this.#getActiveRuntime(clientSessionId);
+    if (!runtime) {
+      await this.#deliverClientInput({
+        type: "error",
+        clientSessionId,
+        kind: "agent.status.unavailable",
+      });
+      return;
+    }
+
+    this.#touchRuntime(runtime);
+
+    if (!runtime.agentAdapter.getStatus) {
+      await this.#deliverClientInput({
+        type: "error",
+        clientSessionId,
+        kind: "agent.status.unavailable",
+      });
+      return;
+    }
+
+    try {
+      const status = await runtime.agentAdapter.getStatus();
+      await this.#deliverClientInput({
+        type: "agent.status.info",
+        clientSessionId,
+        status,
+      });
+    } catch (error) {
+      const detail = error instanceof Error ? error.message : String(error);
+      await this.#deliverClientInput({
+        type: "error",
+        clientSessionId,
+        kind: "agent.status.unavailable",
+        detail,
+      });
+    }
   }
 
   async #handleSessionNew(clientSessionId: string): Promise<void> {

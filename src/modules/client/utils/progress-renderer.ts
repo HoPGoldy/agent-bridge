@@ -8,9 +8,13 @@ export interface ProgressRendererOptions {
 }
 
 /** The subset of `ClientInputEvent` that represents a renderable progress update. */
-export type ProgressEvent = Exclude<
+export type ProgressEvent = Extract<
   ClientInputEvent,
-  { type: "assistant.message" } | { type: "assistant.thinking" }
+  | { type: "session.compacting" }
+  | { type: "assistant.tool.running" }
+  | { type: "assistant.tool.update" }
+  | { type: "assistant.tool.done" }
+  | { type: "assistant.tool.error" }
 >;
 
 export interface RenderedProgress {

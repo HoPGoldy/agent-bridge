@@ -220,6 +220,32 @@ describe("WecomIMAdapter", () => {
     expect(fakeClientState.sendStreamText).not.toHaveBeenCalled();
   });
 
+  it("forwards /st to the core as a command event", async () => {
+    const adapter = new WecomIMAdapter(
+      {
+        botId: "bot-id",
+        secret: "secret",
+        requireMentionInGroup: true,
+      },
+      createLogger("test"),
+    );
+    const onOutput = vi.fn(async (_event: ClientOutputEvent) => {});
+
+    await adapter.start(onOutput);
+    await fakeClientState.onMessage?.({
+      chatId: "user_1",
+      chatType: "dm",
+      messageId: "msg-status",
+      text: "/st",
+      mentionedBot: false,
+    });
+
+    expect(onOutput).toHaveBeenCalledWith({
+      type: "command.session.status",
+      clientSessionId: "wecom:dm:user_1",
+    });
+  });
+
   it("forwards /stop to the core as a command event", async () => {
     const adapter = new WecomIMAdapter(
       {
@@ -391,6 +417,28 @@ describe("WecomIMAdapter", () => {
     await new Promise((resolve) => setTimeout(resolve, 10));
 
     expect(fakeClientState.sendText).toHaveBeenCalledTimes(1);
+  });
+
+  it("renders structured status errors as a localized text reply", async () => {
+    const adapter = new WecomIMAdapter(
+      {
+        botId: "bot-id",
+        secret: "secret",
+        requireMentionInGroup: true,
+      },
+      createLogger("test"),
+      { channelName: "demo-channel", language: "zh-CN" },
+    );
+
+    await adapter.start(async () => {});
+    await adapter.input({
+      type: "error",
+      clientSessionId: "wecom:dm:user_1",
+      kind: "agent.status.unavailable",
+      detail: "RPC timeout",
+    });
+
+    expect(fakeClientState.sendText).toHaveBeenCalledWith("user_1", expect.stringContaining("当前无法获取会话状态。"));
   });
 
   it("refreshes the same progress stream using the same body text as feishu", async () => {

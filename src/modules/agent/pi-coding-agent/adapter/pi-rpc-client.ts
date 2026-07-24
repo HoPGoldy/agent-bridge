@@ -12,6 +12,7 @@ export type PiRpcCommand =
   | { id?: string; type: "compact"; customInstructions?: string }
   | { id?: string; type: "get_last_assistant_text" }
   | { id?: string; type: "get_state" }
+  | { id?: string; type: "get_session_stats" }
   | { id?: string; type: "set_session_name"; name: string };
 
 export type PiRpcResponse = {
@@ -241,9 +242,50 @@ export class PiRpcClient {
     return data ?? {};
   }
 
-  async getState(): Promise<{ sessionName?: string }> {
+  async getState(): Promise<{
+    sessionId?: string;
+    sessionName?: string;
+    thinkingLevel?: string;
+    model?: {
+      provider?: string;
+      id?: string;
+      contextWindow?: number;
+      maxTokens?: number;
+    };
+  }> {
     const response = await this.#send({ type: "get_state" });
-    return (response.data as { sessionName?: string } | undefined) ?? {};
+    return (
+      (response.data as {
+        sessionId?: string;
+        sessionName?: string;
+        thinkingLevel?: string;
+        model?: {
+          provider?: string;
+          id?: string;
+          contextWindow?: number;
+          maxTokens?: number;
+        };
+      } | undefined) ?? {}
+    );
+  }
+
+  async getSessionStats(): Promise<{
+    contextUsage?: {
+      tokens?: number | null;
+      contextWindow?: number | null;
+      percent?: number | null;
+    };
+  }> {
+    const response = await this.#send({ type: "get_session_stats" });
+    return (
+      (response.data as {
+        contextUsage?: {
+          tokens?: number | null;
+          contextWindow?: number | null;
+          percent?: number | null;
+        };
+      } | undefined) ?? {}
+    );
   }
 
   async setSessionName(name: string): Promise<void> {

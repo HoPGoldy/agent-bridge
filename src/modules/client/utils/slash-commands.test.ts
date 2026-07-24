@@ -56,6 +56,17 @@ describe("parseSlashCommand", () => {
     });
   });
 
+  it("parses /status and /st into a command.session.status event", () => {
+    expect(parseSlashCommand("/status", "session-1")).toEqual({
+      type: "command.session.status",
+      clientSessionId: "session-1",
+    });
+    expect(parseSlashCommand("/st", "session-1")).toEqual({
+      type: "command.session.status",
+      clientSessionId: "session-1",
+    });
+  });
+
   it("parses supported commands case-insensitively", () => {
     expect(parseSlashCommand("/New", "session-1")).toEqual({
       type: "command.session.new",
@@ -73,6 +84,14 @@ describe("parseSlashCommand", () => {
       type: "command.session.stop",
       clientSessionId: "session-1",
     });
+    expect(parseSlashCommand("/Status", "session-1")).toEqual({
+      type: "command.session.status",
+      clientSessionId: "session-1",
+    });
+    expect(parseSlashCommand("/ST", "session-1")).toEqual({
+      type: "command.session.status",
+      clientSessionId: "session-1",
+    });
   });
 
   it("returns null for regular text", () => {
@@ -84,6 +103,7 @@ describe("parseSlashCommand", () => {
     expect(parseSlashCommand("/h", "session-1")).toBeNull();
     expect(parseSlashCommand("/new please", "session-1")).toBeNull();
     expect(parseSlashCommand("/compact please", "session-1")).toBeNull();
+    expect(parseSlashCommand("/status now", "session-1")).toBeNull();
     expect(parseSlashCommand("-n", "session-1")).toBeNull();
     expect(parseSlashCommand("-c", "session-1")).toBeNull();
   });

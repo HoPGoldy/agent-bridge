@@ -22,7 +22,7 @@ export function resolveHelpMarkdown(text: string, t: Translator): string | null 
 
 /**
  * Parses a trimmed inbound text as one of the standard agent-bridge slash
- * commands (`/new`, `/n`, `/compact`, `/c`, `/stop`, `/s`) and returns the
+ * commands (`/new`, `/n`, `/compact`, `/c`, `/stop`, `/s`, `/status`, `/st`) and returns the
  * corresponding `ClientOutputEvent`, or `null` if `text` is not a recognized
  * command and should be treated as a regular user message.
  */
@@ -37,6 +37,9 @@ export function parseSlashCommand(text: string, clientSessionId: string): Client
     case "/stop":
     case "/s":
       return { type: "command.session.stop", clientSessionId };
+    case "/status":
+    case "/st":
+      return { type: "command.session.status", clientSessionId };
     default:
       return null;
   }

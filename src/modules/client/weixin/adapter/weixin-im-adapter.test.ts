@@ -217,6 +217,32 @@ describe("WeixinIMAdapter", () => {
     expect(fakeClientState.sendTyping).not.toHaveBeenCalled();
   });
 
+  it("forwards /status to the core as a command event", async () => {
+    const adapter = new WeixinIMAdapter(
+      {
+        accountId: "bot-account",
+        token: "bot-token",
+      },
+      createLogger("test"),
+    );
+    const onOutput = vi.fn(async (_event: ClientOutputEvent) => {});
+
+    await adapter.start(onOutput);
+    await fakeClientState.onMessage?.({
+      chatId: "wxid_user_1",
+      chatType: "dm",
+      messageId: "msg-status",
+      text: "/status",
+      mentionedBot: false,
+    });
+
+    expect(onOutput).toHaveBeenCalledWith({
+      type: "command.session.status",
+      clientSessionId: "weixin:dm:wxid_user_1",
+    });
+    expect(fakeClientState.sendTyping).not.toHaveBeenCalled();
+  });
+
   it("forwards /stop to the core as a command event", async () => {
     const adapter = new WeixinIMAdapter(
       {
@@ -331,6 +357,33 @@ describe("WeixinIMAdapter", () => {
 
     await vi.advanceTimersByTimeAsync(20_000);
     expect(fakeClientState.sendTyping).toHaveBeenCalledTimes(3);
+  });
+
+  it("renders structured status info as a plain text reply", async () => {
+    const adapter = new WeixinIMAdapter(
+      {
+        accountId: "bot-account",
+        token: "bot-token",
+      },
+      createLogger("test"),
+    );
+
+    await adapter.start(async () => {});
+    await adapter.input({
+      type: "agent.status.info",
+      clientSessionId: "weixin:dm:wxid_user_1",
+      status: {
+        sessionId: "agent-1",
+        provider: "anthropic",
+        modelId: "claude-sonnet-4-5",
+        thinkingLevel: "medium",
+      },
+    });
+
+    expect(fakeClientState.sendText).toHaveBeenCalledWith(
+      "wxid_user_1",
+      expect.stringContaining("anthropic/claude-sonnet-4-5"),
+    );
   });
 
   it("sends one progress summary per minute when progress changes", async () => {

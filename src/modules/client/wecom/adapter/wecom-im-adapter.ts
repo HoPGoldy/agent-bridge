@@ -9,6 +9,7 @@ import { formatSendFailureNotice, getTranslatorForCommon, type Translator } from
 import { createLogger, type Logger } from "../../../../core/logger";
 import { ProgressRenderer } from "../../utils/progress-renderer";
 import { parseSlashCommand, resolveHelpMarkdown } from "../../utils/slash-commands";
+import { renderStatusMarkdown } from "../../utils/status-markdown";
 import { WecomClient } from "./wecom-client";
 import { buildWecomSessionId, parseWecomSessionId } from "./wecom-session";
 
@@ -189,6 +190,12 @@ export class WecomIMAdapter implements IMAdapter {
           const target = parseWecomSessionId(event.clientSessionId);
 
           if (event.type !== "assistant.message") {
+            const statusMarkdown = renderStatusMarkdown(event, this.#t);
+            if (statusMarkdown) {
+              await this.#client.sendText(target.chatId, statusMarkdown);
+              continue;
+            }
+
             await this.#handleProgressEvent(target.chatId, event);
             continue;
           }
