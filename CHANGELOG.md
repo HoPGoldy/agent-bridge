@@ -2,6 +2,13 @@
 
 All notable changes to this project will be documented in this file. See [commit-and-tag-version](https://github.com/absolute-version/commit-and-tag-version) for commit guidelines.
 
+## [0.3.3](https://github.com/HoPGoldy/agent-bridge/compare/v0.3.2...v0.3.3) (2026-07-24)
+
+
+### Bug Fixes
+
+* read cli version from package metadata ([78448a8](https://github.com/HoPGoldy/agent-bridge/commit/78448a8ef7c8947f1dfe72961efcb8c19de66189))
+
 ## [0.3.2](https://github.com/HoPGoldy/agent-bridge/compare/v0.3.1...v0.3.2) (2026-07-24)
 
 
