@@ -1,4 +1,5 @@
 import process from "node:process";
+import { createRequire } from "node:module";
 import { Command } from "commander";
 import type {
   AgentConfig,
@@ -16,6 +17,9 @@ import { getConfigPath, loadConfig, saveConfig } from "./config/store";
 import { runChannel } from "./core/channel-runner";
 import { getAgentModule, listAgentModules } from "./modules/agent";
 import { getClientModule, listClientModules } from "./modules/client";
+
+const require = createRequire(import.meta.url);
+const { version } = require("../package.json") as { version: string };
 
 async function selectModuleType<T extends { type: string }>(
   label: string,
@@ -181,7 +185,7 @@ async function startChannel(channelName: string): Promise<void> {
 export async function runCli(argv = process.argv): Promise<void> {
   const program = new Command();
 
-  program.name("agent-bridge").description("IM to Agent bridge CLI").version("0.1.0");
+  program.name("agent-bridge").description("IM to Agent bridge CLI").version(version);
 
   program
     .command("add")
