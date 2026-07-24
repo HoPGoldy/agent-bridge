@@ -2,6 +2,13 @@
 
 All notable changes to this project will be documented in this file. See [commit-and-tag-version](https://github.com/absolute-version/commit-and-tag-version) for commit guidelines.
 
+## [0.3.4](https://github.com/HoPGoldy/agent-bridge/compare/v0.3.3...v0.3.4) (2026-07-24)
+
+
+### Bug Fixes
+
+* sync pnpm lockfile ([ec32cdb](https://github.com/HoPGoldy/agent-bridge/commit/ec32cdb8fac8422997dec382213073821837a4ad))
+
 ## [0.3.3](https://github.com/HoPGoldy/agent-bridge/compare/v0.3.2...v0.3.3) (2026-07-24)
 
 
