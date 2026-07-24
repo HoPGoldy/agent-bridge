@@ -191,6 +191,35 @@ describe("WecomIMAdapter", () => {
     expect(fakeClientState.sendText.mock.calls[1]?.[1]).toContain("field validation failed");
   });
 
+  it("handles /h locally without forwarding it to the core", async () => {
+    const adapter = new WecomIMAdapter(
+      {
+        botId: "bot-id",
+        secret: "secret",
+        requireMentionInGroup: true,
+      },
+      createLogger("test"),
+    );
+    const onOutput = vi.fn(async (_event: ClientOutputEvent) => {});
+
+    await adapter.start(onOutput);
+    await fakeClientState.onMessage?.({
+      chatId: "user_1",
+      chatType: "dm",
+      messageId: "msg-help",
+      text: "/h",
+      mentionedBot: false,
+    });
+
+    expect(onOutput).not.toHaveBeenCalled();
+    expect(fakeClientState.sendText).toHaveBeenCalledWith(
+      "user_1",
+      expect.stringContaining("Available commands:"),
+      "msg-help",
+    );
+    expect(fakeClientState.sendStreamText).not.toHaveBeenCalled();
+  });
+
   it("forwards /stop to the core as a command event", async () => {
     const adapter = new WecomIMAdapter(
       {

@@ -1,5 +1,26 @@
 import { describe, expect, it } from "vitest";
-import { parseSlashCommand } from "./slash-commands";
+import { getTranslator } from "../../../i18n";
+import { parseSlashCommand, resolveHelpMarkdown } from "./slash-commands";
+
+describe("resolveHelpMarkdown", () => {
+  it("returns localized help markdown for /help and /h", () => {
+    const en = getTranslator("en-US");
+    const zh = getTranslator("zh-CN");
+
+    expect(resolveHelpMarkdown("/help", en)).toContain("Available commands:");
+    expect(resolveHelpMarkdown("/h", en)).toContain("/stop");
+    expect(resolveHelpMarkdown("/H", zh)).toContain("可用命令：");
+    expect(resolveHelpMarkdown("/HELP", zh)).toContain("查看这条帮助信息");
+  });
+
+  it("returns null for non-help text", () => {
+    const en = getTranslator("en-US");
+
+    expect(resolveHelpMarkdown("/stop", en)).toBeNull();
+    expect(resolveHelpMarkdown("/help me", en)).toBeNull();
+    expect(resolveHelpMarkdown("hello", en)).toBeNull();
+  });
+});
 
 describe("parseSlashCommand", () => {
   it("parses /new and /n into a command.session.new event", () => {
@@ -60,6 +81,7 @@ describe("parseSlashCommand", () => {
 
   it("returns null for unrecognized command-like text", () => {
     expect(parseSlashCommand("/help", "session-1")).toBeNull();
+    expect(parseSlashCommand("/h", "session-1")).toBeNull();
     expect(parseSlashCommand("/new please", "session-1")).toBeNull();
     expect(parseSlashCommand("/compact please", "session-1")).toBeNull();
     expect(parseSlashCommand("-n", "session-1")).toBeNull();

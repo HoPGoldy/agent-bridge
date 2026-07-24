@@ -8,7 +8,7 @@ import type {
 import { formatSendFailureNotice, getTranslatorForCommon, type Translator } from "../../../../i18n";
 import { createLogger, type Logger } from "../../../../core/logger";
 import { ProgressRenderer } from "../../utils/progress-renderer";
-import { parseSlashCommand } from "../../utils/slash-commands";
+import { parseSlashCommand, resolveHelpMarkdown } from "../../utils/slash-commands";
 import { WecomClient } from "./wecom-client";
 import { buildWecomSessionId, parseWecomSessionId } from "./wecom-session";
 
@@ -120,6 +120,12 @@ export class WecomIMAdapter implements IMAdapter {
       }
 
       const normalizedText = text.trim();
+      const helpMarkdown = resolveHelpMarkdown(normalizedText, this.#t);
+      if (helpMarkdown) {
+        await this.#client?.sendText(chatId, helpMarkdown, messageId);
+        return;
+      }
+
       const commandEvent = parseSlashCommand(normalizedText, clientSessionId);
       if (commandEvent) {
         await this.#onOutput(commandEvent);

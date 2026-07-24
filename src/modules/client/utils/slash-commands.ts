@@ -1,4 +1,24 @@
+import type { Translator } from "../../../i18n";
 import type { ClientOutputEvent } from "../../../types";
+
+function isHelpCommand(text: string): boolean {
+  switch (text.toLowerCase()) {
+    case "/help":
+    case "/h":
+      return true;
+    default:
+      return false;
+  }
+}
+
+/**
+ * Resolves a trimmed inbound text as the local help command (`/help`, `/h`) and
+ * returns a localized help markdown string, or `null` if `text` is not a help
+ * command and should continue through the normal command/message flow.
+ */
+export function resolveHelpMarkdown(text: string, t: Translator): string | null {
+  return isHelpCommand(text) ? t("client.helpMessage") : null;
+}
 
 /**
  * Parses a trimmed inbound text as one of the standard agent-bridge slash

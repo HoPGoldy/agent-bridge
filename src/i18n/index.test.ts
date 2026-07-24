@@ -8,6 +8,8 @@ describe("i18n", () => {
 
     expect(en("progress.noProgress")).toBe("No progress yet.");
     expect(zh("progress.noProgress")).toBe("暂无进度。");
+    expect(en("client.helpMessage")).toContain("/help");
+    expect(zh("client.helpMessage")).toContain("查看这条帮助信息");
   });
 
   it("does not leak locale state across fixed translators", () => {

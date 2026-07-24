@@ -18,6 +18,8 @@ const resources = {
       },
       client: {
         processing: "Processing...",
+        helpMessage:
+          "Available commands:\n\n- `/new` (`/n`) - Start a new agent session\n- `/compact` (`/c`) - Compact the current session context\n- `/stop` (`/s`) - Stop the active agent run\n- `/help` (`/h`) - Show this help message",
         messageDeliveryFailedTitle: "[agent-bridge error] Message delivery failed",
         weixinCooldown: "Weixin send is cooling down after rate limiting. Please try again shortly.",
       },
@@ -44,6 +46,8 @@ const resources = {
       },
       client: {
         processing: "正在处理中...",
+        helpMessage:
+          "可用命令：\n\n- `/new` (`/n`) - 开始一个新会话\n- `/compact` (`/c`) - 压缩当前会话上下文\n- `/stop` (`/s`) - 停止当前正在运行的任务\n- `/help` (`/h`) - 查看这条帮助信息",
         messageDeliveryFailedTitle: "[agent-bridge 错误] 消息发送失败",
         weixinCooldown: "微信发送因限流已进入冷却，请稍后再试。",
       },

@@ -8,7 +8,7 @@ import type {
 import { formatSendFailureNotice, getTranslatorForCommon, type Translator } from "../../../../i18n";
 import { createLogger, type Logger } from "../../../../core/logger";
 import { ProgressRenderer } from "../../utils/progress-renderer";
-import { parseSlashCommand } from "../../utils/slash-commands";
+import { parseSlashCommand, resolveHelpMarkdown } from "../../utils/slash-commands";
 import { WeixinClient } from "./weixin-client";
 import { buildWeixinSessionId, parseWeixinSessionId } from "./weixin-session";
 
@@ -111,9 +111,14 @@ export class WeixinIMAdapter implements IMAdapter {
         return;
       }
 
-      this.#resetProgressState(clientSessionId);
-
       const normalizedText = text.trim();
+      const helpMarkdown = resolveHelpMarkdown(normalizedText, this.#t);
+      if (helpMarkdown) {
+        await this.#client?.sendText(chatId, helpMarkdown);
+        return;
+      }
+
+      this.#resetProgressState(clientSessionId);
       const commandEvent = parseSlashCommand(normalizedText, clientSessionId);
       if (commandEvent) {
         await this.#onOutput(commandEvent);

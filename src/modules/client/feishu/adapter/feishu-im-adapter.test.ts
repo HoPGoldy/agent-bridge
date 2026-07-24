@@ -147,6 +147,35 @@ describe("FeishuIMAdapter", () => {
     expect(fakeClientState.startTyping).toHaveBeenCalledWith("oc_dm", "msg-2");
   });
 
+  it("handles /help locally without forwarding it to the core", async () => {
+    const adapter = new FeishuIMAdapter(
+      {
+        appId: "cli_xxx",
+        appSecret: "secret",
+        requireMentionInGroup: true,
+      },
+      createLogger("test"),
+    );
+    const onOutput = vi.fn(async (_event: ClientOutputEvent) => {});
+
+    await adapter.start(onOutput);
+    await fakeClientState.onMessage?.({
+      chatId: "oc_dm",
+      chatType: "p2p",
+      messageId: "msg-help",
+      text: "/help",
+      mentionedBot: false,
+    });
+
+    expect(onOutput).not.toHaveBeenCalled();
+    expect(fakeClientState.sendText).toHaveBeenCalledWith(
+      "oc_dm",
+      expect.stringContaining("Available commands:"),
+      "msg-help",
+    );
+    expect(fakeClientState.startTyping).not.toHaveBeenCalled();
+  });
+
   it("forwards /stop to the core as a command event", async () => {
     const adapter = new FeishuIMAdapter(
       {

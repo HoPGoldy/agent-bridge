@@ -2,7 +2,7 @@ import type { ChannelCommonContext, ClientInputEvent, ClientOutputEvent, FeishuC
 import { formatSendFailureNotice, getTranslatorForCommon, type Translator } from "../../../../i18n";
 import { createLogger, type Logger } from "../../../../core/logger";
 import { ProgressRenderer } from "../../utils/progress-renderer";
-import { parseSlashCommand } from "../../utils/slash-commands";
+import { parseSlashCommand, resolveHelpMarkdown } from "../../utils/slash-commands";
 import { FeishuClient } from "./feishu-client";
 import { buildFeishuSessionId, parseFeishuSessionId } from "./feishu-session";
 
@@ -113,10 +113,13 @@ export class FeishuIMAdapter implements IMAdapter {
         return;
       }
 
-      this.#lastInboundMessageIdBySession.set(clientSessionId, messageId);
-      this.#resetProgressState(clientSessionId);
-      await this.#client?.startTyping(chatId, messageId);
       const normalizedText = text.trim();
+      const helpMarkdown = resolveHelpMarkdown(normalizedText, this.#t);
+      if (helpMarkdown) {
+        this.#logger.info(`received local help command ${normalizedText} (session=${clientSessionId})`);
+        await this.#client?.sendText(chatId, helpMarkdown, messageId);
+        return;
+      }
 
       const commandEvent = parseSlashCommand(normalizedText, clientSessionId);
       if (commandEvent) {
@@ -125,6 +128,9 @@ export class FeishuIMAdapter implements IMAdapter {
         return;
       }
 
+      this.#lastInboundMessageIdBySession.set(clientSessionId, messageId);
+      this.#resetProgressState(clientSessionId);
+      await this.#client?.startTyping(chatId, messageId);
       this.#logger.info(`received user message (session=${clientSessionId}): ${normalizedText}`);
       await this.#onOutput({
         type: "user.message",

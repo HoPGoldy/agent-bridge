@@ -189,6 +189,34 @@ describe("WeixinIMAdapter", () => {
     expect(fakeClientState.sendTyping).toHaveBeenCalledWith("wxid_user_1");
   });
 
+  it("handles /help locally and localizes it in Chinese", async () => {
+    const adapter = new WeixinIMAdapter(
+      {
+        accountId: "bot-account",
+        token: "bot-token",
+      },
+      createLogger("test"),
+      { channelName: "demo-channel", language: "zh-CN" },
+    );
+    const onOutput = vi.fn(async (_event: ClientOutputEvent) => {});
+
+    await adapter.start(onOutput);
+    await fakeClientState.onMessage?.({
+      chatId: "wxid_user_1",
+      chatType: "dm",
+      messageId: "msg-help",
+      text: "/help",
+      mentionedBot: false,
+    });
+
+    expect(onOutput).not.toHaveBeenCalled();
+    expect(fakeClientState.sendText).toHaveBeenCalledWith(
+      "wxid_user_1",
+      expect.stringContaining("可用命令："),
+    );
+    expect(fakeClientState.sendTyping).not.toHaveBeenCalled();
+  });
+
   it("forwards /stop to the core as a command event", async () => {
     const adapter = new WeixinIMAdapter(
       {
