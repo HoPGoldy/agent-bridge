@@ -2,6 +2,20 @@
 
 All notable changes to this project will be documented in this file. See [commit-and-tag-version](https://github.com/absolute-version/commit-and-tag-version) for commit guidelines.
 
+## [0.3.2](https://github.com/HoPGoldy/agent-bridge/compare/v0.3.1...v0.3.2) (2026-07-24)
+
+
+### Features
+
+* add /s slash command alias ([43aa24c](https://github.com/HoPGoldy/agent-bridge/commit/43aa24c9ab7ccc289066b21d71d1d6de2ae692fb))
+* add channel language i18n support ([9555c6e](https://github.com/HoPGoldy/agent-bridge/commit/9555c6eb3a412f97fd8fc06a838a3122c84813a8))
+* add localized /help slash command ([6d7a7ae](https://github.com/HoPGoldy/agent-bridge/commit/6d7a7ae4f103cbb0a253c690a41a604ec3e2e796))
+
+
+### Bug Fixes
+
+* avoid redundant generic tool error text ([e291fce](https://github.com/HoPGoldy/agent-bridge/commit/e291fcef74c692e294b198a6135ec48257e63cfa))
+
 ## [0.3.1](https://github.com/HoPGoldy/agent-bridge/compare/v0.2.1...v0.3.1) (2026-07-23)
 
 
