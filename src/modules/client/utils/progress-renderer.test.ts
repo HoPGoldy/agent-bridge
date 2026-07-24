@@ -60,12 +60,12 @@ describe("ProgressRenderer", () => {
     });
   });
 
-  it("formats legacy tool running/done/error and session.compacting lines in English", () => {
+  it("formats tool and compacting lines with status icons in English", () => {
     const renderer = new ProgressRenderer({ t: getTranslator("en-US") });
     const events: ProgressEvent[] = [
       { type: "assistant.tool.running", clientSessionId: "s1", toolName: "web_search" },
       { type: "assistant.tool.done", clientSessionId: "s1", toolName: "bash" },
-      { type: "assistant.tool.error", clientSessionId: "s1", toolName: "bash", text: "Failed bash" },
+      { type: "assistant.tool.error", clientSessionId: "s1", toolName: "bash", text: "permission denied" },
       { type: "session.compacting", clientSessionId: "s1", text: "trimming history" },
     ];
 
@@ -75,43 +75,31 @@ describe("ProgressRenderer", () => {
 
     const progress = renderer.getCurrentProgress();
     expect(progress.markdown).toBe(
-      [
-        "- Running web_search",
-        "- Finished bash",
-        "- Failed bash",
-        "- Compacting session: trimming history",
-      ].join("\n"),
+      ["- ⏳ web_search", "- ✅ bash", "- ❌ bash: permission denied", "- Compacting session: trimming history"].join(
+        "\n",
+      ),
     );
     expect(progress.status).toBe("running");
     expect(progress.collapsedCount).toBe(0);
   });
 
-  it("dedupes redundant error text and falls back to a humanized message", () => {
+  it("renders tool errors without synthetic dedupe logic", () => {
     const renderer = new ProgressRenderer({ t: getTranslator("en-US") });
 
     renderer.takeProgressEvent({ type: "assistant.tool.error", clientSessionId: "s1", toolName: "bash" });
-    expect(renderer.getCurrentProgress().markdown).toBe("- Failed bash");
+    expect(renderer.getCurrentProgress().markdown).toBe("- ❌ bash");
 
     const renderer2 = new ProgressRenderer({ t: getTranslator("en-US") });
     renderer2.takeProgressEvent({
       type: "assistant.tool.error",
       clientSessionId: "s1",
       toolName: "bash",
-      text: "bash",
-    });
-    expect(renderer2.getCurrentProgress().markdown).toBe("- Failed bash");
-
-    const renderer3 = new ProgressRenderer({ t: getTranslator("en-US") });
-    renderer3.takeProgressEvent({
-      type: "assistant.tool.error",
-      clientSessionId: "s1",
-      toolName: "bash",
       text: "permission denied",
     });
-    expect(renderer3.getCurrentProgress().markdown).toBe("- Failed bash: permission denied");
+    expect(renderer2.getCurrentProgress().markdown).toBe("- ❌ bash: permission denied");
   });
 
-  it("renders tool labels on error lines without appending a redundant generic failure suffix", () => {
+  it("renders tool labels on error lines with a longer visible label before truncation", () => {
     const renderer = new ProgressRenderer({ t: getTranslator("en-US") });
 
     renderer.takeProgressEvent({
@@ -122,7 +110,7 @@ describe("ProgressRenderer", () => {
       toolLabel: "/home/leefoundy/demo.txt",
     });
 
-    expect(renderer.getCurrentProgress().markdown).toBe("- Failed read: /home/leefoundy…");
+    expect(renderer.getCurrentProgress().markdown).toBe("- ❌ read: /home/leefoundy/demo.txt");
   });
 
   it("updates the same tool row in place when toolCallId is present", () => {
@@ -135,7 +123,7 @@ describe("ProgressRenderer", () => {
       toolCallId: "call-1",
       toolLabel: "ls -la",
     });
-    expect(renderer.getCurrentProgress().markdown).toBe("- Running bash: ls -la");
+    expect(renderer.getCurrentProgress().markdown).toBe("- ⏳ bash: ls -la");
 
     renderer.takeProgressEvent({
       type: "assistant.tool.update",
@@ -144,7 +132,7 @@ describe("ProgressRenderer", () => {
       toolCallId: "call-1",
       toolLabel: "ls -la",
     });
-    expect(renderer.getCurrentProgress().markdown).toBe("- Running bash: ls -la");
+    expect(renderer.getCurrentProgress().markdown).toBe("- ⏳ bash: ls -la");
 
     renderer.takeProgressEvent({
       type: "assistant.tool.done",
@@ -153,10 +141,10 @@ describe("ProgressRenderer", () => {
       toolCallId: "call-1",
       toolLabel: "ls -la",
     });
-    expect(renderer.getCurrentProgress().markdown).toBe("- Finished bash: ls -la");
+    expect(renderer.getCurrentProgress().markdown).toBe("- ✅ bash: ls -la");
   });
 
-  it("truncates long tool labels in rendered progress", () => {
+  it("truncates long tool labels later now that status text is iconized", () => {
     const renderer = new ProgressRenderer({ t: getTranslator("en-US") });
 
     renderer.takeProgressEvent({
@@ -164,10 +152,10 @@ describe("ProgressRenderer", () => {
       clientSessionId: "s1",
       toolName: "bash",
       toolCallId: "call-1",
-      toolLabel: "12345678901234567890",
+      toolLabel: "123456789012345678901234567890",
     });
 
-    expect(renderer.getCurrentProgress().markdown).toBe("- Running bash: 123456789012345…");
+    expect(renderer.getCurrentProgress().markdown).toBe("- ⏳ bash: 123456789012345678901234…");
   });
 
   it("tracks status across the most recent event", () => {
@@ -215,9 +203,7 @@ describe("ProgressRenderer", () => {
       toolCallId: "call-b",
     });
 
-    expect(renderer.getCurrentProgress().markdown).toBe(
-      ["- Running a", "- Finished b", "- Running c"].join("\n"),
-    );
+    expect(renderer.getCurrentProgress().markdown).toBe(["- ⏳ a", "- ✅ b", "- ⏳ c"].join("\n"));
   });
 
   it("collapses lines beyond the default threshold of 10", () => {
@@ -236,16 +222,16 @@ describe("ProgressRenderer", () => {
     expect(progress.markdown).toBe(
       [
         "- Collapsed 2 earlier updates.",
-        "- Running tool_3",
-        "- Running tool_4",
-        "- Running tool_5",
-        "- Running tool_6",
-        "- Running tool_7",
-        "- Running tool_8",
-        "- Running tool_9",
-        "- Running tool_10",
-        "- Running tool_11",
-        "- Running tool_12",
+        "- ⏳ tool_3",
+        "- ⏳ tool_4",
+        "- ⏳ tool_5",
+        "- ⏳ tool_6",
+        "- ⏳ tool_7",
+        "- ⏳ tool_8",
+        "- ⏳ tool_9",
+        "- ⏳ tool_10",
+        "- ⏳ tool_11",
+        "- ⏳ tool_12",
       ].join("\n"),
     );
   });
@@ -259,9 +245,7 @@ describe("ProgressRenderer", () => {
 
     const progress = renderer.getCurrentProgress();
     expect(progress.collapsedCount).toBe(1);
-    expect(progress.markdown).toBe(
-      ["- Collapsed 1 earlier updates.", "- Running b", "- Running c"].join("\n"),
-    );
+    expect(progress.markdown).toBe(["- Collapsed 1 earlier updates.", "- ⏳ b", "- ⏳ c"].join("\n"));
   });
 
   it("renders progress lines in Chinese when configured", () => {
@@ -278,7 +262,7 @@ describe("ProgressRenderer", () => {
     }
 
     expect(renderer.getCurrentProgress().markdown).toBe(
-      ["- 正在执行 web_search", "- 已完成 bash", "- read: /tmp/demo.txt 执行失败", "- 正在压缩会话: 压缩上下文"].join(
+      ["- ⏳ web_search", "- ✅ bash", "- ❌ read: /tmp/demo.txt", "- 正在压缩会话: 压缩上下文"].join(
         "\n",
       ),
     );

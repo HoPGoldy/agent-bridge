@@ -426,28 +426,26 @@ describe("WecomIMAdapter", () => {
       clientSessionId: "wecom:dm:user_1",
       agentSessionId: "agent-1",
       toolName: "web_search",
-      text: "Running web_search",
+      text: undefined,
     });
     await adapter.input({
       type: "assistant.tool.done",
       clientSessionId: "wecom:dm:user_1",
       agentSessionId: "agent-1",
       toolName: "bash",
-      text: "Finished bash",
+      text: undefined,
     });
     await adapter.input({
       type: "assistant.tool.error",
       clientSessionId: "wecom:dm:user_1",
       agentSessionId: "agent-1",
       toolName: "bash",
-      text: "Failed bash",
+      text: undefined,
     });
 
     await waitFor(() => fakeClientState.sendStreamText.mock.calls.length === 3);
 
-    expect(fakeClientState.sendStreamText.mock.calls[2]?.[1]).toBe(
-      ["- Running web_search", "- Finished bash", "- Failed bash"].join("\n"),
-    );
+    expect(fakeClientState.sendStreamText.mock.calls[2]?.[1]).toBe(["- ⏳ web_search", "- ✅ bash", "- ❌ bash"].join("\n"));
     expect(fakeClientState.sendStreamText.mock.calls[2]?.[2]).toEqual({
       replyToMessageId: "msg-progress-1",
       finish: false,
@@ -483,7 +481,7 @@ describe("WecomIMAdapter", () => {
         clientSessionId: "wecom:dm:user_1",
         agentSessionId: "agent-1",
         toolName: `tool_${index}`,
-        text: `Running tool_${index}`,
+        text: undefined,
       });
     }
 
@@ -492,16 +490,16 @@ describe("WecomIMAdapter", () => {
     expect(fakeClientState.sendStreamText.mock.calls[11]?.[1]).toBe(
       [
         "- Collapsed 2 earlier updates.",
-        "- Running tool_3",
-        "- Running tool_4",
-        "- Running tool_5",
-        "- Running tool_6",
-        "- Running tool_7",
-        "- Running tool_8",
-        "- Running tool_9",
-        "- Running tool_10",
-        "- Running tool_11",
-        "- Running tool_12",
+        "- ⏳ tool_3",
+        "- ⏳ tool_4",
+        "- ⏳ tool_5",
+        "- ⏳ tool_6",
+        "- ⏳ tool_7",
+        "- ⏳ tool_8",
+        "- ⏳ tool_9",
+        "- ⏳ tool_10",
+        "- ⏳ tool_11",
+        "- ⏳ tool_12",
       ].join("\n"),
     );
     expect(fakeClientState.sendStreamText.mock.calls[11]?.[2]).toEqual({

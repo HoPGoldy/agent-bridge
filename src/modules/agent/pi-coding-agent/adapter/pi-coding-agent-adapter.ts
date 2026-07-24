@@ -226,7 +226,7 @@ export class PiCodingAgentAdapter implements AgentAdapter {
         toolCallId,
         toolInput,
         toolLabel,
-        text: `Running ${toolName}`,
+        text: undefined,
       });
       return;
     }
@@ -248,7 +248,7 @@ export class PiCodingAgentAdapter implements AgentAdapter {
         toolInput,
         toolLabel,
         partialResult: "partialResult" in rpcEvent ? rpcEvent.partialResult : undefined,
-        text: `Running ${toolName}`,
+        text: undefined,
       });
       return;
     }
@@ -267,7 +267,7 @@ export class PiCodingAgentAdapter implements AgentAdapter {
         toolInput,
         toolLabel,
         result: "result" in rpcEvent ? rpcEvent.result : undefined,
-        text: isError ? undefined : `Finished ${toolName}`,
+        text: undefined,
       });
       if (toolCallId) {
         this.#toolLabelByCallId.delete(toolCallId);

@@ -360,14 +360,14 @@ describe("WeixinIMAdapter", () => {
       clientSessionId: "weixin:dm:wxid_user_1",
       agentSessionId: "agent-1",
       toolName: "web_search",
-      text: "Running web_search",
+      text: undefined,
     });
     await adapter.input({
       type: "assistant.tool.done",
       clientSessionId: "weixin:dm:wxid_user_1",
       agentSessionId: "agent-1",
       toolName: "bash",
-      text: "Finished bash",
+      text: undefined,
     });
 
     await vi.advanceTimersByTimeAsync(59_000);
@@ -376,9 +376,7 @@ describe("WeixinIMAdapter", () => {
     await vi.advanceTimersByTimeAsync(1_000);
     await waitFor(() => fakeClientState.sendText.mock.calls.length === 1);
 
-    expect(fakeClientState.sendText.mock.calls[0]?.[1]).toBe(
-      ["- Running web_search", "- Finished bash"].join("\n"),
-    );
+    expect(fakeClientState.sendText.mock.calls[0]?.[1]).toBe(["- ⏳ web_search", "- ✅ bash"].join("\n"));
   });
 
   it("sends attachments after the text reply", async () => {

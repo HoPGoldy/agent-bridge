@@ -44,7 +44,7 @@ afterEach(() => {
 });
 
 describe("PiCodingAgentAdapter", () => {
-  it("forwards tool execution events with tool ids and labels", async () => {
+  it("forwards tool execution events with tool ids and labels but without generic display text", async () => {
     const adapter = new PiCodingAgentAdapter({ agentSessionId: "agent-1" });
     const outputs: AgentOutputEvent[] = [];
 
@@ -81,7 +81,7 @@ describe("PiCodingAgentAdapter", () => {
         toolCallId: "call-1",
         toolInput: { command: "ls -la" },
         toolLabel: "ls -la",
-        text: "Running bash",
+        text: undefined,
       },
       {
         type: "assistant.tool.update",
@@ -91,7 +91,7 @@ describe("PiCodingAgentAdapter", () => {
         toolInput: { command: "ls -la" },
         toolLabel: "ls -la",
         partialResult: { content: [{ type: "text", text: "partial output" }] },
-        text: "Running bash",
+        text: undefined,
       },
       {
         type: "assistant.tool.done",
@@ -101,7 +101,7 @@ describe("PiCodingAgentAdapter", () => {
         toolInput: { command: "ls -la" },
         toolLabel: "ls -la",
         result: { content: [{ type: "text", text: "done" }] },
-        text: "Finished bash",
+        text: undefined,
       },
     ]);
   });
@@ -136,7 +136,7 @@ describe("PiCodingAgentAdapter", () => {
         toolCallId: "call-err-1",
         toolInput: { path: "/tmp/demo.txt" },
         toolLabel: "/tmp/demo.txt",
-        text: "Running read",
+        text: undefined,
       },
       {
         type: "assistant.tool.error",

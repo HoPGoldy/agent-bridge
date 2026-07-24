@@ -21,7 +21,7 @@ export interface RenderedProgress {
 }
 
 const DEFAULT_COLLAPSE_THRESHOLD = 10;
-const MAX_TOOL_LABEL_DISPLAY_LENGTH = 15;
+const MAX_TOOL_LABEL_DISPLAY_LENGTH = 24;
 
 /**
  * Accumulates agent progress events (tool running/done/error, session
@@ -177,17 +177,6 @@ export class ProgressRenderer {
   #formatToolErrorLine(toolName: string, text?: string): string {
     const normalizedText = text?.trim();
     if (!normalizedText) {
-      return `- ${this.#humanizeToolError(toolName)}`;
-    }
-
-    const lowerText = normalizedText.toLowerCase();
-    const lowerToolName = toolName.toLowerCase();
-    if (
-      lowerText === lowerToolName ||
-      lowerText === this.#t("progress.failed", { subject: toolName }).toLowerCase() ||
-      lowerText === this.#t("progress.running", { subject: toolName }).toLowerCase() ||
-      lowerText === this.#t("progress.finished", { subject: toolName }).toLowerCase()
-    ) {
       return `- ${this.#humanizeToolError(toolName)}`;
     }
 

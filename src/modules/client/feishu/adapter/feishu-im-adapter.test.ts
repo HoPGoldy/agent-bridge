@@ -361,21 +361,21 @@ describe("FeishuIMAdapter", () => {
       clientSessionId: "feishu:dm:oc_dm",
       agentSessionId: "agent-1",
       toolName: "web_search",
-      text: "Running web_search",
+      text: undefined,
     });
     await adapter.input({
       type: "assistant.tool.done",
       clientSessionId: "feishu:dm:oc_dm",
       agentSessionId: "agent-1",
       toolName: "bash",
-      text: "Finished bash",
+      text: undefined,
     });
     await adapter.input({
       type: "assistant.tool.error",
       clientSessionId: "feishu:dm:oc_dm",
       agentSessionId: "agent-1",
       toolName: "bash",
-      text: "Failed bash",
+      text: undefined,
     });
 
     await waitFor(
@@ -390,16 +390,14 @@ describe("FeishuIMAdapter", () => {
       body: { elements: Array<{ content: string }> };
     };
     expect(firstCard.header).toBeUndefined();
-    expect(firstCard.body.elements[0]?.content).toBe("- Running web_search");
+    expect(firstCard.body.elements[0]?.content).toBe("- ⏳ web_search");
 
     const updatedCard = fakeClientState.updateCard.mock.calls[1]?.[1] as {
       header?: unknown;
       body: { elements: Array<{ content: string }> };
     };
     expect(updatedCard.header).toBeUndefined();
-    expect(updatedCard.body.elements[0]?.content).toBe(
-      ["- Running web_search", "- Finished bash", "- Failed bash"].join("\n"),
-    );
+    expect(updatedCard.body.elements[0]?.content).toBe(["- ⏳ web_search", "- ✅ bash", "- ❌ bash"].join("\n"));
   });
 
   it("keeps multiple tool updates in the same card within one user turn", async () => {
@@ -428,21 +426,21 @@ describe("FeishuIMAdapter", () => {
       clientSessionId: "feishu:dm:oc_dm",
       agentSessionId: "agent-1",
       toolName: "web_search",
-      text: "Running web_search",
+      text: undefined,
     });
     await adapter.input({
       type: "assistant.tool.done",
       clientSessionId: "feishu:dm:oc_dm",
       agentSessionId: "agent-1",
       toolName: "web_search",
-      text: "Finished web_search",
+      text: undefined,
     });
     await adapter.input({
       type: "assistant.tool.running",
       clientSessionId: "feishu:dm:oc_dm",
       agentSessionId: "agent-1",
       toolName: "read_file",
-      text: "Running read_file",
+      text: undefined,
     });
 
     await waitFor(
@@ -454,9 +452,7 @@ describe("FeishuIMAdapter", () => {
     const finalCard = fakeClientState.updateCard.mock.calls[1]?.[1] as {
       body: { elements: Array<{ content: string }> };
     };
-    expect(finalCard.body.elements[0]?.content).toBe(
-      ["- Running web_search", "- Finished web_search", "- Running read_file"].join("\n"),
-    );
+    expect(finalCard.body.elements[0]?.content).toBe(["- ⏳ web_search", "- ✅ web_search", "- ⏳ read_file"].join("\n"));
   });
 
   it("starts a fresh progress card only after the next user message", async () => {
@@ -485,14 +481,14 @@ describe("FeishuIMAdapter", () => {
       clientSessionId: "feishu:dm:oc_dm",
       agentSessionId: "agent-1",
       toolName: "web_search",
-      text: "Running web_search",
+      text: undefined,
     });
     await adapter.input({
       type: "assistant.tool.done",
       clientSessionId: "feishu:dm:oc_dm",
       agentSessionId: "agent-1",
       toolName: "web_search",
-      text: "Finished web_search",
+      text: undefined,
     });
 
     await waitFor(() => fakeClientState.sendCard.mock.calls.length === 1);
@@ -510,7 +506,7 @@ describe("FeishuIMAdapter", () => {
       clientSessionId: "feishu:dm:oc_dm",
       agentSessionId: "agent-1",
       toolName: "read_file",
-      text: "Running read_file",
+      text: undefined,
     });
 
     await waitFor(() => fakeClientState.sendCard.mock.calls.length === 2);
@@ -518,7 +514,7 @@ describe("FeishuIMAdapter", () => {
     const secondCard = fakeClientState.sendCard.mock.calls[1]?.[1] as {
       body: { elements: Array<{ content: string }> };
     };
-    expect(secondCard.body.elements[0]?.content).toBe("- Running read_file");
+    expect(secondCard.body.elements[0]?.content).toBe("- ⏳ read_file");
   });
 
   it("shows a collapsed-updates summary after more than ten progress entries", async () => {
@@ -546,7 +542,7 @@ describe("FeishuIMAdapter", () => {
         clientSessionId: "feishu:dm:oc_dm",
         agentSessionId: "agent-1",
         toolName: `tool_${index}`,
-        text: `Running tool_${index}`,
+        text: undefined,
       });
     }
 
@@ -558,16 +554,16 @@ describe("FeishuIMAdapter", () => {
     expect(finalCard.body.elements[0]?.content).toBe(
       [
         "- Collapsed 2 earlier updates.",
-        "- Running tool_3",
-        "- Running tool_4",
-        "- Running tool_5",
-        "- Running tool_6",
-        "- Running tool_7",
-        "- Running tool_8",
-        "- Running tool_9",
-        "- Running tool_10",
-        "- Running tool_11",
-        "- Running tool_12",
+        "- ⏳ tool_3",
+        "- ⏳ tool_4",
+        "- ⏳ tool_5",
+        "- ⏳ tool_6",
+        "- ⏳ tool_7",
+        "- ⏳ tool_8",
+        "- ⏳ tool_9",
+        "- ⏳ tool_10",
+        "- ⏳ tool_11",
+        "- ⏳ tool_12",
       ].join("\n"),
     );
   });

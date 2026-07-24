@@ -561,7 +561,7 @@ describe("GatewayCore", () => {
         type: "assistant.tool.running",
         agentSessionId: "agent-1",
         toolName: "read_file",
-        text: "Running read_file",
+        text: undefined,
       });
 
       await waitFor(() => {
@@ -570,7 +570,7 @@ describe("GatewayCore", () => {
           clientSessionId: "client-1",
           agentSessionId: "agent-1",
           toolName: "read_file",
-          text: "Running read_file",
+          text: undefined,
         });
       });
 
@@ -582,7 +582,7 @@ describe("GatewayCore", () => {
           agentSessionId: "agent-1",
           clientSessionId: "client-1",
           toolName: "read_file",
-          text: "Running read_file",
+          text: undefined,
         },
       );
     } finally {
