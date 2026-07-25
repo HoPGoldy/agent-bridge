@@ -127,15 +127,15 @@ export class WecomIMAdapter implements IMAdapter {
         return;
       }
 
+      this.#lastInboundMessageIdBySession.set(clientSessionId, messageId);
+      this.#resetProgressState(clientSessionId);
+      await this.#announceStart(chatId, messageId, clientSessionId);
+
       const commandEvent = parseSlashCommand(normalizedText, clientSessionId);
       if (commandEvent) {
         await this.#onOutput(commandEvent);
         return;
       }
-
-      this.#lastInboundMessageIdBySession.set(clientSessionId, messageId);
-      this.#resetProgressState(clientSessionId);
-      await this.#announceStart(chatId, messageId, clientSessionId);
 
       await this.#onOutput({
         type: "user.message",
@@ -192,7 +192,9 @@ export class WecomIMAdapter implements IMAdapter {
           if (event.type !== "assistant.message") {
             const statusMarkdown = renderStatusMarkdown(event, this.#t);
             if (statusMarkdown) {
-              await this.#client.sendText(target.chatId, statusMarkdown);
+              const replyToMessageId = this.#lastInboundMessageIdBySession.get(event.clientSessionId);
+              await this.#finishProgressMessage(target.chatId, event.clientSessionId, replyToMessageId);
+              await this.#client.sendText(target.chatId, statusMarkdown, replyToMessageId);
               continue;
             }
 

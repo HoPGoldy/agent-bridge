@@ -214,7 +214,8 @@ describe("WeixinIMAdapter", () => {
       "wxid_user_1",
       expect.stringContaining("可用命令："),
     );
-    expect(fakeClientState.sendTyping).not.toHaveBeenCalled();
+    expect(fakeClientState.sendTyping).toHaveBeenCalledWith("wxid_user_1");
+    expect(fakeClientState.stopTyping).toHaveBeenCalledWith("wxid_user_1");
   });
 
   it("forwards /status to the core as a command event", async () => {
@@ -240,7 +241,19 @@ describe("WeixinIMAdapter", () => {
       type: "command.session.status",
       clientSessionId: "weixin:dm:wxid_user_1",
     });
-    expect(fakeClientState.sendTyping).not.toHaveBeenCalled();
+    expect(fakeClientState.sendTyping).toHaveBeenCalledWith("wxid_user_1");
+
+    await adapter.input({
+      type: "agent.status.info",
+      clientSessionId: "weixin:dm:wxid_user_1",
+      status: { sessionId: "agent-1" },
+    });
+
+    expect(fakeClientState.sendText).toHaveBeenCalledWith(
+      "wxid_user_1",
+      expect.stringContaining("Current session status"),
+    );
+    expect(fakeClientState.stopTyping).toHaveBeenCalledWith("wxid_user_1");
   });
 
   it("forwards /model to the core as a model-list command event", async () => {
@@ -266,7 +279,19 @@ describe("WeixinIMAdapter", () => {
       type: "command.session.model.list",
       clientSessionId: "weixin:dm:wxid_user_1",
     });
-    expect(fakeClientState.sendTyping).not.toHaveBeenCalled();
+    expect(fakeClientState.sendTyping).toHaveBeenCalledWith("wxid_user_1");
+
+    await adapter.input({
+      type: "agent.model.list",
+      clientSessionId: "weixin:dm:wxid_user_1",
+      models: [],
+    });
+
+    expect(fakeClientState.sendText).toHaveBeenCalledWith(
+      "wxid_user_1",
+      expect.stringContaining("Available models"),
+    );
+    expect(fakeClientState.stopTyping).toHaveBeenCalledWith("wxid_user_1");
   });
 
   it("forwards /stop to the core as a command event", async () => {
@@ -509,7 +534,9 @@ describe("WeixinIMAdapter", () => {
     });
 
     await waitFor(
-      () => fakeClientState.sendText.mock.calls.length === 1 && fakeClientState.sendAttachment.mock.calls.length === 1,
+      () =>
+        fakeClientState.sendText.mock.calls.length === 1 &&
+        fakeClientState.sendAttachment.mock.calls.length === 1,
     );
 
     expect(fakeClientState.sendText.mock.invocationCallOrder[0]).toBeLessThan(
@@ -670,11 +697,7 @@ describe("WeixinIMAdapter", () => {
     });
 
     const sentTexts = fakeClientState.sendText.mock.calls.map((call) => call[1]);
-    expect(sentTexts).toEqual([
-      "first",
-      expect.stringContaining("Message delivery failed"),
-      "second",
-    ]);
+    expect(sentTexts).toEqual(["first", expect.stringContaining("Message delivery failed"), "second"]);
   });
 
   it("notifies the user when delivery fails", async () => {

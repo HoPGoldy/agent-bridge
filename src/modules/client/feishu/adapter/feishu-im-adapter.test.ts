@@ -173,7 +173,8 @@ describe("FeishuIMAdapter", () => {
       expect.stringContaining("Available commands:"),
       "msg-help",
     );
-    expect(fakeClientState.startTyping).not.toHaveBeenCalled();
+    expect(fakeClientState.startTyping).toHaveBeenCalledWith("oc_dm", "msg-help");
+    expect(fakeClientState.stopTyping).toHaveBeenCalledWith("oc_dm");
   });
 
   it("forwards /status to the core as a command event", async () => {
@@ -200,7 +201,21 @@ describe("FeishuIMAdapter", () => {
       type: "command.session.status",
       clientSessionId: "feishu:dm:oc_dm",
     });
-    expect(fakeClientState.startTyping).not.toHaveBeenCalled();
+    expect(fakeClientState.startTyping).toHaveBeenCalledWith("oc_dm", "msg-status");
+
+    await adapter.input({
+      type: "agent.status.info",
+      clientSessionId: "feishu:dm:oc_dm",
+      status: { sessionId: "agent-1" },
+    });
+    await waitFor(() => fakeClientState.sendText.mock.calls.length === 1);
+
+    expect(fakeClientState.sendText).toHaveBeenCalledWith(
+      "oc_dm",
+      expect.stringContaining("Current session status"),
+      "msg-status",
+    );
+    expect(fakeClientState.stopTyping).toHaveBeenCalledWith("oc_dm");
   });
 
   it("forwards /model to the core as a model-list command event", async () => {
@@ -227,7 +242,21 @@ describe("FeishuIMAdapter", () => {
       type: "command.session.model.list",
       clientSessionId: "feishu:dm:oc_dm",
     });
-    expect(fakeClientState.startTyping).not.toHaveBeenCalled();
+    expect(fakeClientState.startTyping).toHaveBeenCalledWith("oc_dm", "msg-model-list");
+
+    await adapter.input({
+      type: "agent.model.list",
+      clientSessionId: "feishu:dm:oc_dm",
+      models: [],
+    });
+    await waitFor(() => fakeClientState.sendText.mock.calls.length === 1);
+
+    expect(fakeClientState.sendText).toHaveBeenCalledWith(
+      "oc_dm",
+      expect.stringContaining("Available models"),
+      "msg-model-list",
+    );
+    expect(fakeClientState.stopTyping).toHaveBeenCalledWith("oc_dm");
   });
 
   it("forwards /stop to the core as a command event", async () => {
@@ -413,7 +442,11 @@ describe("FeishuIMAdapter", () => {
       },
     });
 
-    expect(fakeClientState.sendText).toHaveBeenCalledWith("oc_dm", expect.stringContaining("Current session status"));
+    expect(fakeClientState.sendText).toHaveBeenCalledWith(
+      "oc_dm",
+      expect.stringContaining("Current session status"),
+      undefined,
+    );
   });
 
   it("renders structured model lists as a localized text reply", async () => {
@@ -436,8 +469,16 @@ describe("FeishuIMAdapter", () => {
       ],
     });
 
-    expect(fakeClientState.sendText).toHaveBeenCalledWith("oc_dm", expect.stringContaining("Available models"));
-    expect(fakeClientState.sendText).toHaveBeenCalledWith("oc_dm", expect.stringContaining("anthropic/claude-sonnet-4-5"));
+    expect(fakeClientState.sendText).toHaveBeenCalledWith(
+      "oc_dm",
+      expect.stringContaining("Available models"),
+      undefined,
+    );
+    expect(fakeClientState.sendText).toHaveBeenCalledWith(
+      "oc_dm",
+      expect.stringContaining("anthropic/claude-sonnet-4-5"),
+      undefined,
+    );
   });
 
   it("renders progress cards with friendly labels and skips thinking events", async () => {
@@ -505,7 +546,9 @@ describe("FeishuIMAdapter", () => {
       body: { elements: Array<{ content: string }> };
     };
     expect(updatedCard.header).toBeUndefined();
-    expect(updatedCard.body.elements[0]?.content).toBe(["- ⏳ web_search", "- ✅ bash", "- ❌ bash"].join("\n"));
+    expect(updatedCard.body.elements[0]?.content).toBe(
+      ["- ⏳ web_search", "- ✅ bash", "- ❌ bash"].join("\n"),
+    );
   });
 
   it("keeps multiple tool updates in the same card within one user turn", async () => {
@@ -560,7 +603,9 @@ describe("FeishuIMAdapter", () => {
     const finalCard = fakeClientState.updateCard.mock.calls[1]?.[1] as {
       body: { elements: Array<{ content: string }> };
     };
-    expect(finalCard.body.elements[0]?.content).toBe(["- ⏳ web_search", "- ✅ web_search", "- ⏳ read_file"].join("\n"));
+    expect(finalCard.body.elements[0]?.content).toBe(
+      ["- ⏳ web_search", "- ✅ web_search", "- ⏳ read_file"].join("\n"),
+    );
   });
 
   it("starts a fresh progress card only after the next user message", async () => {

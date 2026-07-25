@@ -113,21 +113,24 @@ export class WeixinIMAdapter implements IMAdapter {
       }
 
       const normalizedText = text.trim();
+      this.#resetProgressState(clientSessionId);
+      await this.#client?.sendTyping(chatId);
+      this.#startTypingHeartbeat(clientSessionId, chatId);
+
       const helpMarkdown = resolveHelpMarkdown(normalizedText, this.#t);
       if (helpMarkdown) {
         await this.#client?.sendText(chatId, helpMarkdown);
+        this.#stopProgressTimer(clientSessionId);
+        this.#stopTypingHeartbeat(clientSessionId);
+        await this.#client?.stopTyping(chatId);
         return;
       }
 
-      this.#resetProgressState(clientSessionId);
       const commandEvent = parseSlashCommand(normalizedText, clientSessionId);
       if (commandEvent) {
         await this.#onOutput(commandEvent);
         return;
       }
-
-      await this.#client?.sendTyping(chatId);
-      this.#startTypingHeartbeat(clientSessionId, chatId);
 
       await this.#onOutput({
         type: "user.message",
@@ -197,6 +200,9 @@ export class WeixinIMAdapter implements IMAdapter {
             const statusMarkdown = renderStatusMarkdown(event, this.#t);
             if (statusMarkdown) {
               await this.#sendTextWithProtection(target.chatId, statusMarkdown);
+              this.#stopProgressTimer(event.clientSessionId);
+              this.#stopTypingHeartbeat(event.clientSessionId);
+              await this.#client.stopTyping(target.chatId);
               continue;
             }
 

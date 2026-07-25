@@ -1,4 +1,10 @@
-import type { ChannelCommonContext, ClientInputEvent, ClientOutputEvent, FeishuClientConfig, IMAdapter } from "../../../../types";
+import type {
+  ChannelCommonContext,
+  ClientInputEvent,
+  ClientOutputEvent,
+  FeishuClientConfig,
+  IMAdapter,
+} from "../../../../types";
 import { formatSendFailureNotice, getTranslatorForCommon, type Translator } from "../../../../i18n";
 import { createLogger, type Logger } from "../../../../core/logger";
 import { ProgressRenderer } from "../../utils/progress-renderer";
@@ -115,10 +121,15 @@ export class FeishuIMAdapter implements IMAdapter {
       }
 
       const normalizedText = text.trim();
+      this.#lastInboundMessageIdBySession.set(clientSessionId, messageId);
+      this.#resetProgressState(clientSessionId);
+      await this.#client?.startTyping(chatId, messageId);
+
       const helpMarkdown = resolveHelpMarkdown(normalizedText, this.#t);
       if (helpMarkdown) {
         this.#logger.info(`received local help command ${normalizedText} (session=${clientSessionId})`);
         await this.#client?.sendText(chatId, helpMarkdown, messageId);
+        await this.#client?.stopTyping(chatId);
         return;
       }
 
@@ -129,9 +140,6 @@ export class FeishuIMAdapter implements IMAdapter {
         return;
       }
 
-      this.#lastInboundMessageIdBySession.set(clientSessionId, messageId);
-      this.#resetProgressState(clientSessionId);
-      await this.#client?.startTyping(chatId, messageId);
       this.#logger.info(`received user message (session=${clientSessionId}): ${normalizedText}`);
       await this.#onOutput({
         type: "user.message",
@@ -188,7 +196,9 @@ export class FeishuIMAdapter implements IMAdapter {
           if (event.type !== "assistant.message") {
             const statusMarkdown = renderStatusMarkdown(event, this.#t);
             if (statusMarkdown) {
-              await this.#client.sendText(target.chatId, statusMarkdown);
+              const replyToMessageId = this.#lastInboundMessageIdBySession.get(event.clientSessionId);
+              await this.#client.sendText(target.chatId, statusMarkdown, replyToMessageId);
+              await this.#client.stopTyping(target.chatId);
               continue;
             }
 

@@ -244,6 +244,27 @@ describe("WecomIMAdapter", () => {
       type: "command.session.status",
       clientSessionId: "wecom:dm:user_1",
     });
+    expect(fakeClientState.sendStreamText).toHaveBeenCalledWith("user_1", "Processing...", {
+      replyToMessageId: "msg-status",
+      finish: false,
+    });
+
+    await adapter.input({
+      type: "agent.status.info",
+      clientSessionId: "wecom:dm:user_1",
+      status: { sessionId: "agent-1" },
+    });
+    await waitFor(() => fakeClientState.sendText.mock.calls.length === 1);
+
+    expect(fakeClientState.sendStreamText).toHaveBeenLastCalledWith("user_1", "Processing...", {
+      replyToMessageId: "msg-status",
+      finish: true,
+    });
+    expect(fakeClientState.sendText).toHaveBeenCalledWith(
+      "user_1",
+      expect.stringContaining("Current session status"),
+      "msg-status",
+    );
   });
 
   it("forwards /m anthropic/claude-sonnet-4-5 to the core as a model-set command event", async () => {
@@ -464,8 +485,13 @@ describe("WecomIMAdapter", () => {
       kind: "agent.status.unavailable",
       detail: "RPC timeout",
     });
+    await waitFor(() => fakeClientState.sendText.mock.calls.length === 1);
 
-    expect(fakeClientState.sendText).toHaveBeenCalledWith("user_1", expect.stringContaining("当前无法获取会话状态。"));
+    expect(fakeClientState.sendText).toHaveBeenCalledWith(
+      "user_1",
+      expect.stringContaining("当前无法获取会话状态。"),
+      undefined,
+    );
 
     fakeClientState.sendText.mockClear();
     await adapter.input({
@@ -473,8 +499,13 @@ describe("WecomIMAdapter", () => {
       clientSessionId: "wecom:dm:user_1",
       kind: "agent.model.busy",
     });
+    await waitFor(() => fakeClientState.sendText.mock.calls.length === 1);
 
-    expect(fakeClientState.sendText).toHaveBeenCalledWith("user_1", expect.stringContaining("当前正在运行，无法切换模型"));
+    expect(fakeClientState.sendText).toHaveBeenCalledWith(
+      "user_1",
+      expect.stringContaining("当前正在运行，无法切换模型"),
+      undefined,
+    );
   });
 
   it("refreshes the same progress stream using the same body text as feishu", async () => {
@@ -529,7 +560,9 @@ describe("WecomIMAdapter", () => {
 
     await waitFor(() => fakeClientState.sendStreamText.mock.calls.length === 3);
 
-    expect(fakeClientState.sendStreamText.mock.calls[2]?.[1]).toBe(["- ⏳ web_search", "- ✅ bash", "- ❌ bash"].join("\n"));
+    expect(fakeClientState.sendStreamText.mock.calls[2]?.[1]).toBe(
+      ["- ⏳ web_search", "- ✅ bash", "- ❌ bash"].join("\n"),
+    );
     expect(fakeClientState.sendStreamText.mock.calls[2]?.[2]).toEqual({
       replyToMessageId: "msg-progress-1",
       finish: false,
