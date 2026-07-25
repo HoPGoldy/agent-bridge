@@ -20,6 +20,8 @@ let mockedSessionStats: {
 
 let mockedAvailableModels: Array<{ provider: string; id: string }> = [];
 let setModelCalls: Array<{ provider: string; modelId: string }> = [];
+let promptCalls: Array<{ message: string; streamingBehavior?: "steer" | "followUp" }> = [];
+let abortCalls = 0;
 
 vi.mock("./pi-rpc-client", () => {
   return {
@@ -42,9 +44,13 @@ vi.mock("./pi-rpc-client", () => {
 
       async stop(): Promise<void> {}
 
-      async abort(): Promise<void> {}
+      async abort(): Promise<void> {
+        abortCalls += 1;
+      }
 
-      async prompt(): Promise<void> {}
+      async prompt(message: string, streamingBehavior?: "steer" | "followUp"): Promise<void> {
+        promptCalls.push({ message, streamingBehavior });
+      }
 
       async compact(): Promise<{ estimatedTokensAfter?: number; summary?: string }> {
         return {};
@@ -89,9 +95,38 @@ afterEach(() => {
   mockedSessionStats = {};
   mockedAvailableModels = [];
   setModelCalls = [];
+  promptCalls = [];
+  abortCalls = 0;
 });
 
 describe("PiCodingAgentAdapter", () => {
+  it("delegates busy-message steering to Pi and tracks the run until it settles", async () => {
+    const adapter = new PiCodingAgentAdapter({ agentSessionId: "agent-1" });
+
+    await adapter.start(() => {});
+    await adapter.input({ type: "user.message", text: "long-running task" });
+
+    expect(promptCalls).toEqual([
+      { message: "long-running task", streamingBehavior: "steer" },
+    ]);
+    await new Promise((resolve) => setImmediate(resolve));
+    expect(await adapter.isBusy()).toBe(true);
+
+    await adapter.input({ type: "user.message", text: "change direction" });
+    expect(promptCalls).toEqual([
+      { message: "long-running task", streamingBehavior: "steer" },
+      { message: "change direction", streamingBehavior: "steer" },
+    ]);
+
+    await adapter.abort();
+    expect(abortCalls).toBe(1);
+
+    rpcClients[0]?.emit({ type: "agent_settled" });
+    await vi.waitFor(async () => {
+      expect(await adapter.isBusy()).toBe(false);
+    });
+  });
+
   it("forwards tool execution events with tool ids and labels but without generic display text", async () => {
     const adapter = new PiCodingAgentAdapter({ agentSessionId: "agent-1" });
     const outputs: AgentOutputEvent[] = [];

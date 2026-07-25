@@ -106,9 +106,7 @@ No active agent session to compact.
 
 ### `/stop`
 
-`/stop` and `/s` ask the current agent adapter to abort the active run.
-
-If there is no active session, or no active run to stop, the bridge returns a short explanatory message instead of failing silently.
+`/stop` and `/s` forward an abort request to the current agent adapter without first checking whether it reports itself as busy. If there is no active session, the bridge returns a short explanatory message instead of failing silently.
 
 ### `/status`
 

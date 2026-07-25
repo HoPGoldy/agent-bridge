@@ -7,7 +7,7 @@ import { createLogger, type Logger } from "../../../../core/logger";
 import { resolveMediaPromptExtensionPath } from "./pi-extension-path";
 
 export type PiRpcCommand =
-  | { id?: string; type: "prompt"; message: string }
+  | { id?: string; type: "prompt"; message: string; streamingBehavior?: "steer" | "followUp" }
   | { id?: string; type: "abort" }
   | { id?: string; type: "compact"; customInstructions?: string }
   | { id?: string; type: "get_last_assistant_text" }
@@ -230,8 +230,8 @@ export class PiRpcClient {
     this.#rejectPending(new Error("pi RPC client stopped"));
   }
 
-  async prompt(message: string): Promise<void> {
-    await this.#send({ type: "prompt", message });
+  async prompt(message: string, streamingBehavior?: "steer" | "followUp"): Promise<void> {
+    await this.#send({ type: "prompt", message, streamingBehavior });
   }
 
   async abort(): Promise<void> {

@@ -153,15 +153,6 @@ export class GatewayCore {
       return;
     }
 
-    if (!(await runtime.agentAdapter.isBusy())) {
-      await this.#deliverClientInput({
-        type: "assistant.message",
-        clientSessionId,
-        text: this.#t("gateway.noActiveRunToStop"),
-      });
-      return;
-    }
-
     await runtime.agentAdapter.abort();
   }
 

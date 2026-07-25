@@ -31,8 +31,7 @@ export class PiCodingAgentAdapter implements AgentAdapter {
   readonly #logger: Logger;
   #client: PiRpcClient | null = null;
   #onOutput: ((event: AgentOutputEvent) => Promise<void> | void) | null = null;
-  #inputQueue: AgentInputEvent[] = [];
-  #processing = false;
+  #activeRun = false;
   #toolLabelByCallId = new Map<string, string>();
   #toolInputByCallId = new Map<string, unknown>();
 
@@ -87,12 +86,11 @@ export class PiCodingAgentAdapter implements AgentAdapter {
   }
 
   async stop(): Promise<void> {
-    this.#inputQueue.length = 0;
     this.#toolLabelByCallId.clear();
     this.#toolInputByCallId.clear();
     await this.#client?.stop();
     this.#client = null;
-    this.#processing = false;
+    this.#activeRun = false;
     this.#onOutput = null;
     this.#logger.info(`session ${this.#agentSessionId} stopped`);
   }
@@ -107,15 +105,11 @@ export class PiCodingAgentAdapter implements AgentAdapter {
       throw new Error("PiCodingAgentAdapter is not started");
     }
 
-    this.#inputQueue.push(event);
-    this.#logger.debug(
-      `input event queued (session=${this.#agentSessionId} type=${event.type} queueDepth=${this.#inputQueue.length})`,
-    );
-    void this.#drainInputQueue();
+    await this.#processEvent(event);
   }
 
   async isBusy(): Promise<boolean> {
-    return this.#processing || this.#inputQueue.length > 0;
+    return this.#activeRun;
   }
 
   async getStatus(): Promise<AgentSessionStatus> {
@@ -198,23 +192,6 @@ export class PiCodingAgentAdapter implements AgentAdapter {
     return { provider, modelId };
   }
 
-  async #drainInputQueue(): Promise<void> {
-    if (this.#processing) {
-      return;
-    }
-
-    this.#processing = true;
-    try {
-      while (this.#client && this.#onOutput && this.#inputQueue.length > 0) {
-        const event = this.#inputQueue.shift();
-        if (!event) continue;
-        await this.#processEvent(event);
-      }
-    } finally {
-      this.#processing = false;
-    }
-  }
-
   async #processEvent(event: AgentInputEvent): Promise<void> {
     if (!this.#client) {
       throw new Error("PiCodingAgentAdapter is not started");
@@ -228,7 +205,16 @@ export class PiCodingAgentAdapter implements AgentAdapter {
           agentSessionId: this.#agentSessionId,
           text: "Processing request",
         });
-        await this.#client.prompt(event.text);
+        // Let Pi atomically decide whether this starts a new run or steers the
+        // current one. This avoids duplicating Pi's message queue in the adapter.
+        const wasActive = this.#activeRun;
+        this.#activeRun = true;
+        try {
+          await this.#client.prompt(event.text, "steer");
+        } catch (error) {
+          this.#activeRun = wasActive;
+          throw error;
+        }
         return;
       }
 
@@ -280,6 +266,18 @@ export class PiCodingAgentAdapter implements AgentAdapter {
 
   async #handleRpcEvent(rpcEvent: { type: string; [key: string]: unknown }): Promise<void> {
     if (!this.#onOutput) {
+      return;
+    }
+
+    if (rpcEvent.type === "agent_start") {
+      this.#activeRun = true;
+      return;
+    }
+
+    if (rpcEvent.type === "agent_settled") {
+      this.#activeRun = false;
+      this.#toolLabelByCallId.clear();
+      this.#toolInputByCallId.clear();
       return;
     }
 

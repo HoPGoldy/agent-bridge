@@ -472,7 +472,7 @@ describe("GatewayCore", () => {
     });
   });
 
-  it("aborts the active agent run when stop is requested", async () => {
+  it("forwards stop to the agent without pre-checking its busy state", async () => {
     const imAdapter = new FakeIMAdapter();
     const createdAdapters: FakeAgentAdapter[] = [];
 
@@ -481,7 +481,6 @@ describe("GatewayCore", () => {
       async createAgentSession() {
         const agentSessionId = `agent-${createdAdapters.length + 1}`;
         const agentAdapter = new FakeAgentAdapter(agentSessionId);
-        agentAdapter.busy = true;
         createdAdapters.push(agentAdapter);
         return { agentSessionId, agentAdapter };
       },
