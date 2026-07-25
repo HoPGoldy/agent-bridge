@@ -92,6 +92,16 @@ export class GatewayCore {
       return;
     }
 
+    if (event.type === "command.session.model.list") {
+      await this.#handleSessionModelList(event.clientSessionId);
+      return;
+    }
+
+    if (event.type === "command.session.model.set") {
+      await this.#handleSessionModelSet(event.clientSessionId, event.target);
+      return;
+    }
+
     await this.#handleUserMessage(event.clientSessionId, event.text);
   }
 
@@ -191,6 +201,96 @@ export class GatewayCore {
         clientSessionId,
         kind: "agent.status.unavailable",
         detail,
+      });
+    }
+  }
+
+  async #handleSessionModelList(clientSessionId: string): Promise<void> {
+    const runtime = await this.#getActiveRuntime(clientSessionId);
+    if (!runtime) {
+      await this.#deliverClientInput({
+        type: "error",
+        clientSessionId,
+        kind: "agent.model.list.unavailable",
+      });
+      return;
+    }
+
+    this.#touchRuntime(runtime);
+
+    if (!runtime.agentAdapter.getAvailableModels) {
+      await this.#deliverClientInput({
+        type: "error",
+        clientSessionId,
+        kind: "agent.model.list.unavailable",
+      });
+      return;
+    }
+
+    try {
+      const models = await runtime.agentAdapter.getAvailableModels();
+      await this.#deliverClientInput({
+        type: "agent.model.list",
+        clientSessionId,
+        models,
+      });
+    } catch (error) {
+      const detail = error instanceof Error ? error.message : String(error);
+      await this.#deliverClientInput({
+        type: "error",
+        clientSessionId,
+        kind: "agent.model.list.unavailable",
+        detail,
+      });
+    }
+  }
+
+  async #handleSessionModelSet(clientSessionId: string, target: string): Promise<void> {
+    const runtime = await this.#getActiveRuntime(clientSessionId);
+    if (!runtime) {
+      await this.#deliverClientInput({
+        type: "error",
+        clientSessionId,
+        kind: "agent.model.set.unavailable",
+      });
+      return;
+    }
+
+    this.#touchRuntime(runtime);
+
+    if (!runtime.agentAdapter.setModel) {
+      await this.#deliverClientInput({
+        type: "error",
+        clientSessionId,
+        kind: "agent.model.set.unavailable",
+      });
+      return;
+    }
+
+    if (await runtime.agentAdapter.isBusy()) {
+      await this.#deliverClientInput({
+        type: "error",
+        clientSessionId,
+        kind: "agent.model.busy",
+      });
+      return;
+    }
+
+    try {
+      const result = await runtime.agentAdapter.setModel(target);
+      await this.#deliverClientInput({
+        type: "agent.model.updated",
+        clientSessionId,
+        provider: result.provider,
+        modelId: result.modelId,
+      });
+    } catch (error) {
+      const { kind, detail } = this.#resolveModelCommandError(error);
+      await this.#deliverClientInput({
+        type: "error",
+        clientSessionId,
+        kind,
+        ...(detail ? { detail } : {}),
       });
     }
   }
@@ -304,6 +404,19 @@ export class GatewayCore {
     } catch (error) {
       this.#logger.error("failed to persist session bindings:", error);
     }
+  }
+
+  #resolveModelCommandError(error: unknown): { kind: string; detail?: string } {
+    const detail = error instanceof Error ? error.message : String(error);
+    if (typeof error === "object" && error && "kind" in error && typeof error.kind === "string") {
+      switch (error.kind) {
+        case "agent.model.invalid":
+        case "agent.model.busy":
+        case "agent.model.set.unavailable":
+          return { kind: error.kind, ...(detail ? { detail } : {}) };
+      }
+    }
+    return { kind: "agent.model.set.unavailable", ...(detail ? { detail } : {}) };
   }
 
   async #handleAgentOutput(event: AgentOutputEvent): Promise<void> {

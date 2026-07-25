@@ -65,6 +65,11 @@ class FakeAgentAdapter implements AgentAdapter {
   busy = false;
   statusResult?: import("../types").AgentSessionStatus;
   statusError?: Error;
+  availableModels: import("../types").AgentAvailableModel[] = [];
+  availableModelsError?: Error;
+  setModelResult?: { provider: string; modelId: string };
+  setModelError?: Error;
+  setModelCalls: string[] = [];
   #onOutput: ((event: AgentOutputEvent) => Promise<void> | void) | null = null;
 
   constructor(readonly agentSessionId: string) {}
@@ -102,6 +107,24 @@ class FakeAgentAdapter implements AgentAdapter {
       throw new Error("status not configured");
     }
     return this.statusResult;
+  }
+
+  async getAvailableModels(): Promise<import("../types").AgentAvailableModel[]> {
+    if (this.availableModelsError) {
+      throw this.availableModelsError;
+    }
+    return this.availableModels;
+  }
+
+  async setModel(target: string): Promise<{ provider: string; modelId: string }> {
+    this.setModelCalls.push(target);
+    if (this.setModelError) {
+      throw this.setModelError;
+    }
+    if (!this.setModelResult) {
+      throw new Error("setModel not configured");
+    }
+    return this.setModelResult;
   }
 
   async emitAssistant(text: string): Promise<void> {
@@ -677,6 +700,252 @@ describe("GatewayCore", () => {
         clientSessionId: "client-1",
         kind: "agent.status.unavailable",
         detail: "RPC timeout",
+      });
+    });
+  });
+
+  it("forwards available model lists back to the client adapter", async () => {
+    const imAdapter = new FakeIMAdapter();
+    const createdAdapters: FakeAgentAdapter[] = [];
+
+    const agentModule: AgentModule<Record<string, never>> = {
+      type: "fake",
+      async createAgentSession() {
+        const agentAdapter = new FakeAgentAdapter("agent-1");
+        agentAdapter.availableModels = [
+          { provider: "anthropic", modelId: "claude-sonnet-4-5", isCurrent: true },
+          { provider: "openai", modelId: "gpt-5", isCurrent: false },
+        ];
+        createdAdapters.push(agentAdapter);
+        return { agentSessionId: "agent-1", agentAdapter };
+      },
+    };
+
+    const core = new GatewayCore({
+      imAdapter,
+      agentModule,
+      agentConfig: {},
+      agentIdleTimeoutMs: 60_000,
+    });
+    running.push(core);
+    await core.start();
+
+    await imAdapter.emit({
+      type: "user.message",
+      clientSessionId: "client-1",
+      text: "hello",
+    });
+
+    await waitFor(() => {
+      expect(createdAdapters).toHaveLength(1);
+    });
+
+    await imAdapter.emit({
+      type: "command.session.model.list",
+      clientSessionId: "client-1",
+    });
+
+    await waitFor(() => {
+      expect(imAdapter.outputs.at(-1)).toEqual({
+        type: "agent.model.list",
+        clientSessionId: "client-1",
+        models: [
+          { provider: "anthropic", modelId: "claude-sonnet-4-5", isCurrent: true },
+          { provider: "openai", modelId: "gpt-5", isCurrent: false },
+        ],
+      });
+    });
+  });
+
+  it("emits a model-list unavailable error when no active agent session exists for /model", async () => {
+    const imAdapter = new FakeIMAdapter();
+
+    const agentModule: AgentModule<Record<string, never>> = {
+      type: "fake",
+      async createAgentSession() {
+        return {
+          agentSessionId: "agent-1",
+          agentAdapter: new FakeAgentAdapter("agent-1"),
+        };
+      },
+    };
+
+    const core = new GatewayCore({
+      imAdapter,
+      agentModule,
+      agentConfig: {},
+      agentIdleTimeoutMs: 60_000,
+    });
+    running.push(core);
+    await core.start();
+
+    await imAdapter.emit({
+      type: "command.session.model.list",
+      clientSessionId: "client-1",
+    });
+
+    await waitFor(() => {
+      expect(imAdapter.outputs.at(-1)).toEqual({
+        type: "error",
+        clientSessionId: "client-1",
+        kind: "agent.model.list.unavailable",
+      });
+    });
+  });
+
+  it("emits a model-updated event when model switching succeeds", async () => {
+    const imAdapter = new FakeIMAdapter();
+    const createdAdapters: FakeAgentAdapter[] = [];
+
+    const agentModule: AgentModule<Record<string, never>> = {
+      type: "fake",
+      async createAgentSession() {
+        const agentAdapter = new FakeAgentAdapter("agent-1");
+        agentAdapter.setModelResult = {
+          provider: "anthropic",
+          modelId: "claude-sonnet-4-5",
+        };
+        createdAdapters.push(agentAdapter);
+        return { agentSessionId: "agent-1", agentAdapter };
+      },
+    };
+
+    const core = new GatewayCore({
+      imAdapter,
+      agentModule,
+      agentConfig: {},
+      agentIdleTimeoutMs: 60_000,
+    });
+    running.push(core);
+    await core.start();
+
+    await imAdapter.emit({
+      type: "user.message",
+      clientSessionId: "client-1",
+      text: "hello",
+    });
+
+    await waitFor(() => {
+      expect(createdAdapters).toHaveLength(1);
+    });
+
+    await imAdapter.emit({
+      type: "command.session.model.set",
+      clientSessionId: "client-1",
+      target: "anthropic/claude-sonnet-4-5",
+    });
+
+    await waitFor(() => {
+      expect(createdAdapters[0]?.setModelCalls).toEqual(["anthropic/claude-sonnet-4-5"]);
+      expect(imAdapter.outputs.at(-1)).toEqual({
+        type: "agent.model.updated",
+        clientSessionId: "client-1",
+        provider: "anthropic",
+        modelId: "claude-sonnet-4-5",
+      });
+    });
+  });
+
+  it("emits a busy error when trying to switch model during an active run", async () => {
+    const imAdapter = new FakeIMAdapter();
+    const createdAdapters: FakeAgentAdapter[] = [];
+
+    const agentModule: AgentModule<Record<string, never>> = {
+      type: "fake",
+      async createAgentSession() {
+        const agentAdapter = new FakeAgentAdapter("agent-1");
+        agentAdapter.busy = true;
+        agentAdapter.setModelResult = {
+          provider: "anthropic",
+          modelId: "claude-sonnet-4-5",
+        };
+        createdAdapters.push(agentAdapter);
+        return { agentSessionId: "agent-1", agentAdapter };
+      },
+    };
+
+    const core = new GatewayCore({
+      imAdapter,
+      agentModule,
+      agentConfig: {},
+      agentIdleTimeoutMs: 60_000,
+    });
+    running.push(core);
+    await core.start();
+
+    await imAdapter.emit({
+      type: "user.message",
+      clientSessionId: "client-1",
+      text: "hello",
+    });
+
+    await waitFor(() => {
+      expect(createdAdapters).toHaveLength(1);
+    });
+
+    await imAdapter.emit({
+      type: "command.session.model.set",
+      clientSessionId: "client-1",
+      target: "anthropic/claude-sonnet-4-5",
+    });
+
+    await waitFor(() => {
+      expect(createdAdapters[0]?.setModelCalls).toEqual([]);
+      expect(imAdapter.outputs.at(-1)).toEqual({
+        type: "error",
+        clientSessionId: "client-1",
+        kind: "agent.model.busy",
+      });
+    });
+  });
+
+  it("emits an invalid-model error with detail when switching model fails validation", async () => {
+    const imAdapter = new FakeIMAdapter();
+    const createdAdapters: FakeAgentAdapter[] = [];
+
+    const agentModule: AgentModule<Record<string, never>> = {
+      type: "fake",
+      async createAgentSession() {
+        const agentAdapter = new FakeAgentAdapter("agent-1");
+        const error = new Error("Model not found: anthropic/unknown");
+        Object.assign(error, { kind: "agent.model.invalid" });
+        agentAdapter.setModelError = error;
+        createdAdapters.push(agentAdapter);
+        return { agentSessionId: "agent-1", agentAdapter };
+      },
+    };
+
+    const core = new GatewayCore({
+      imAdapter,
+      agentModule,
+      agentConfig: {},
+      agentIdleTimeoutMs: 60_000,
+    });
+    running.push(core);
+    await core.start();
+
+    await imAdapter.emit({
+      type: "user.message",
+      clientSessionId: "client-1",
+      text: "hello",
+    });
+
+    await waitFor(() => {
+      expect(createdAdapters).toHaveLength(1);
+    });
+
+    await imAdapter.emit({
+      type: "command.session.model.set",
+      clientSessionId: "client-1",
+      target: "anthropic/unknown",
+    });
+
+    await waitFor(() => {
+      expect(imAdapter.outputs.at(-1)).toEqual({
+        type: "error",
+        clientSessionId: "client-1",
+        kind: "agent.model.invalid",
+        detail: "Model not found: anthropic/unknown",
       });
     });
   });

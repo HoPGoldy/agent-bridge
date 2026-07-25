@@ -1,5 +1,6 @@
 import type {
   AgentAdapter,
+  AgentAvailableModel,
   AgentInputEvent,
   AgentOutputEvent,
   AgentSessionStatus,
@@ -9,6 +10,15 @@ import { createLogger, type Logger } from "../../../../core/logger";
 import { extractMediaMarkers } from "../media-marker";
 import { PiRpcClient } from "./pi-rpc-client";
 import { toPiSessionId } from "./pi-session-id";
+
+class PiModelCommandError extends Error {
+  readonly kind: "agent.model.invalid" | "agent.model.busy" | "agent.model.set.unavailable";
+
+  constructor(kind: "agent.model.invalid" | "agent.model.busy" | "agent.model.set.unavailable", message: string) {
+    super(message);
+    this.kind = kind;
+  }
+}
 
 export class PiCodingAgentAdapter implements AgentAdapter {
   readonly #agentSessionId: string;
@@ -129,6 +139,63 @@ export class PiCodingAgentAdapter implements AgentAdapter {
           }
         : undefined,
     };
+  }
+
+  async getAvailableModels(): Promise<AgentAvailableModel[]> {
+    if (!this.#client) {
+      throw new Error("PiCodingAgentAdapter is not started");
+    }
+
+    const [state, models] = await Promise.all([this.#client.getState(), this.#client.getAvailableModels()]);
+    return models
+      .filter((model): model is { provider: string; id: string } => typeof model.provider === "string" && typeof model.id === "string")
+      .map((model) => ({
+        provider: model.provider,
+        modelId: model.id,
+        isCurrent: state.model?.provider === model.provider && state.model?.id === model.id,
+      }));
+  }
+
+  async setModel(target: string): Promise<{ provider: string; modelId: string }> {
+    if (!this.#client) {
+      throw new PiModelCommandError("agent.model.set.unavailable", "PiCodingAgentAdapter is not started");
+    }
+
+    const parsed = this.#parseModelTarget(target);
+    const state = await this.#client.getState();
+    if (state.isStreaming || state.isCompacting) {
+      throw new PiModelCommandError("agent.model.busy", "Current session is busy, so the model cannot be switched. Please use /stop first.");
+    }
+
+    try {
+      const result = await this.#client.setModel(parsed.provider, parsed.modelId);
+      return {
+        provider: result.provider ?? parsed.provider,
+        modelId: result.id ?? parsed.modelId,
+      };
+    } catch (error) {
+      const message = error instanceof Error ? error.message : String(error);
+      if (/Model not found:/i.test(message)) {
+        throw new PiModelCommandError("agent.model.invalid", message);
+      }
+      throw new PiModelCommandError("agent.model.set.unavailable", message);
+    }
+  }
+
+  #parseModelTarget(target: string): { provider: string; modelId: string } {
+    const trimmed = target.trim();
+    const slashIndex = trimmed.indexOf("/");
+    if (slashIndex <= 0 || slashIndex === trimmed.length - 1) {
+      throw new PiModelCommandError("agent.model.invalid", `Invalid model target: ${target}`);
+    }
+
+    const provider = trimmed.slice(0, slashIndex).trim();
+    const modelId = trimmed.slice(slashIndex + 1).trim();
+    if (!provider || !modelId) {
+      throw new PiModelCommandError("agent.model.invalid", `Invalid model target: ${target}`);
+    }
+
+    return { provider, modelId };
   }
 
   async #drainInputQueue(): Promise<void> {

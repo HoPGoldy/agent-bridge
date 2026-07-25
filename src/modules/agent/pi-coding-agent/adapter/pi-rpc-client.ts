@@ -13,6 +13,8 @@ export type PiRpcCommand =
   | { id?: string; type: "get_last_assistant_text" }
   | { id?: string; type: "get_state" }
   | { id?: string; type: "get_session_stats" }
+  | { id?: string; type: "get_available_models" }
+  | { id?: string; type: "set_model"; provider: string; modelId: string }
   | { id?: string; type: "set_session_name"; name: string };
 
 export type PiRpcResponse = {
@@ -246,6 +248,8 @@ export class PiRpcClient {
     sessionId?: string;
     sessionName?: string;
     thinkingLevel?: string;
+    isStreaming?: boolean;
+    isCompacting?: boolean;
     model?: {
       provider?: string;
       id?: string;
@@ -259,6 +263,8 @@ export class PiRpcClient {
         sessionId?: string;
         sessionName?: string;
         thinkingLevel?: string;
+        isStreaming?: boolean;
+        isCompacting?: boolean;
         model?: {
           provider?: string;
           id?: string;
@@ -286,6 +292,17 @@ export class PiRpcClient {
         };
       } | undefined) ?? {}
     );
+  }
+
+  async getAvailableModels(): Promise<Array<{ provider?: string; id?: string }>> {
+    const response = await this.#send({ type: "get_available_models" });
+    const data = response.data as { models?: Array<{ provider?: string; id?: string }> } | undefined;
+    return data?.models ?? [];
+  }
+
+  async setModel(provider: string, modelId: string): Promise<{ provider?: string; id?: string }> {
+    const response = await this.#send({ type: "set_model", provider, modelId });
+    return (response.data as { provider?: string; id?: string } | undefined) ?? {};
   }
 
   async setSessionName(name: string): Promise<void> {

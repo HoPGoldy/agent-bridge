@@ -67,6 +67,30 @@ describe("parseSlashCommand", () => {
     });
   });
 
+  it("parses /model and /m into a command.session.model.list event", () => {
+    expect(parseSlashCommand("/model", "session-1")).toEqual({
+      type: "command.session.model.list",
+      clientSessionId: "session-1",
+    });
+    expect(parseSlashCommand("/m", "session-1")).toEqual({
+      type: "command.session.model.list",
+      clientSessionId: "session-1",
+    });
+  });
+
+  it("parses /model <target> and /m <target> into a command.session.model.set event", () => {
+    expect(parseSlashCommand("/model anthropic/claude-sonnet-4-5", "session-1")).toEqual({
+      type: "command.session.model.set",
+      clientSessionId: "session-1",
+      target: "anthropic/claude-sonnet-4-5",
+    });
+    expect(parseSlashCommand("/m openai/gpt-5", "session-1")).toEqual({
+      type: "command.session.model.set",
+      clientSessionId: "session-1",
+      target: "openai/gpt-5",
+    });
+  });
+
   it("parses supported commands case-insensitively", () => {
     expect(parseSlashCommand("/New", "session-1")).toEqual({
       type: "command.session.new",
@@ -92,6 +116,15 @@ describe("parseSlashCommand", () => {
       type: "command.session.status",
       clientSessionId: "session-1",
     });
+    expect(parseSlashCommand("/Model", "session-1")).toEqual({
+      type: "command.session.model.list",
+      clientSessionId: "session-1",
+    });
+    expect(parseSlashCommand("/M anthropic/claude-sonnet-4-5", "session-1")).toEqual({
+      type: "command.session.model.set",
+      clientSessionId: "session-1",
+      target: "anthropic/claude-sonnet-4-5",
+    });
   });
 
   it("returns null for regular text", () => {
@@ -104,6 +137,7 @@ describe("parseSlashCommand", () => {
     expect(parseSlashCommand("/new please", "session-1")).toBeNull();
     expect(parseSlashCommand("/compact please", "session-1")).toBeNull();
     expect(parseSlashCommand("/status now", "session-1")).toBeNull();
+    expect(parseSlashCommand("hello /model anthropic/claude-sonnet-4-5", "session-1")).toBeNull();
     expect(parseSlashCommand("-n", "session-1")).toBeNull();
     expect(parseSlashCommand("-c", "session-1")).toBeNull();
   });

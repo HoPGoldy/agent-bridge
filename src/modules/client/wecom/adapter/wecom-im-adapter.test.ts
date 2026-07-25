@@ -246,6 +246,33 @@ describe("WecomIMAdapter", () => {
     });
   });
 
+  it("forwards /m anthropic/claude-sonnet-4-5 to the core as a model-set command event", async () => {
+    const adapter = new WecomIMAdapter(
+      {
+        botId: "bot-id",
+        secret: "secret",
+        requireMentionInGroup: true,
+      },
+      createLogger("test"),
+    );
+    const onOutput = vi.fn(async (_event: ClientOutputEvent) => {});
+
+    await adapter.start(onOutput);
+    await fakeClientState.onMessage?.({
+      chatId: "user_1",
+      chatType: "dm",
+      messageId: "msg-model-set",
+      text: "/m anthropic/claude-sonnet-4-5",
+      mentionedBot: false,
+    });
+
+    expect(onOutput).toHaveBeenCalledWith({
+      type: "command.session.model.set",
+      clientSessionId: "wecom:dm:user_1",
+      target: "anthropic/claude-sonnet-4-5",
+    });
+  });
+
   it("forwards /stop to the core as a command event", async () => {
     const adapter = new WecomIMAdapter(
       {
@@ -419,7 +446,7 @@ describe("WecomIMAdapter", () => {
     expect(fakeClientState.sendText).toHaveBeenCalledTimes(1);
   });
 
-  it("renders structured status errors as a localized text reply", async () => {
+  it("renders structured status and model errors as localized text replies", async () => {
     const adapter = new WecomIMAdapter(
       {
         botId: "bot-id",
@@ -439,6 +466,15 @@ describe("WecomIMAdapter", () => {
     });
 
     expect(fakeClientState.sendText).toHaveBeenCalledWith("user_1", expect.stringContaining("当前无法获取会话状态。"));
+
+    fakeClientState.sendText.mockClear();
+    await adapter.input({
+      type: "error",
+      clientSessionId: "wecom:dm:user_1",
+      kind: "agent.model.busy",
+    });
+
+    expect(fakeClientState.sendText).toHaveBeenCalledWith("user_1", expect.stringContaining("当前正在运行，无法切换模型"));
   });
 
   it("refreshes the same progress stream using the same body text as feishu", async () => {

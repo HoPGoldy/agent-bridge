@@ -243,6 +243,32 @@ describe("WeixinIMAdapter", () => {
     expect(fakeClientState.sendTyping).not.toHaveBeenCalled();
   });
 
+  it("forwards /model to the core as a model-list command event", async () => {
+    const adapter = new WeixinIMAdapter(
+      {
+        accountId: "bot-account",
+        token: "bot-token",
+      },
+      createLogger("test"),
+    );
+    const onOutput = vi.fn(async (_event: ClientOutputEvent) => {});
+
+    await adapter.start(onOutput);
+    await fakeClientState.onMessage?.({
+      chatId: "wxid_user_1",
+      chatType: "dm",
+      messageId: "msg-model-list",
+      text: "/model",
+      mentionedBot: false,
+    });
+
+    expect(onOutput).toHaveBeenCalledWith({
+      type: "command.session.model.list",
+      clientSessionId: "weixin:dm:wxid_user_1",
+    });
+    expect(fakeClientState.sendTyping).not.toHaveBeenCalled();
+  });
+
   it("forwards /stop to the core as a command event", async () => {
     const adapter = new WeixinIMAdapter(
       {
@@ -378,6 +404,29 @@ describe("WeixinIMAdapter", () => {
         modelId: "claude-sonnet-4-5",
         thinkingLevel: "medium",
       },
+    });
+
+    expect(fakeClientState.sendText).toHaveBeenCalledWith(
+      "wxid_user_1",
+      expect.stringContaining("anthropic/claude-sonnet-4-5"),
+    );
+  });
+
+  it("renders model-updated replies as plain text", async () => {
+    const adapter = new WeixinIMAdapter(
+      {
+        accountId: "bot-account",
+        token: "bot-token",
+      },
+      createLogger("test"),
+    );
+
+    await adapter.start(async () => {});
+    await adapter.input({
+      type: "agent.model.updated",
+      clientSessionId: "weixin:dm:wxid_user_1",
+      provider: "anthropic",
+      modelId: "claude-sonnet-4-5",
     });
 
     expect(fakeClientState.sendText).toHaveBeenCalledWith(

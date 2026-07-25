@@ -20,13 +20,36 @@ export function resolveHelpMarkdown(text: string, t: Translator): string | null 
   return isHelpCommand(text) ? t("client.helpMessage") : null;
 }
 
+function parseModelCommand(text: string, clientSessionId: string): ClientOutputEvent | null {
+  const match = text.match(/^\/(model|m)(?:\s+(.*))?$/i);
+  if (!match) {
+    return null;
+  }
+
+  const target = match[2]?.trim();
+  if (!target) {
+    return { type: "command.session.model.list", clientSessionId };
+  }
+
+  return {
+    type: "command.session.model.set",
+    clientSessionId,
+    target,
+  };
+}
+
 /**
  * Parses a trimmed inbound text as one of the standard agent-bridge slash
- * commands (`/new`, `/n`, `/compact`, `/c`, `/stop`, `/s`, `/status`, `/st`) and returns the
+ * commands (`/new`, `/n`, `/compact`, `/c`, `/stop`, `/s`, `/status`, `/st`, `/model`, `/m`) and returns the
  * corresponding `ClientOutputEvent`, or `null` if `text` is not a recognized
  * command and should be treated as a regular user message.
  */
 export function parseSlashCommand(text: string, clientSessionId: string): ClientOutputEvent | null {
+  const modelCommand = parseModelCommand(text, clientSessionId);
+  if (modelCommand) {
+    return modelCommand;
+  }
+
   switch (text.toLowerCase()) {
     case "/new":
     case "/n":

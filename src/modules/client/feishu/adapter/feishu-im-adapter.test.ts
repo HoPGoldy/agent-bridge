@@ -203,6 +203,33 @@ describe("FeishuIMAdapter", () => {
     expect(fakeClientState.startTyping).not.toHaveBeenCalled();
   });
 
+  it("forwards /model to the core as a model-list command event", async () => {
+    const adapter = new FeishuIMAdapter(
+      {
+        appId: "cli_xxx",
+        appSecret: "secret",
+        requireMentionInGroup: true,
+      },
+      createLogger("test"),
+    );
+    const onOutput = vi.fn(async (_event: ClientOutputEvent) => {});
+
+    await adapter.start(onOutput);
+    await fakeClientState.onMessage?.({
+      chatId: "oc_dm",
+      chatType: "p2p",
+      messageId: "msg-model-list",
+      text: "/model",
+      mentionedBot: false,
+    });
+
+    expect(onOutput).toHaveBeenCalledWith({
+      type: "command.session.model.list",
+      clientSessionId: "feishu:dm:oc_dm",
+    });
+    expect(fakeClientState.startTyping).not.toHaveBeenCalled();
+  });
+
   it("forwards /stop to the core as a command event", async () => {
     const adapter = new FeishuIMAdapter(
       {
@@ -387,6 +414,30 @@ describe("FeishuIMAdapter", () => {
     });
 
     expect(fakeClientState.sendText).toHaveBeenCalledWith("oc_dm", expect.stringContaining("Current session status"));
+  });
+
+  it("renders structured model lists as a localized text reply", async () => {
+    const adapter = new FeishuIMAdapter(
+      {
+        appId: "cli_xxx",
+        appSecret: "secret",
+        requireMentionInGroup: true,
+      },
+      createLogger("test"),
+    );
+
+    await adapter.start(async () => {});
+    await adapter.input({
+      type: "agent.model.list",
+      clientSessionId: "feishu:dm:oc_dm",
+      models: [
+        { provider: "anthropic", modelId: "claude-sonnet-4-5", isCurrent: true },
+        { provider: "openai", modelId: "gpt-5", isCurrent: false },
+      ],
+    });
+
+    expect(fakeClientState.sendText).toHaveBeenCalledWith("oc_dm", expect.stringContaining("Available models"));
+    expect(fakeClientState.sendText).toHaveBeenCalledWith("oc_dm", expect.stringContaining("anthropic/claude-sonnet-4-5"));
   });
 
   it("renders progress cards with friendly labels and skips thinking events", async () => {

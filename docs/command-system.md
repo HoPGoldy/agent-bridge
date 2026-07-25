@@ -20,6 +20,9 @@ All client adapters use the same command parser, so the command behavior is cons
 | `/s` | Alias of `/stop` | `command.session.stop` |
 | `/status` | Query the current agent session runtime status | `command.session.status` |
 | `/st` | Alias of `/status` | `command.session.status` |
+| `/model` | List available models for the current active agent session | `command.session.model.list` |
+| `/m` | Alias of `/model` | `command.session.model.list` or `command.session.model.set` |
+| `/model provider/modelId` | Switch the current active agent session model | `command.session.model.set` |
 | `/help` | Show the built-in command help for the current client locale | Local client-side help response |
 | `/h` | Alias of `/help` | Local client-side help response |
 
@@ -28,8 +31,9 @@ All client adapters use the same command parser, so the command behavior is cons
 The parser is deliberately strict and predictable:
 
 1. The inbound message text is trimmed.
-2. The whole message must match a supported command exactly.
-3. Matching is case-insensitive.
+2. Zero-argument commands must match a supported command exactly.
+3. `/model` and `/m` additionally support a single argument tail, interpreted as the target model string.
+4. Matching is case-insensitive.
 
 That means these are valid:
 
@@ -41,12 +45,18 @@ That means these are valid:
 - `/s`
 - `/status`
 - `/st`
+- `/model`
+- `/m`
+- `/model anthropic/claude-sonnet-4-5`
+- `/m openai/gpt-5`
 - `/New`
 - `/Compact`
 - `/C`
 - `/S`
 - `/Status`
 - `/ST`
+- `/Model`
+- `/M anthropic/claude-sonnet-4-5`
 - `/help`
 - `/h`
 - `/HELP`
@@ -59,6 +69,7 @@ And these are **not** treated as commands:
 - `/status now`
 - `/help me`
 - `hello /n`
+- `hello /model anthropic/claude-sonnet-4-5`
 - `-n`
 - `-c`
 
@@ -119,6 +130,29 @@ Architecturally, this is a session/runtime command, not a normal user message:
 
 If there is no active agent session, or the current agent adapter cannot provide runtime status, the bridge returns a structured unavailable/error event and the client adapter renders it for the user.
 
+### `/model`
+
+`/model` and `/m` have two related behaviors:
+
+- `/model` or `/m`
+  - query the available models for the current active agent session
+- `/model provider/modelId` or `/m provider/modelId`
+  - switch the current active agent session model
+
+Architecturally, both are session/runtime commands:
+
+- client adapters parse them into `command.session.model.list` or `command.session.model.set`
+- `GatewayCore` routes the request to the active agent runtime
+- the agent adapter either returns a structured model list or performs the model switch
+- the client adapter renders the structured result into localized markdown/text for the IM platform
+
+Current runtime behavior:
+
+- model listing requires an active agent session
+- model switching requires an active agent session
+- model switching is rejected while the current agent runtime is busy
+- v1 switching expects the target format `provider/modelId`
+
 ### `/help`
 
 `/help` and `/h` are handled locally by the client adapter and return a built-in help message in the configured channel language.
@@ -129,6 +163,7 @@ This help text currently lists:
 - `/compact` (`/c`)
 - `/stop` (`/s`)
 - `/status` (`/st`)
+- `/model` (`/m`)
 - `/help` (`/h`)
 
 Because this is local client-side help, it does **not** create an agent session, does **not** send anything to `GatewayCore`, and does **not** invoke the agent.
@@ -146,4 +181,4 @@ The intended design is:
 - `GatewayCore` routes those commands to the correct agent session or emits a structured unavailable/error result
 - client adapters render user-facing status/help output locally
 
-This keeps command semantics identical across all supported IM platforms while still allowing `/help` to remain a local UI-facing response and `/status` to remain a structured runtime query.
+This keeps command semantics identical across all supported IM platforms while still allowing `/help` to remain a local UI-facing response, `/status` to remain a structured runtime query, and `/model` to remain a structured runtime list/switch command.

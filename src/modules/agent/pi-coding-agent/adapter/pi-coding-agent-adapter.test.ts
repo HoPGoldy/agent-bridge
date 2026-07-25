@@ -10,11 +10,16 @@ let mockedState: {
   sessionName?: string;
   model?: { provider?: string; id?: string };
   thinkingLevel?: string;
+  isStreaming?: boolean;
+  isCompacting?: boolean;
 } = { sessionId: "agent-1", sessionName: "agent-1" };
 
 let mockedSessionStats: {
   contextUsage?: { tokens?: number | null; contextWindow?: number | null; percent?: number | null };
 } = {};
+
+let mockedAvailableModels: Array<{ provider: string; id: string }> = [];
+let setModelCalls: Array<{ provider: string; modelId: string }> = [];
 
 vi.mock("./pi-rpc-client", () => {
   return {
@@ -50,6 +55,8 @@ vi.mock("./pi-rpc-client", () => {
         sessionName?: string;
         model?: { provider?: string; id?: string };
         thinkingLevel?: string;
+        isStreaming?: boolean;
+        isCompacting?: boolean;
       }> {
         return mockedState;
       }
@@ -58,6 +65,15 @@ vi.mock("./pi-rpc-client", () => {
         contextUsage?: { tokens?: number | null; contextWindow?: number | null; percent?: number | null };
       }> {
         return mockedSessionStats;
+      }
+
+      async getAvailableModels(): Promise<Array<{ provider: string; id: string }>> {
+        return mockedAvailableModels;
+      }
+
+      async setModel(provider: string, modelId: string): Promise<{ provider: string; id: string }> {
+        setModelCalls.push({ provider, modelId });
+        return { provider, id: modelId };
       }
 
       async setSessionName(): Promise<void> {}
@@ -71,6 +87,8 @@ afterEach(() => {
   rpcClients.length = 0;
   mockedState = { sessionId: "agent-1", sessionName: "agent-1" };
   mockedSessionStats = {};
+  mockedAvailableModels = [];
+  setModelCalls = [];
 });
 
 describe("PiCodingAgentAdapter", () => {
@@ -215,6 +233,66 @@ describe("PiCodingAgentAdapter", () => {
         percent: 30,
       },
     });
+  });
+
+  it("returns available models with the current model flagged", async () => {
+    mockedState = {
+      sessionId: "pi-session-1",
+      sessionName: "agent-1",
+      model: {
+        provider: "anthropic",
+        id: "claude-sonnet-4-5",
+      },
+    };
+    mockedAvailableModels = [
+      { provider: "anthropic", id: "claude-sonnet-4-5" },
+      { provider: "openai", id: "gpt-5" },
+    ];
+
+    const adapter = new PiCodingAgentAdapter({ agentSessionId: "agent-1" });
+
+    await adapter.start(() => {});
+    const models = await adapter.getAvailableModels?.();
+
+    expect(models).toEqual([
+      { provider: "anthropic", modelId: "claude-sonnet-4-5", isCurrent: true },
+      { provider: "openai", modelId: "gpt-5", isCurrent: false },
+    ]);
+  });
+
+  it("sets the current model when the agent is idle", async () => {
+    mockedState = {
+      sessionId: "pi-session-1",
+      sessionName: "agent-1",
+      isStreaming: false,
+      isCompacting: false,
+    };
+
+    const adapter = new PiCodingAgentAdapter({ agentSessionId: "agent-1" });
+
+    await adapter.start(() => {});
+    const result = await adapter.setModel?.("anthropic/claude-sonnet-4-5");
+
+    expect(setModelCalls).toEqual([{ provider: "anthropic", modelId: "claude-sonnet-4-5" }]);
+    expect(result).toEqual({ provider: "anthropic", modelId: "claude-sonnet-4-5" });
+  });
+
+  it("rejects model switching while the agent is running", async () => {
+    mockedState = {
+      sessionId: "pi-session-1",
+      sessionName: "agent-1",
+      isStreaming: true,
+      isCompacting: false,
+    };
+
+    const adapter = new PiCodingAgentAdapter({ agentSessionId: "agent-1" });
+
+    await adapter.start(() => {});
+
+    await expect(adapter.setModel?.("anthropic/claude-sonnet-4-5")).rejects.toMatchObject({
+      kind: "agent.model.busy",
+    });
+    expect(setModelCalls).toEqual([]);
   });
 
   it("forwards assistant text from Pi message_end text blocks", async () => {

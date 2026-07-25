@@ -1,5 +1,5 @@
 import type { Translator } from "../../../i18n";
-import type { AgentSessionStatus, ClientInputEvent } from "../../../types";
+import type { AgentAvailableModel, AgentSessionStatus, ClientInputEvent } from "../../../types";
 
 function formatModel(status: AgentSessionStatus, t: Translator): string {
   if (status.provider && status.modelId) {
@@ -28,7 +28,30 @@ function formatContext(status: AgentSessionStatus, t: Translator): string {
   return `\`${tokens.toLocaleString()} / ${contextWindow.toLocaleString()} (${percent}%)\``;
 }
 
+function formatAvailableModel(model: AgentAvailableModel, t: Translator): string {
+  const label = `\`${model.provider}/${model.modelId}\``;
+  return model.isCurrent ? `- ${label} ✅ ${t("client.modelListCurrent")}` : `- ${label}`;
+}
+
+function formatErrorMarkdown(title: string, detail?: string): string {
+  return [`**${title}**`, ...(detail ? ["", detail] : [])].join("\n");
+}
+
 export function renderStatusMarkdown(event: ClientInputEvent, t: Translator): string | null {
+  if (event.type === "agent.model.list") {
+    return [
+      `**${t("client.modelListTitle")}**`,
+      "",
+      ...(event.models.length > 0 ? event.models.map((model) => formatAvailableModel(model, t)) : [`- ${t("client.statusUnavailableValue")}`]),
+      "",
+      t("client.modelListUsage"),
+    ].join("\n");
+  }
+
+  if (event.type === "agent.model.updated") {
+    return t("client.modelUpdated", { model: `${event.provider}/${event.modelId}` });
+  }
+
   if (event.type === "agent.status.info") {
     return [
       `**${t("client.statusTitle")}**`,
@@ -40,8 +63,21 @@ export function renderStatusMarkdown(event: ClientInputEvent, t: Translator): st
     ].join("\n");
   }
 
-  if (event.type === "error" && event.kind === "agent.status.unavailable") {
-    return [`**${t("client.statusUnavailable")}**`, ...(event.detail ? ["", event.detail] : [])].join("\n");
+  if (event.type === "error") {
+    switch (event.kind) {
+      case "agent.status.unavailable":
+        return formatErrorMarkdown(t("client.statusUnavailable"), event.detail);
+      case "agent.model.list.unavailable":
+        return formatErrorMarkdown(t("client.modelListUnavailable"), event.detail);
+      case "agent.model.set.unavailable":
+        return formatErrorMarkdown(t("client.modelSetUnavailable"), event.detail);
+      case "agent.model.invalid":
+        return formatErrorMarkdown(t("client.modelInvalid"), event.detail);
+      case "agent.model.busy":
+        return event.detail ?? t("client.modelBusy");
+      default:
+        return null;
+    }
   }
 
   return null;

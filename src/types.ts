@@ -19,6 +19,15 @@ export type ClientOutputEvent =
   | {
       type: "command.session.status";
       clientSessionId: string;
+    }
+  | {
+      type: "command.session.model.list";
+      clientSessionId: string;
+    }
+  | {
+      type: "command.session.model.set";
+      clientSessionId: string;
+      target: string;
     };
 
 export type AgentInputEvent =
@@ -49,6 +58,12 @@ export interface AgentSessionStatus {
   };
 }
 
+export interface AgentAvailableModel {
+  provider: string;
+  modelId: string;
+  isCurrent: boolean;
+}
+
 type ToolProgressPayload = {
   toolName: string;
   toolCallId?: string;
@@ -70,6 +85,15 @@ type AgentOutputPayload =
   | {
       type: "agent.status.info";
       status: AgentSessionStatus;
+    }
+  | {
+      type: "agent.model.list";
+      models: AgentAvailableModel[];
+    }
+  | {
+      type: "agent.model.updated";
+      provider: string;
+      modelId: string;
     }
   | {
       type: "error";
@@ -118,6 +142,8 @@ export interface AgentAdapter {
   stop(): Promise<void>;
   abort?(): Promise<void>;
   getStatus?(): Promise<AgentSessionStatus>;
+  getAvailableModels?(): Promise<AgentAvailableModel[]>;
+  setModel?(target: string): Promise<{ provider: string; modelId: string }>;
   input(event: AgentInputEvent): Promise<void>;
   isBusy(): Promise<boolean>;
 }
