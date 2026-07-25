@@ -7,6 +7,7 @@ import type {
 } from "../../../../types";
 import { formatSendFailureNotice, getTranslatorForCommon, type Translator } from "../../../../i18n";
 import { createLogger, type Logger } from "../../../../core/logger";
+import { isTerminalAgentError } from "../../utils/error-events";
 import { ProgressRenderer } from "../../utils/progress-renderer";
 import { parseSlashCommand, resolveHelpMarkdown } from "../../utils/slash-commands";
 import { renderStatusMarkdown } from "../../utils/status-markdown";
@@ -192,8 +193,10 @@ export class WecomIMAdapter implements IMAdapter {
           if (event.type !== "assistant.message") {
             const statusMarkdown = renderStatusMarkdown(event, this.#t);
             if (statusMarkdown) {
-              const replyToMessageId = this.#lastInboundMessageIdBySession.get(event.clientSessionId);
-              await this.#finishProgressMessage(target.chatId, event.clientSessionId, replyToMessageId);
+const replyToMessageId = this.#lastInboundMessageIdBySession.get(event.clientSessionId);
+              if (isTerminalAgentError(event)) {
+                await this.#finishProgressMessage(target.chatId, event.clientSessionId, replyToMessageId);
+              }
               await this.#client.sendText(target.chatId, statusMarkdown, replyToMessageId);
               continue;
             }

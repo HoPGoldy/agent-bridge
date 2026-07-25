@@ -437,6 +437,85 @@ describe("WeixinIMAdapter", () => {
     );
   });
 
+  it("stops typing and progress timers for terminal agent errors", async () => {
+    vi.useFakeTimers();
+
+    const adapter = new WeixinIMAdapter(
+      {
+        accountId: "bot-account",
+        token: "bot-token",
+      },
+      createLogger("test"),
+    );
+
+    await adapter.start(async () => {});
+    await fakeClientState.onMessage?.({
+      chatId: "wxid_user_1",
+      chatType: "dm",
+      messageId: "msg-run-error",
+      text: "do work",
+      mentionedBot: false,
+    });
+    await adapter.input({
+      type: "assistant.tool.running",
+      clientSessionId: "weixin:dm:wxid_user_1",
+      agentSessionId: "agent-1",
+      toolName: "bash",
+    });
+    fakeClientState.sendText.mockClear();
+    fakeClientState.stopTyping.mockClear();
+
+    await adapter.input({
+      type: "error",
+      clientSessionId: "weixin:dm:wxid_user_1",
+      kind: "agent.run.failed",
+      detail: "Provider connection failed",
+    });
+
+    expect(fakeClientState.sendText).toHaveBeenCalledWith(
+      "wxid_user_1",
+      expect.stringContaining("Provider connection failed"),
+    );
+    expect(fakeClientState.stopTyping).toHaveBeenCalledWith("wxid_user_1");
+
+    await vi.advanceTimersByTimeAsync(60_000);
+    expect(fakeClientState.sendText).toHaveBeenCalledTimes(1);
+    await vi.advanceTimersByTimeAsync(20_000);
+    expect(fakeClientState.sendTyping).toHaveBeenCalledTimes(1);
+  });
+
+  it("does not stop typing for non-terminal command errors", async () => {
+    vi.useFakeTimers();
+
+    const adapter = new WeixinIMAdapter(
+      {
+        accountId: "bot-account",
+        token: "bot-token",
+      },
+      createLogger("test"),
+    );
+
+    await adapter.start(async () => {});
+    await fakeClientState.onMessage?.({
+      chatId: "wxid_user_1",
+      chatType: "dm",
+      messageId: "msg-model-error",
+      text: "do work",
+      mentionedBot: false,
+    });
+    fakeClientState.stopTyping.mockClear();
+
+    await adapter.input({
+      type: "error",
+      clientSessionId: "weixin:dm:wxid_user_1",
+      kind: "agent.model.busy",
+    });
+
+    expect(fakeClientState.stopTyping).not.toHaveBeenCalled();
+    await vi.advanceTimersByTimeAsync(10_000);
+    expect(fakeClientState.sendTyping).toHaveBeenCalledTimes(2);
+  });
+
   it("renders model-updated replies as plain text", async () => {
     const adapter = new WeixinIMAdapter(
       {

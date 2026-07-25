@@ -37,6 +37,7 @@ const resources = {
         modelInvalid: "The requested model is invalid or unavailable.",
         modelBusy: "Current session is busy, so the model cannot be switched. Please use `/stop` first.",
         modelUpdated: "Switched current model to `{{model}}`.",
+        agentRunFailed: "The agent run failed.",
       },
       gateway: {
         noActiveSessionToCompact: "No active agent session to compact.",
@@ -80,6 +81,7 @@ const resources = {
         modelInvalid: "请求的模型无效或当前不可用。",
         modelBusy: "当前正在运行，无法切换模型。请先使用 `/stop`。",
         modelUpdated: "当前模型已切换至 `{{model}}`。",
+        agentRunFailed: "智能体任务执行失败。"
       },
       gateway: {
         noActiveSessionToCompact: "当前没有可压缩的智能体会话。",

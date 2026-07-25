@@ -264,6 +264,15 @@ export class PiCodingAgentAdapter implements AgentAdapter {
     await this.#onOutput(event);
   }
 
+  async #emitRunFailed(detail: string): Promise<void> {
+    await this.#emitProgress({
+      type: "error",
+      agentSessionId: this.#agentSessionId,
+      kind: "agent.run.failed",
+      detail,
+    });
+  }
+
   async #handleRpcEvent(rpcEvent: { type: string; [key: string]: unknown }): Promise<void> {
     if (!this.#onOutput) {
       return;
@@ -288,6 +297,22 @@ export class PiCodingAgentAdapter implements AgentAdapter {
           contentType: Array.isArray(message.content) ? "array" : typeof message.content,
           contentPreview: this.#summarizeContentShape(message.content),
         });
+
+        if (message.stopReason === "error") {
+          const detail =
+            typeof message.errorMessage === "string" && message.errorMessage.trim().length > 0
+              ? message.errorMessage.trim()
+              : "The agent run failed without additional error details.";
+          this.#logger.error(`agent run failed (session=${this.#agentSessionId})`, {
+            errorMessage: detail,
+            responseId: typeof message.responseId === "string" ? message.responseId : undefined,
+            provider: typeof message.provider === "string" ? message.provider : undefined,
+            model: typeof message.model === "string" ? message.model : undefined,
+          });
+          await this.#emitRunFailed(detail);
+          return;
+        }
+
         const rawText = this.#extractMessageText(message.content);
         const { text, attachments } = extractMediaMarkers(rawText);
         this.#logger.debug(
@@ -438,7 +463,15 @@ export class PiCodingAgentAdapter implements AgentAdapter {
     return value.length > maxLength ? `${value.slice(0, maxLength - 1)}…` : value;
   }
 
-  #isAssistantMessage(value: unknown): value is { role?: unknown; content?: unknown } {
+  #isAssistantMessage(value: unknown): value is {
+    role: "assistant";
+    content?: unknown;
+    stopReason?: unknown;
+    errorMessage?: unknown;
+    responseId?: unknown;
+    provider?: unknown;
+    model?: unknown;
+  } {
     if (!value || typeof value !== "object") {
       return false;
     }

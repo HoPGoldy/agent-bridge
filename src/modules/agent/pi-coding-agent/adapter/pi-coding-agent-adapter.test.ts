@@ -360,6 +360,62 @@ describe("PiCodingAgentAdapter", () => {
     ]);
   });
 
+  it("forwards failed assistant turns as agent.run.failed errors", async () => {
+    const adapter = new PiCodingAgentAdapter({ agentSessionId: "agent-1" });
+    const outputs: AgentOutputEvent[] = [];
+
+    await adapter.start((event) => {
+      outputs.push(event);
+    });
+
+    rpcClients[0]?.emit({
+      type: "message_end",
+      message: {
+        role: "assistant",
+        content: [],
+        stopReason: "error",
+        errorMessage: "Unknown error (no error details in response)",
+        responseId: "resp-123",
+        provider: "azure-openai-responses",
+        model: "gpt-5.6-sol",
+      },
+    });
+
+    await vi.waitFor(() => {
+      expect(outputs).toEqual([
+        {
+          type: "error",
+          agentSessionId: "agent-1",
+          kind: "agent.run.failed",
+          detail: "Unknown error (no error details in response)",
+        },
+      ]);
+    });
+  });
+
+  it("uses fallback detail when a failed assistant turn has no error message", async () => {
+    const adapter = new PiCodingAgentAdapter({ agentSessionId: "agent-1" });
+    const outputs: AgentOutputEvent[] = [];
+
+    await adapter.start((event) => {
+      outputs.push(event);
+    });
+
+    rpcClients[0]?.emit({
+      type: "message_end",
+      message: { role: "assistant", content: [], stopReason: "error" },
+    });
+
+    await vi.waitFor(() => {
+      expect(outputs[0]).toEqual({
+        type: "error",
+        agentSessionId: "agent-1",
+        kind: "agent.run.failed",
+        detail: "The agent run failed without additional error details.",
+      });
+    });
+  });
+
   it("ignores assistant message_end without visible text or attachments", async () => {
     const adapter = new PiCodingAgentAdapter({ agentSessionId: "agent-1" });
     const outputs: AgentOutputEvent[] = [];
@@ -377,6 +433,10 @@ describe("PiCodingAgentAdapter", () => {
           { type: "toolCall", id: "call-1", name: "Read", arguments: {} },
         ],
       },
+    });
+    rpcClients[0]?.emit({
+      type: "message_end",
+      message: { role: "assistant", content: [], stopReason: "aborted" },
     });
 
     expect(outputs).toEqual([]);

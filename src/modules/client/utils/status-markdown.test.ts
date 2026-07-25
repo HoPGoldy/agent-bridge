@@ -99,6 +99,29 @@ describe("renderStatusMarkdown", () => {
     expect(modelMarkdown).toBe("当前正在运行，无法切换模型。请先使用 `/stop`。");
   });
 
+  it("renders agent run failures with localized detail", () => {
+    const english = renderStatusMarkdown(
+      {
+        type: "error",
+        clientSessionId: "client-1",
+        kind: "agent.run.failed",
+        detail: "Provider connection failed",
+      },
+      getTranslator("en-US"),
+    );
+    const chinese = renderStatusMarkdown(
+      {
+        type: "error",
+        clientSessionId: "client-1",
+        kind: "agent.run.failed",
+      },
+      getTranslator("zh-CN"),
+    );
+
+    expect(english).toBe(["**The agent run failed.**", "", "Provider connection failed"].join("\n"));
+    expect(chinese).toBe("**智能体任务执行失败。**");
+  });
+
   it("returns null for unrelated client input events", () => {
     const markdown = renderStatusMarkdown(
       {

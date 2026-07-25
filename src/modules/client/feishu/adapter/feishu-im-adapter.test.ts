@@ -415,6 +415,62 @@ describe("FeishuIMAdapter", () => {
     expect(fakeClientState.sendText.mock.calls[1]?.[1]).toContain("field validation failed");
   });
 
+  it("renders terminal agent errors and stops typing", async () => {
+    const adapter = new FeishuIMAdapter(
+      {
+        appId: "cli_xxx",
+        appSecret: "secret",
+        requireMentionInGroup: true,
+      },
+      createLogger("test"),
+    );
+
+    await adapter.start(async () => {});
+    await fakeClientState.onMessage?.({
+      chatId: "oc_dm",
+      chatType: "p2p",
+      messageId: "msg-run-error",
+      text: "do work",
+      mentionedBot: false,
+    });
+    fakeClientState.stopTyping.mockClear();
+
+    await adapter.input({
+      type: "error",
+      clientSessionId: "feishu:dm:oc_dm",
+      kind: "agent.run.failed",
+      detail: "Provider connection failed",
+    });
+
+    await waitFor(() => fakeClientState.stopTyping.mock.calls.length === 1);
+    expect(fakeClientState.sendText).toHaveBeenCalledWith(
+      "oc_dm",
+      expect.stringContaining("Provider connection failed"),
+    );
+    expect(fakeClientState.stopTyping).toHaveBeenCalledWith("oc_dm");
+  });
+
+  it("does not stop typing for non-terminal command errors", async () => {
+    const adapter = new FeishuIMAdapter(
+      {
+        appId: "cli_xxx",
+        appSecret: "secret",
+        requireMentionInGroup: true,
+      },
+      createLogger("test"),
+    );
+
+    await adapter.start(async () => {});
+    await adapter.input({
+      type: "error",
+      clientSessionId: "feishu:dm:oc_dm",
+      kind: "agent.model.busy",
+    });
+
+    await waitFor(() => fakeClientState.sendText.mock.calls.length === 1);
+    expect(fakeClientState.stopTyping).not.toHaveBeenCalled();
+  });
+
   it("renders structured status info as a localized text reply", async () => {
     const adapter = new FeishuIMAdapter(
       {

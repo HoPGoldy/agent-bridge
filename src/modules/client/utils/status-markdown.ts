@@ -75,6 +75,8 @@ export function renderStatusMarkdown(event: ClientInputEvent, t: Translator): st
         return formatErrorMarkdown(t("client.modelInvalid"), event.detail);
       case "agent.model.busy":
         return event.detail ?? t("client.modelBusy");
+      case "agent.run.failed":
+        return formatErrorMarkdown(t("client.agentRunFailed"), event.detail);
       default:
         return null;
     }

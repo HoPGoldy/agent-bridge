@@ -467,6 +467,76 @@ describe("WecomIMAdapter", () => {
     expect(fakeClientState.sendText).toHaveBeenCalledTimes(1);
   });
 
+  it("finishes progress and renders terminal agent errors", async () => {
+    const adapter = new WecomIMAdapter(
+      {
+        botId: "bot-id",
+        secret: "secret",
+        requireMentionInGroup: true,
+      },
+      createLogger("test"),
+    );
+
+    await adapter.start(async () => {});
+    await fakeClientState.onMessage?.({
+      chatId: "user_1",
+      chatType: "dm",
+      messageId: "msg-run-error",
+      text: "do work",
+      mentionedBot: false,
+    });
+    fakeClientState.sendStreamText.mockClear();
+    fakeClientState.sendText.mockClear();
+
+    await adapter.input({
+      type: "error",
+      clientSessionId: "wecom:dm:user_1",
+      kind: "agent.run.failed",
+      detail: "Provider connection failed",
+    });
+
+    await waitFor(() => fakeClientState.sendText.mock.calls.length === 1);
+    expect(fakeClientState.sendStreamText).toHaveBeenCalledWith("user_1", "Processing...", {
+      replyToMessageId: "msg-run-error",
+      finish: true,
+    });
+    expect(fakeClientState.sendText).toHaveBeenCalledWith(
+      "user_1",
+      expect.stringContaining("Provider connection failed"),
+      "msg-run-error",
+    );
+  });
+
+  it("does not finish progress for non-terminal command errors", async () => {
+    const adapter = new WecomIMAdapter(
+      {
+        botId: "bot-id",
+        secret: "secret",
+        requireMentionInGroup: true,
+      },
+      createLogger("test"),
+    );
+
+    await adapter.start(async () => {});
+    await fakeClientState.onMessage?.({
+      chatId: "user_1",
+      chatType: "dm",
+      messageId: "msg-model-error",
+      text: "do work",
+      mentionedBot: false,
+    });
+    fakeClientState.sendStreamText.mockClear();
+
+    await adapter.input({
+      type: "error",
+      clientSessionId: "wecom:dm:user_1",
+      kind: "agent.model.busy",
+    });
+
+    await waitFor(() => fakeClientState.sendText.mock.calls.length === 1);
+    expect(fakeClientState.sendStreamText).not.toHaveBeenCalled();
+  });
+
   it("renders structured status and model errors as localized text replies", async () => {
     const adapter = new WecomIMAdapter(
       {
