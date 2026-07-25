@@ -2,6 +2,19 @@
 
 All notable changes to this project will be documented in this file. See [commit-and-tag-version](https://github.com/absolute-version/commit-and-tag-version) for commit guidelines.
 
+## [0.4.0](https://github.com/HoPGoldy/agent-bridge/compare/v0.3.4...v0.4.0) (2026-07-25)
+
+
+### Features
+
+* add session model slash commands ([b8d651e](https://github.com/HoPGoldy/agent-bridge/commit/b8d651efb49354ffdd11107dfd83e81f0ed88cf8))
+* add structured session status command ([0f32e9b](https://github.com/HoPGoldy/agent-bridge/commit/0f32e9b81b3f0914f46068298118a4ca2f8da714))
+
+
+### Bug Fixes
+
+* unify IM command response lifecycle ([c885f75](https://github.com/HoPGoldy/agent-bridge/commit/c885f75e00f6fd4a6333b76f741533a3b21b8bbf))
+
 ## [0.3.4](https://github.com/HoPGoldy/agent-bridge/compare/v0.3.3...v0.3.4) (2026-07-24)
 
 
