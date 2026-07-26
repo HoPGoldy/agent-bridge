@@ -32,7 +32,9 @@ function buildAdapter(config: PiCodingAgentConfig, agentSessionId: string): Agen
 function createPiCodingAgentConfigCollector(): ConfigAdapter<PiCodingAgentConfig> {
   return {
     async collect(ctx) {
-      const model = await ctx.input("Pi model (leave empty for pi default)");
+      const model = await ctx.input("Pi model (leave empty for pi default)", {
+        placeholder: "Example: azure-openai-responses/gpt-5.6-terra",
+      });
       return model ? { model } : {};
     },
 

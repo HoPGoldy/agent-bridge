@@ -155,6 +155,7 @@ export interface ConfigSelectOption {
 
 export interface ConfigInputOptions {
   defaultValue?: string;
+  placeholder?: string;
   required?: boolean;
   secret?: boolean;
   validate?: (value: string) => string | null;

@@ -15,7 +15,7 @@ function throwIfCancelled<T>(value: T | symbol): asserts value is T {
 export function createPromptContext(): ConfigCollectContext {
   return {
     async input(label: string, opts: ConfigInputOptions = {}) {
-      const { defaultValue, required = false, secret = false, validate } = opts;
+      const { defaultValue, placeholder, required = false, secret = false, validate } = opts;
 
       const validateInput = (raw: unknown): string | undefined => {
         const value = normalize(raw) || normalize(defaultValue);
@@ -33,7 +33,7 @@ export function createPromptContext(): ConfigCollectContext {
         : await text({
             message: label,
             defaultValue: defaultValue || undefined,
-            placeholder: defaultValue,
+            placeholder: placeholder ?? defaultValue,
             validate: validateInput,
           });
       throwIfCancelled(raw);
