@@ -85,7 +85,7 @@ describe("renderStatusMarkdown", () => {
       getTranslator("zh-CN"),
     );
 
-    expect(statusMarkdown).toBe(["**当前无法获取会话状态。**", "", "RPC timeout"].join("\n"));
+    expect(statusMarkdown).toBe(["**当前无法获取会话状态。**", "RPC timeout"].join("\n"));
 
     const modelMarkdown = renderStatusMarkdown(
       {
@@ -118,7 +118,7 @@ describe("renderStatusMarkdown", () => {
       getTranslator("zh-CN"),
     );
 
-    expect(english).toBe(["**The agent run failed.**", "", "Provider connection failed"].join("\n"));
+    expect(english).toBe(["**The agent run failed.**", "Provider connection failed"].join("\n"));
     expect(chinese).toBe("**智能体任务执行失败。**");
   });
 

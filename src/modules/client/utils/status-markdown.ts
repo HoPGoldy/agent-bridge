@@ -34,7 +34,7 @@ function formatAvailableModel(model: AgentAvailableModel, t: Translator): string
 }
 
 function formatErrorMarkdown(title: string, detail?: string): string {
-  return [`**${title}**`, ...(detail ? ["", detail] : [])].join("\n");
+  return [`**${title}**`, ...(detail ? [detail] : [])].join("\n");
 }
 
 export function renderStatusMarkdown(event: ClientInputEvent, t: Translator): string | null {
