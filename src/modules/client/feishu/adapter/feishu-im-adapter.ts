@@ -7,7 +7,7 @@ import type {
 } from "../../../../types";
 import { formatSendFailureNotice, getTranslatorForCommon, type Translator } from "../../../../i18n";
 import { createLogger, type Logger } from "../../../../core/logger";
-import { isTerminalAgentError } from "../../utils/error-events";
+import { isCompletedCommandResponse, isTerminalAgentError } from "../../utils/error-events";
 import { ProgressRenderer } from "../../utils/progress-renderer";
 import { parseSlashCommand, resolveHelpMarkdown } from "../../utils/slash-commands";
 import { renderStatusMarkdown } from "../../utils/status-markdown";
@@ -198,7 +198,7 @@ export class FeishuIMAdapter implements IMAdapter {
             const statusMarkdown = renderStatusMarkdown(event, this.#t);
             if (statusMarkdown) {
 const replyToMessageId = this.#lastInboundMessageIdBySession.get(event.clientSessionId);
-              if (isTerminalAgentError(event)) {
+              if (isTerminalAgentError(event) || isCompletedCommandResponse(event)) {
                 this.#progressStateBySession.delete(event.clientSessionId);
                 await this.#client.stopTyping(target.chatId);
               }

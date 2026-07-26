@@ -446,6 +446,7 @@ describe("FeishuIMAdapter", () => {
     expect(fakeClientState.sendText).toHaveBeenCalledWith(
       "oc_dm",
       expect.stringContaining("Provider connection failed"),
+      "msg-run-error",
     );
     expect(fakeClientState.stopTyping).toHaveBeenCalledWith("oc_dm");
   });

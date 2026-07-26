@@ -7,7 +7,7 @@ import type {
 } from "../../../../types";
 import { formatSendFailureNotice, getTranslatorForCommon, type Translator } from "../../../../i18n";
 import { createLogger, type Logger } from "../../../../core/logger";
-import { isTerminalAgentError } from "../../utils/error-events";
+import { isCompletedCommandResponse, isTerminalAgentError } from "../../utils/error-events";
 import { ProgressRenderer } from "../../utils/progress-renderer";
 import { parseSlashCommand, resolveHelpMarkdown } from "../../utils/slash-commands";
 import { renderStatusMarkdown } from "../../utils/status-markdown";
@@ -200,15 +200,12 @@ export class WeixinIMAdapter implements IMAdapter {
           if (event.type !== "assistant.message") {
             const statusMarkdown = renderStatusMarkdown(event, this.#t);
             if (statusMarkdown) {
-              if (isTerminalAgentError(event)) {
+              if (isTerminalAgentError(event) || isCompletedCommandResponse(event)) {
                 this.#stopProgressTimer(event.clientSessionId);
                 this.#stopTypingHeartbeat(event.clientSessionId);
                 await this.#client.stopTyping(target.chatId);
               }
               await this.#sendTextWithProtection(target.chatId, statusMarkdown);
-              this.#stopProgressTimer(event.clientSessionId);
-              this.#stopTypingHeartbeat(event.clientSessionId);
-              await this.#client.stopTyping(target.chatId);
               continue;
             }
 
