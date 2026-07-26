@@ -2,6 +2,13 @@
 
 All notable changes to this project will be documented in this file. See [commit-and-tag-version](https://github.com/absolute-version/commit-and-tag-version) for commit guidelines.
 
+## [0.4.2](https://github.com/HoPGoldy/agent-bridge/compare/v0.4.1...v0.4.2) (2026-07-26)
+
+
+### Bug Fixes
+
+* compact error detail markdown ([8dcaac2](https://github.com/HoPGoldy/agent-bridge/commit/8dcaac2a2f9b7338bde2d28aeacdeeb258e5c105))
+
 ## [0.4.1](https://github.com/HoPGoldy/agent-bridge/compare/v0.4.0...v0.4.1) (2026-07-26)
 
 
