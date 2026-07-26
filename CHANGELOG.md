@@ -2,6 +2,20 @@
 
 All notable changes to this project will be documented in this file. See [commit-and-tag-version](https://github.com/absolute-version/commit-and-tag-version) for commit guidelines.
 
+## [0.4.1](https://github.com/HoPGoldy/agent-bridge/compare/v0.4.0...v0.4.1) (2026-07-26)
+
+
+### Features
+
+* clarify Pi model configuration ([1a6a8a4](https://github.com/HoPGoldy/agent-bridge/commit/1a6a8a420927132961f6373d5439574c78e8aece))
+
+
+### Bug Fixes
+
+* preserve command response cleanup with run failures ([d693413](https://github.com/HoPGoldy/agent-bridge/commit/d693413007bc00417e8e7bcd80abf4df39abbb17))
+* steer messages during active agent runs ([7c7535a](https://github.com/HoPGoldy/agent-bridge/commit/7c7535a04f8443818c2d280101b47d81bbd6d775))
+* surface terminal agent run failures ([eed0b07](https://github.com/HoPGoldy/agent-bridge/commit/eed0b0756e87fa205cfb6ef7fa494eb048cb8a6c))
+
 ## [0.4.0](https://github.com/HoPGoldy/agent-bridge/compare/v0.3.4...v0.4.0) (2026-07-25)
 
 
