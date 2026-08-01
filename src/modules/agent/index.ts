@@ -1,7 +1,11 @@
 import type { AgentConfig, AgentModule } from "../../types";
+import { openCodeAgentModule } from "./opencode";
 import { piCodingAgentModule } from "./pi-coding-agent";
 
-const registry = new Map<string, AgentModule<any>>([[piCodingAgentModule.type, piCodingAgentModule]]);
+const registry = new Map<string, AgentModule<any>>([
+  [piCodingAgentModule.type, piCodingAgentModule],
+  [openCodeAgentModule.type, openCodeAgentModule],
+]);
 
 export function listAgentModules(): AgentModule<any>[] {
   return [...registry.values()];

@@ -14,6 +14,9 @@ importers:
       '@larksuiteoapi/node-sdk':
         specifier: ^1.64.0
         version: 1.71.1
+      '@opencode-ai/sdk':
+        specifier: 1.18.10
+        version: 1.18.10
       '@openilink/openilink-sdk-node':
         specifier: ^0.6.0
         version: 0.6.0
@@ -442,6 +445,9 @@ packages:
 
   '@nodable/entities@3.0.0':
     resolution: {integrity: sha512-8L9xFeTYKhm49xfIypoe2W5wV1m/3Z58kT+7kR9A8OyFxcPduI4VmxaUMQyKYrRjUoLLSXv6EKKID5Tvj9cUVw==}
+
+  '@opencode-ai/sdk@1.18.10':
+    resolution: {integrity: sha512-K+glWbBp5pfGepZ/6EHvuXY3IpVG2qgsEqF4z9mOiUQUrs6KWN72Vdp15Qsl2TCDbemgHWXKQKgbX3b8PSK2hg==}
 
   '@openilink/openilink-sdk-node@0.6.0':
     resolution: {integrity: sha512-F4xr+OC1O+D90A2URbQtigHS8dbprnQASo03jqnp8zRx/kutZ6cUqCKqfad49AoH6Mii++N7XCFJC8VuTyRmFg==}
@@ -2309,6 +2315,10 @@ snapshots:
       - utf-8-validate
 
   '@nodable/entities@3.0.0': {}
+
+  '@opencode-ai/sdk@1.18.10':
+    dependencies:
+      cross-spawn: 7.0.6
 
   '@openilink/openilink-sdk-node@0.6.0': {}
 
