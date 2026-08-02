@@ -17,6 +17,8 @@ export type ProgressEvent = Extract<
   | { type: "assistant.tool.error" }
 >;
 
+type ToolProgressEvent = Exclude<ProgressEvent, { type: "session.compacting" }>;
+
 export interface RenderedProgress {
   markdown: string;
   status: string;
@@ -65,9 +67,13 @@ export class ProgressRenderer {
 
   /** Records a progress event, formatting it into a line and collapsing older lines if needed. */
   takeProgressEvent(event: ProgressEvent): void {
-    const toolEntryId = this.#toolEntryId(event);
-    if (toolEntryId) {
-      this.#upsertToolEntry(toolEntryId, event);
+    if (this.#isToolProgressEvent(event)) {
+      const toolEntryId = this.#toolEntryId(event);
+      if (toolEntryId) {
+        this.#upsertToolEntry(toolEntryId, event);
+      } else {
+        this.#appendLineEntry(this.#formatProgressLine(event));
+      }
     } else {
       this.#appendLineEntry(this.#formatProgressLine(event));
     }
@@ -108,7 +114,7 @@ export class ProgressRenderer {
     this.#order.push(id);
   }
 
-  #upsertToolEntry(id: string, event: ProgressEvent): void {
+  #upsertToolEntry(id: string, event: ToolProgressEvent): void {
     if (!this.#entries.has(id)) {
       this.#order.push(id);
     }
@@ -122,16 +128,12 @@ export class ProgressRenderer {
     });
   }
 
-  #toolEntryId(event: ProgressEvent): string | null {
-    if (
-      event.type === "assistant.tool.running" ||
-      event.type === "assistant.tool.update" ||
-      event.type === "assistant.tool.done" ||
-      event.type === "assistant.tool.error"
-    ) {
-      return event.toolCallId ? `tool:${event.toolCallId}` : null;
-    }
-    return null;
+  #isToolProgressEvent(event: ProgressEvent): event is ToolProgressEvent {
+    return event.type !== "session.compacting";
+  }
+
+  #toolEntryId(event: ToolProgressEvent): string | null {
+    return event.toolCallId ? `tool:${event.toolCallId}` : null;
   }
 
   #formatToolEntry(entry: Extract<ProgressEntry, { kind: "tool" }>): string {

@@ -100,7 +100,7 @@ void instance.init({
   fallbackLng: DEFAULT_LOCALE,
   resources,
   interpolation: { escapeValue: false },
-  initImmediate: false,
+  initAsync: false,
 });
 
 export type Translator = TFunction;
