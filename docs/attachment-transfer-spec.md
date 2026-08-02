@@ -114,9 +114,9 @@ type AgentOutputPayload =
 
 `GatewayCore.#handleAgentOutput` must pass `attachments` through for `assistant.message` events (previously it reconstructed the object and dropped every field except `text` — fixed).
 
-## Media Marker Grammar (`src/modules/agent/pi-coding-agent/media-marker.ts`)
+## Media Convention (`src/modules/agent/media-convention.ts`)
 
-Owns the parsing regex and validation only. The system-prompt text describing the convention to the model lives in `media-prompt.ts` instead (its only consumer — `extractMediaMarkers` has no dependency on that prose). The two are not forced into the same file; a coherence test in `media-marker.test.ts` asserts that a marker written the way the prompt describes is actually recognized, which is the invariant that actually matters, not file co-location.
+Owns the shared `MEDIA_CONVENTION_PROMPT`, parsing regex, and validation used by Agent Adapters. Keeping the model-facing instruction and parser in the Agent shared layer lets Pi Coding Agent and OpenCode use the same outbound attachment convention without either Adapter owning the protocol.
 
 - `MEDIA:<path>` may appear anywhere in the text, not only at line start (matches Hermes's proven behavior, not the initially-proposed line-anchored version).
 - Path must look absolute (`~/`, `/`, or a Windows drive letter) — bare relative-looking mentions never match.
@@ -130,7 +130,7 @@ Owns the parsing regex and validation only. The system-prompt text describing th
 - A minimal Pi extension, loaded per-invocation via `--extension <path>` in `PiRpcClient`'s spawn args.
 - Hooks `before_agent_start` only. No tool registration, no IPC, no env vars.
 - Reads `event.systemPrompt` (Pi's fully-assembled prompt — all of Pi's own `APPEND_SYSTEM.md` discovery has already run) and returns `{ systemPrompt: event.systemPrompt + "\n\n" + MEDIA_CONVENTION_PROMPT }`.
-- `MEDIA_CONVENTION_PROMPT` is defined in this file, not imported from `media-marker.ts` — nothing in the regex/validation module depends on this prose, so forcing a cross-module import for it only bought weak protection at the cost of real friction (it also required a `.js`-extension-pointing-at-`.ts` import once `media-prompt.ts` moved under `src/` and became subject to normal `tsc` module resolution). The one real invariant — a marker written the way this text describes must actually be recognized — is guarded by a coherence test in `media-marker.test.ts`, not by file placement.
+- Imports `MEDIA_CONVENTION_PROMPT` from the shared Agent media convention; this extension only adapts the instruction to Pi's hook.
 - Because the hook's result is documented as chained across extensions, this cannot clobber another extension's or the project's own system-prompt contributions — this is why the earlier plan to have agent-bridge manually read `~/.pi/agent/APPEND_SYSTEM.md` before spawning was abandoned; it is unnecessary and inferior to this hook.
 
 ## Feishu Client Changes (`feishu-client.ts` / `feishu-im-adapter.ts`)
@@ -155,7 +155,7 @@ Ported from `pi-feishu/src/feishu-client.ts`, adapted to the existing `LarkClien
 
 ## Validation Requirements
 
-- `media-marker.test.ts`: marker mid-sentence is extracted; marker inside a fenced code block is not extracted; marker pointing at a non-existent path is left in the visible text and produces no attachment; stripping and delivery agree on the same set of matches (no black-hole case).
+- `media-convention.test.ts`: marker mid-sentence is extracted; marker inside a fenced code block is not extracted; marker pointing at a non-existent path is left in the visible text and produces no attachment; stripping and delivery agree on the same set of matches (no black-hole case).
 - `feishu-client` inbound parsing: image/file/audio/video message types resolve to the correct resource type and are downloaded to a local path.
 - `feishu-im-adapter` outbound: an `assistant.message` with `attachments` triggers upload+send after text delivery; a failed upload triggers `#notifySendFailure` instead of throwing.
 - `gateway-core.test.ts`: `attachments` on an `assistant.message` `AgentOutputEvent` survive through to the delivered `ClientInputEvent` unchanged.
@@ -163,7 +163,7 @@ Ported from `pi-feishu/src/feishu-client.ts`, adapted to the existing `LarkClien
 ## Implementation Plan
 
 1. Add `OutboundAttachment` to `src/types.ts`; fix `GatewayCore`'s `assistant.message` pass-through to include `attachments`.
-2. Add `src/core/media-marker.ts` (regex, existence/resolution check, code-block masking, and the co-located `MEDIA_CONVENTION_PROMPT` text).
+2. Add `src/modules/agent/media-convention.ts` (shared prompt, regex, existence/resolution check, and code-block masking).
 3. Add `src/modules/agent/pi-coding-agent/adapter/media-prompt.ts` and wire its path into `PiRpcClient`'s spawn args via `--extension`.
 4. Extend `PiCodingAgentAdapter` to call `extractMediaMarkers` on the final assistant text before emitting `assistant.message`.
 5. Port `downloadResource` / `uploadImage` / `uploadFile` / `sendImage` / `sendFile` / `parseContentWithResources` into agent-bridge's `feishu-client.ts`.

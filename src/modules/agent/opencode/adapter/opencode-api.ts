@@ -26,6 +26,7 @@ export interface OpenCodePromptOptions {
   text: string;
   agent?: string;
   model?: { providerID: string; modelID: string };
+  system?: string;
 }
 
 export interface OpenCodeApi {
@@ -102,6 +103,7 @@ export function createOpenCodeApi(config: OpenCodeAgentConfig): OpenCodeApi {
           sessionID,
           agent: options.agent,
           model: options.model,
+          system: options.system,
           parts: [{ type: "text", text: options.text }],
         },
         { throwOnError: true },

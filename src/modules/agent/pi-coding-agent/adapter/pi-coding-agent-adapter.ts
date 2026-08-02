@@ -7,7 +7,7 @@ import type {
   OutboundAttachment,
 } from "../../../../types";
 import { createLogger, type Logger } from "../../../../core/logger";
-import { extractMediaMarkers } from "../media-marker";
+import { extractMediaMarkers } from "../../media-convention";
 import { PiRpcClient } from "./pi-rpc-client";
 import { toPiSessionId } from "./pi-session-id";
 

@@ -106,12 +106,17 @@ The OpenCode adapter provides:
 - `/model` listing and model selection
 - reasoning and tool progress events
 - final assistant text and local file attachments
+- the shared `MEDIA:<absolute_path>` convention for files created by the agent
 - a shared SSE connection for sessions belonging to the same channel runtime
 - bounded SSE reconnection with status and pending-request recovery
 
 Only models belonging to connected OpenCode providers appear in `/model`. A model selection applies to the next prompt because OpenCode does not expose a separate immediate model-switch operation.
 
 OpenCode's internal compaction summary messages are not forwarded to the IM client; users receive only bridge progress and completion output.
+
+For every user message, the bridge adds the media convention through OpenCode's per-message `system` field. OpenCode combines it with the current agent and project instructions for that turn; it does not accumulate copies from earlier messages or modify `AGENTS.md`.
+
+Local path attachments require the OpenCode Server and `agent-bridge` to use the same filesystem paths. If the server is remote and its path is not available on the bridge host, the marker remains visible and no attachment is claimed as delivered.
 
 ## Lifecycle
 

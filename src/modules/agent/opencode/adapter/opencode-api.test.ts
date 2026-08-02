@@ -50,6 +50,32 @@ describe("OpenCode API client", () => {
     expect(onEvent).toHaveBeenCalledWith(expect.objectContaining({ type: "server.connected" }));
   });
 
+  it("passes per-message system instructions to prompt_async", async () => {
+    let promptRequest: Request | undefined;
+    vi.stubGlobal(
+      "fetch",
+      vi.fn(async (request: Request) => {
+        promptRequest = request;
+        return new Response(null, { status: 204 });
+      }),
+    );
+
+    const api = createOpenCodeApi({
+      baseUrl: "http://127.0.0.1:4096",
+      directory: "/workspace",
+    });
+    await api.promptAsync("ses-1", {
+      text: "create a chart",
+      system: "Return local deliverables with MEDIA markers.",
+    });
+
+    expect(new URL(promptRequest!.url).pathname).toBe("/session/ses-1/prompt_async");
+    expect(await promptRequest!.json()).toMatchObject({
+      system: "Return local deliverables with MEDIA markers.",
+      parts: [{ type: "text", text: "create a chart" }],
+    });
+  });
+
   it("does not send Authorization when no password is configured", async () => {
     const requests: Request[] = [];
     vi.stubGlobal(

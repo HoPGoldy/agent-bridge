@@ -1,6 +1,7 @@
 import { fileURLToPath } from "node:url";
 import type { Event, FilePart, Message, Part, ToolPart } from "@opencode-ai/sdk/v2/types";
 import { createLogger, type Logger } from "../../../../core/logger";
+import { extractMediaMarkers, MEDIA_CONVENTION_PROMPT } from "../../media-convention";
 import type {
   AgentAdapter,
   AgentAvailableModel,
@@ -134,6 +135,7 @@ export class OpenCodeAgentAdapter implements AgentAdapter, OpenCodeRuntimeAdapte
           text: event.text,
           agent: this.#config.agent,
           model: this.#model,
+          system: MEDIA_CONVENTION_PROMPT,
         });
         return;
       }
@@ -398,10 +400,15 @@ export class OpenCodeAgentAdapter implements AgentAdapter, OpenCodeRuntimeAdapte
   async #flushAssistantMessages(): Promise<void> {
     for (const [messageID, buffer] of this.#messages) {
       if (!this.#assistantMessageIds.has(messageID)) continue;
-      const text = [...buffer.parts.values()].join("");
+      const extracted = extractMediaMarkers([...buffer.parts.values()].join(""));
+      for (const attachment of extracted.attachments) {
+        if (!buffer.attachments.has(attachment.filePath)) {
+          buffer.attachments.set(attachment.filePath, attachment);
+        }
+      }
       const attachments = [...buffer.attachments.values()];
-      if (text.trim() || attachments.length > 0) {
-        await this.#emitAssistant(text, attachments.length > 0 ? attachments : undefined);
+      if (extracted.text.trim() || attachments.length > 0) {
+        await this.#emitAssistant(extracted.text, attachments.length > 0 ? attachments : undefined);
       }
     }
     this.#clearTurnState();

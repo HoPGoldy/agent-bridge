@@ -1,8 +1,22 @@
-import { describe, expect, it, vi } from "vitest";
+import { mkdtempSync, realpathSync, rmSync, writeFileSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
+import { afterAll, describe, expect, it, vi } from "vitest";
 import type { Event, Provider, Session } from "@opencode-ai/sdk/v2/types";
+import { MEDIA_CONVENTION_PROMPT } from "../../media-convention";
 import { OpenCodeAgentAdapter } from "./opencode-agent-adapter";
 import type { OpenCodeApi } from "./opencode-api";
 import { OpenCodeRuntime } from "./opencode-runtime";
+
+const mediaDir = realpathSync(mkdtempSync(join(tmpdir(), "opencode-media-test-")));
+const mediaPath = join(mediaDir, "chart.png");
+const mediaFilePath = join(mediaDir, "report.pdf");
+writeFileSync(mediaPath, "fake-png-bytes");
+writeFileSync(mediaFilePath, "fake-pdf-bytes");
+
+afterAll(() => {
+  rmSync(mediaDir, { recursive: true, force: true });
+});
 
 function provider(): Provider {
   return {
@@ -93,11 +107,13 @@ describe("OpenCodeAgentAdapter", () => {
       text: "first",
       agent: "build",
       model: { providerID: "anthropic", modelID: "claude-sonnet" },
+      system: MEDIA_CONVENTION_PROMPT,
     });
     expect(api.promptAsync).toHaveBeenNthCalledWith(2, "ses-1", {
       text: "follow-up",
       agent: "build",
       model: { providerID: "anthropic", modelID: "claude-sonnet" },
+      system: MEDIA_CONVENTION_PROMPT,
     });
     expect(await adapter.isBusy()).toBe(true);
 
@@ -185,6 +201,78 @@ describe("OpenCodeAgentAdapter", () => {
     });
     expect(output).not.toHaveBeenCalledWith(expect.objectContaining({ type: "assistant.message", text: "question" }));
 
+    await adapter.stop();
+  });
+
+  it("turns MEDIA markers into attachments and deduplicates native file parts", async () => {
+    const { adapter } = createAdapter();
+    const output = vi.fn();
+    await adapter.start(output);
+
+    await adapter.handleOpenCodeEvent(
+      event({
+        id: "media-message",
+        type: "message.updated",
+        properties: {
+          sessionID: "ses-1",
+          info: {
+            id: "assistant-media",
+            sessionID: "ses-1",
+            role: "assistant",
+            tokens: { input: 1, output: 1, reasoning: 0, cache: { read: 0, write: 0 } },
+          },
+        },
+      }),
+    );
+    await adapter.handleOpenCodeEvent(
+      event({
+        id: "native-file",
+        type: "message.part.updated",
+        properties: {
+          sessionID: "ses-1",
+          time: 1,
+          part: {
+            id: "file-1",
+            sessionID: "ses-1",
+            messageID: "assistant-media",
+            type: "file",
+            mime: "image/png",
+            filename: "chart.png",
+            url: `file://${mediaPath}`,
+          },
+        },
+      }),
+    );
+    await adapter.handleOpenCodeEvent(
+      event({
+        id: "media-text",
+        type: "message.part.updated",
+        properties: {
+          sessionID: "ses-1",
+          time: 2,
+          part: {
+            id: "text-media",
+            sessionID: "ses-1",
+            messageID: "assistant-media",
+            type: "text",
+            text: `Chart and report attached. MEDIA:${mediaPath} MEDIA:${mediaFilePath}`,
+          },
+        },
+      }),
+    );
+    await adapter.handleOpenCodeEvent(
+      event({ id: "media-idle", type: "session.idle", properties: { sessionID: "ses-1" } }),
+    );
+
+    expect(output).toHaveBeenCalledWith({
+      type: "assistant.message",
+      agentSessionId: "opencode:ses-1",
+      text: "Chart and report attached.",
+      attachments: [
+        { kind: "image", filePath: mediaPath, fileName: "chart.png" },
+        { kind: "file", filePath: mediaFilePath },
+      ],
+    });
     await adapter.stop();
   });
 

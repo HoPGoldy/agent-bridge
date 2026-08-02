@@ -2,8 +2,7 @@ import { describe, expect, it, afterAll } from "vitest";
 import { mkdtempSync, writeFileSync, rmSync, realpathSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { extractMediaMarkers } from "./media-marker";
-import { MEDIA_CONVENTION_PROMPT } from "./adapter/media-prompt";
+import { extractMediaMarkers, MEDIA_CONVENTION_PROMPT } from "./media-convention";
 
 const rawDir = mkdtempSync(join(tmpdir(), "media-marker-test-"));
 const dir = realpathSync(rawDir);
@@ -78,11 +77,8 @@ describe("extractMediaMarkers", () => {
   });
 });
 
-// Coherence test between media-marker.ts (the regex/validation) and
-// media-prompt.ts (the prose describing the convention to the model).
-// These two files have no code-level dependency on each other, so nothing
-// stops them from drifting apart if edited independently — this test is
-// the actual guard against that, not file co-location.
+// Keep the model-facing instruction coherent with the parser that consumes
+// the marker from final assistant text.
 describe("MEDIA_CONVENTION_PROMPT stays consistent with extractMediaMarkers", () => {
   it("documents the exact marker keyword that extractMediaMarkers recognizes", () => {
     expect(MEDIA_CONVENTION_PROMPT).toContain("MEDIA:");

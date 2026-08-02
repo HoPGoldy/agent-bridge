@@ -1,17 +1,13 @@
 import { existsSync, realpathSync } from "node:fs";
 import path from "node:path";
 import os from "node:os";
-import type { OutboundAttachment } from "../../../types";
+import type { OutboundAttachment } from "../../types";
 
 /**
- * `MEDIA:<path>` outbound attachment convention: the regex/validation that
- * recognizes the format lives here. The system-prompt text that *describes*
- * the format to the model lives in `./adapter/media-prompt.ts` (its only
- * consumer) instead of here, since nothing in this file depends on that
- * prose. The one invariant that must never drift — a marker written the way
- * the prompt describes is actually recognized by this module — is guarded
- * by a coherence test in `media-marker.test.ts`, not by file co-location.
+ * Shared convention used by agent adapters that need to turn local files
+ * mentioned in assistant text into outbound attachment events.
  */
+export const MEDIA_CONVENTION_PROMPT = `When you want to send a local image or file to the user in this chat, include a line containing \`MEDIA:<absolute_path>\` in your reply (the path must point to a file that actually exists on disk). You can put it inline in a sentence or on its own line. Do not use this for files the user should not receive (e.g. credentials, temp scratch files unrelated to the request).`;
 
 const IMAGE_EXTS = new Set(["png", "jpg", "jpeg", "webp", "gif", "bmp"]);
 const DELIVERABLE_EXTS = new Set([

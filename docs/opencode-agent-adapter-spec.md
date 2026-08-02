@@ -298,6 +298,9 @@ Prompt 参数包括：
 - 文本 Part
 - 可选 agent
 - 当前选择的 model
+- 共享的 `MEDIA_CONVENTION_PROMPT`，通过当前 User Message 的 `system` 字段注入
+
+OpenCode 只把当前 User Message 的 `system` 合并到本轮模型请求，不把历史消息的该字段重复转换为上下文，因此每条消息都应传入同一约定而不会累积。不得修改用户的 `AGENTS.md`、OpenCode 配置或 Agent Prompt 来实现该注入。
 
 当 session 已 busy 时仍提交 `promptAsync()`，使用 OpenCode follow-up 行为。不得把它描述为真正的 in-flight steer，也不得在 Adapter 中静默丢弃或覆盖消息。
 
@@ -394,7 +397,9 @@ Runtime 只建立一条 SSE 订阅，并按事件中的 `sessionID` 分发到对
 - `message.part.updated` tool error：输出 `assistant.tool.error`
 - File Part：在可解析为本地文件时转换成 `OutboundAttachment`
 
-工具事件以 `callID` 去重。最终文本按 message ID 累积，在对应 session idle 后只发送一次。
+工具事件以 `callID` 去重。最终文本按 message ID 累积，在对应 session idle 后只发送一次。发送前使用共享 `extractMediaMarkers()` 解析文本中的 `MEDIA:<absolute_path>`，移除已成功解析的 marker，并与 File Part、Tool attachments 按本地路径去重后合并。
+
+本地路径附件要求 OpenCode Server 与 `agent-bridge` 运行在同一文件系统，或共享相同路径。远程 Server 返回的路径在 bridge 主机上不可访问时必须保留原始 marker 文本，不得声称附件已发送。
 
 ### SSE 重连
 
