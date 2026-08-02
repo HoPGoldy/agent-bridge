@@ -234,6 +234,15 @@ export interface PiCodingAgentConfig {
   extraArgs?: string[];
 }
 
+export interface OpenCodeAgentConfig {
+  baseUrl: string;
+  username?: string;
+  password?: string;
+  directory?: string;
+  agent?: string;
+  model?: string;
+}
+
 export type ClientConfig =
   | {
       type: "feishu";
@@ -248,10 +257,15 @@ export type ClientConfig =
       config: WeixinClientConfig;
     };
 
-export type AgentConfig = {
-  type: "pi-coding-agent";
-  config: PiCodingAgentConfig;
-};
+export type AgentConfig =
+  | {
+      type: "pi-coding-agent";
+      config: PiCodingAgentConfig;
+    }
+  | {
+      type: "opencode";
+      config: OpenCodeAgentConfig;
+    };
 
 export interface ChannelConfig {
   common: ChannelCommonConfig;

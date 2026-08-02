@@ -25,7 +25,10 @@ Client side:
 
 Agent side:
 
-- `PI Coding Agent`
+| Agent           | New | Stop | Compact | Model switching | Setup guide                        |
+| --------------- | --- | ---- | ------- | --------------- | ---------------------------------- |
+| PI Coding Agent | ✅  | ✅   | ✅      | ✅              | [Guide](./docs/pi-coding-agent.md) |
+| OpenCode        | ✅  | ✅   | ✅      | ✅              | [Guide](./docs/opencode.md)        |
 
 > The current built-in support is intentionally small, but the architecture is designed for straightforward horizontal extension. The project will primarily maintain the integrations used in practice today, and contributions for additional client or agent adapters are welcome through forks and PRs.
 

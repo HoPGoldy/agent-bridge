@@ -41,6 +41,7 @@
   "dependencies": {
     "@clack/prompts": "^1.7.0",
     "@larksuiteoapi/node-sdk": "^1.64.0",
+    "@opencode-ai/sdk": "1.18.10",
     "@openilink/openilink-sdk-node": "^0.6.0",
     "@wecom/aibot-node-sdk": "^1.0.7",
     "commander": "^12.1.0",
