@@ -2,6 +2,14 @@
 
 All notable changes to this project will be documented in this file. See [commit-and-tag-version](https://github.com/absolute-version/commit-and-tag-version) for commit guidelines.
 
+## [0.6.0](https://github.com/HoPGoldy/agent-bridge/compare/v0.4.2...v0.6.0) (2026-08-02)
+
+
+### Features
+
+* add OpenCode agent adapter ([e89f86f](https://github.com/HoPGoldy/agent-bridge/commit/e89f86fc1f34f588158e56edb099047e895821df))
+* add OpenCode agent adapter ([f60dba7](https://github.com/HoPGoldy/agent-bridge/commit/f60dba75b8c20094c9e14a2fd9443568fdca47a3))
+
 ## [0.4.2](https://github.com/HoPGoldy/agent-bridge/compare/v0.4.1...v0.4.2) (2026-07-26)
 
 
