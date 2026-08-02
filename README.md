@@ -25,10 +25,10 @@ Client side:
 
 Agent side:
 
-| Agent             | Session restore | Follow-up while busy | Stop | Compact | Status | Model switching | Tool progress |
-| ----------------- | --------------- | -------------------- | ---- | ------- | ------ | --------------- | ------------- |
-| PI Coding Agent   | ✅              | ✅                   | ✅   | ✅      | ✅     | ✅              | ✅            |
-| OpenCode Server   | ✅              | ✅                   | ✅   | ✅      | ✅     | ✅              | ✅            |
+| Agent           | New | Stop | Compact | Model switching | Setup guide                        |
+| --------------- | --- | ---- | ------- | --------------- | ---------------------------------- |
+| PI Coding Agent | ✅  | ✅   | ✅      | ✅              | [Guide](./docs/pi-coding-agent.md) |
+| OpenCode        | ✅  | ✅   | ✅      | ✅              | [Guide](./docs/opencode.md)        |
 
 > The current built-in support is intentionally small, but the architecture is designed for straightforward horizontal extension. The project will primarily maintain the integrations used in practice today, and contributions for additional client or agent adapters are welcome through forks and PRs.
 
@@ -80,11 +80,6 @@ agent-bridge remove <channel-name>
 ```
 
 Config file: `~/.config/agent-bridge/config.json`
-
-Agent setup guides:
-
-- [PI Coding Agent](./docs/pi-coding-agent.md)
-- [OpenCode](./docs/opencode.md)
 
 Architecture overview: [`docs/architecture-design.md`](./docs/architecture-design.md)
 
