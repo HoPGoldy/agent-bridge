@@ -85,6 +85,28 @@ Architecture overview: [`docs/architecture-design.md`](./docs/architecture-desig
 
 Command usage across IM adapters: [`docs/command-system.md`](./docs/command-system.md)
 
+## Start a session in a specific directory
+
+From any IM chat, `/new <path>` starts the next agent session in that directory instead of the bridge's working directory:
+
+```text
+/new ~/project-learn/demo
+```
+
+A bare `/new` keeps the default working directory. Path semantics differ per agent backend (PI resolves paths locally; OpenCode forwards them to its server) — see [`docs/command-system.md`](./docs/command-system.md) for details.
+
+If the bot is not strictly private, restrict the directories users may start sessions in via `defaults.allowedWorkingDirectoryRoots` in `~/.config/agent-bridge/config.json`:
+
+```json
+{
+  "defaults": {
+    "allowedWorkingDirectoryRoots": ["/Users/wesley/project-learn"]
+  }
+}
+```
+
+When configured, `/new <path>` targets must resolve inside one of the roots. Bare `/new` and the channel-level agent configuration are trusted and never checked.
+
 ## Development
 
 ```bash

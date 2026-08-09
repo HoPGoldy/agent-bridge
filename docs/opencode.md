@@ -68,6 +68,24 @@ Start the channel:
 agent-bridge start <channel-name>
 ```
 
+## Working directories
+
+Sending `/new <path>` (or `/n <path>`) starts the next session with `<path>` as the OpenCode workspace instead of the channel-configured directory (or the bridge process cwd). A bare `/new` keeps the configured default.
+
+The bridge does **not** touch the local filesystem for OpenCode directories. The OpenCode Server may run on a remote host or inside a container, so the bridge only trims the path and forwards it to the server:
+
+- absolute and relative paths are forwarded as typed; a relative path is resolved by the server against the server's own working directory, not the bridge's
+- `~` and shell-style environment variables are **not** expanded
+- the server is responsible for validating the directory (existence, permissions, symlink resolution) and its errors propagate back through the session-new failure message
+
+Prefer absolute paths for predictable behavior:
+
+```text
+/new /Users/wesley/project-learn/demo
+```
+
+If `defaults.allowedWorkingDirectoryRoots` is configured (see [`docs/command-system.md`](./command-system.md)), a user-supplied directory must be an absolute path inside one of the allowed roots. The bridge performs this lexical check only; filesystem-level safety remains the server's responsibility. The allowlist check applies only to user-supplied paths: a bare `/new` and the channel-configured `directory` are trusted and never checked.
+
 ## HTTP Basic Auth
 
 Start a protected server with environment variables:
@@ -99,6 +117,7 @@ Use HTTPS for remote deployments. Plain HTTP is allowed after a warning, but it 
 The OpenCode adapter provides:
 
 - creation and restoration of OpenCode sessions
+- `/new <path>` to start a session in a specific working directory (see [Working directories](#working-directories))
 - regular prompts and follow-up messages while a session is busy
 - `/stop` to abort only the current session
 - `/compact` using the current provider and model
@@ -164,3 +183,7 @@ Review the OpenCode server permission configuration. The recommended non-interac
 ### Events stop arriving
 
 The runtime reconnects SSE automatically. If the server itself was restarted or removed the session, restart the channel or use `/new` to create a new session.
+
+### `/new <path>` reports an invalid directory
+
+The bridge forwards the path to the server without local validation, so an invalid-directory error comes from the OpenCode Server. Check the path from the server's point of view (for a remote or containerized server, the path must exist inside that server's filesystem), and prefer absolute paths.
