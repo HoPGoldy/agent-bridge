@@ -50,32 +50,43 @@ provider/modelID
 
 Leave it empty to use PI's default model.
 
-Start the channel from the workspace that PI should operate on:
+Start the channel from the workspace that PI should operate on by default:
 
 ```bash
 cd /path/to/workspace
 agent-bridge start <channel-name>
 ```
 
-The PI adapter uses the current working directory of the `agent-bridge` process as the agent workspace.
+By default, the PI adapter uses the current working directory of the `agent-bridge` process as the agent workspace. Any chat can override this per session with `/new <path>` — see [Working directories](#working-directories) below.
 
 ## Advanced configuration
 
-The interactive setup currently asks only for the model. These optional fields can also be set in `~/.config/agent-bridge/config.json`:
+The interactive setup currently asks only for the model. These optional fields can also be set in `~/.config/agent-bridge/config.json`. The `agent` block lives under a channel, not at the top level:
 
 ```json
 {
-  "agent": {
-    "type": "pi-coding-agent",
-    "config": {
-      "bin": "pi",
-      "sessionDir": "/path/to/pi-sessions",
-      "model": "provider/modelID",
-      "extraArgs": ["--thinking", "high"]
+  "channels": {
+    "<channel-name>": {
+      "common": { "language": "zh-CN" },
+      "client": {
+        "type": "<client-type>",
+        "config": { "...": "existing client config" }
+      },
+      "agent": {
+        "type": "pi-coding-agent",
+        "config": {
+          "bin": "pi",
+          "sessionDir": "/path/to/pi-sessions",
+          "model": "provider/modelID",
+          "extraArgs": ["--thinking", "high"]
+        }
+      }
     }
   }
 }
 ```
+
+Replace `<channel-name>` with the configured channel name. The `common` and `client` blocks are required and must stay intact; a top-level `agent` key would be ignored by the bridge.
 
 | Field | Description |
 | --- | --- |
@@ -91,12 +102,36 @@ Prefer the JSON `extraArgs` array when an argument contains spaces.
 The adapter starts PI in RPC mode and provides:
 
 - persistent session creation and restoration
+- `/new <path>` to start a session in a specific working directory
 - messages sent while PI is busy using PI's steering behavior
 - `/stop`, `/compact`, `/status`, and `/model`
 - reasoning, tool progress, final text, and local attachments
 - PI extensions, skills, prompt templates, context files, and packages loaded by the PI process
 
 PI configuration remains owned by PI. Files such as `~/.pi/agent/settings.json`, `~/.pi/agent/models.json`, `AGENTS.md`, and project `.pi` resources continue to work according to PI's normal loading and project-trust rules.
+
+## Working directories
+
+Sending `/new <path>` (or `/n <path>`) starts the next session with `<path>` as the PI working directory instead of the bridge process cwd. A bare `/new` keeps the bridge process cwd.
+
+Path handling is performed by the bridge before PI starts:
+
+- absolute paths are used as-is
+- relative paths are resolved against the agent-bridge process cwd
+- `~` and `~/...` are expanded against the bridge user's home directory
+- spaces and Unicode (for example Chinese directory names) are supported
+- shell-style environment variables such as `$HOME` are **not** expanded
+- the target is canonicalized with `realpath`: it must exist, be a directory, and be readable/enterable by the bridge process, and symlinks are resolved before any allowlist check
+
+Prefer absolute paths for predictable behavior:
+
+```text
+/new /Users/wesley/project-learn/demo
+```
+
+The working directory is persisted with the session binding, so it is restored when the session is resumed after the idle timeout or a bridge restart.
+
+If `defaults.allowedWorkingDirectoryRoots` is configured (see [`docs/command-system.md`](./command-system.md)), a user-supplied working directory must resolve inside one of the allowed roots. The allowlist check applies only to user-supplied paths: a bare `/new` and the channel configuration are trusted and never checked.
 
 ## Troubleshooting
 
@@ -110,7 +145,7 @@ Open PI directly, run `/login` and `/model`, and verify the provider credentials
 
 ### The agent is using the wrong workspace
 
-Stop the channel, change to the intended directory, and start it again. The current adapter does not expose a separate PI working-directory field.
+Use `/new /path/to/workspace` in the chat to start the next session in a different directory, without restarting the channel. The working directory is persisted with the session binding and restored on resume. If the bridge process cwd itself should change for all sessions, stop the channel, change to the intended directory, and start it again.
 
 ### Project extensions or skills are not loaded
 

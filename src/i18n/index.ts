@@ -19,7 +19,7 @@ const resources = {
       client: {
         processing: "Processing...",
         helpMessage:
-          "Available commands:\n\n- `/new` (`/n`) - Start a new agent session\n- `/compact` (`/c`) - Compact the current session context\n- `/stop` (`/s`) - Stop the active agent run\n- `/status` (`/st`) - Show the current agent session status\n- `/model` (`/m`) - List available models, or switch with `/model provider/modelId`\n- `/help` (`/h`) - Show this help message",
+          "Available commands:\n\n- `/new [path]` (`/n [path]`) - Start a new agent session; optionally start it in a specific directory, e.g. `/new /path/to/project`\n- `/compact` (`/c`) - Compact the current session context\n- `/stop` (`/s`) - Stop the active agent run\n- `/status` (`/st`) - Show the current agent session status\n- `/model` (`/m`) - List available models, or switch with `/model provider/modelId`\n- `/help` (`/h`) - Show this help message",
         messageDeliveryFailedTitle: "[agent-bridge error] Message delivery failed",
         weixinCooldown: "Weixin send is cooling down after rate limiting. Please try again shortly.",
         statusTitle: "Current session status",
@@ -64,7 +64,7 @@ const resources = {
       client: {
         processing: "正在处理中...",
         helpMessage:
-          "可用命令：\n\n- `/new` (`/n`) - 开始一个新会话\n- `/compact` (`/c`) - 压缩当前会话上下文\n- `/stop` (`/s`) - 停止当前正在运行的任务\n- `/status` (`/st`) - 查看当前智能体会话状态\n- `/model` (`/m`) - 查看可用模型，或使用 `/model provider/modelId` 切换模型\n- `/help` (`/h`) - 查看这条帮助信息",
+          "可用命令：\n\n- `/new [path]` (`/n [path]`) - 开始一个新会话；可选指定工作目录，例如 `/new /path/to/project`\n- `/compact` (`/c`) - 压缩当前会话上下文\n- `/stop` (`/s`) - 停止当前正在运行的任务\n- `/status` (`/st`) - 查看当前智能体会话状态\n- `/model` (`/m`) - 查看可用模型，或使用 `/model provider/modelId` 切换模型\n- `/help` (`/h`) - 查看这条帮助信息",
         messageDeliveryFailedTitle: "[agent-bridge 错误] 消息发送失败",
         weixinCooldown: "微信发送因限流已进入冷却，请稍后再试。",
         statusTitle: "当前会话状态",
