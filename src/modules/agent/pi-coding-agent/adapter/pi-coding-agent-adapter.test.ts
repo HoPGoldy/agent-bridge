@@ -2,6 +2,7 @@ import { afterEach, describe, expect, it, vi } from "vitest";
 import type { AgentOutputEvent } from "../../../../types";
 
 const rpcClients: Array<{
+  options: { cwd?: string; agentSessionId?: string; piSessionId?: string };
   emit: (event: { type: string; [key: string]: unknown }) => void;
 }> = [];
 
@@ -28,8 +29,9 @@ vi.mock("./pi-rpc-client", () => {
     PiRpcClient: class FakePiRpcClient {
       #listener: ((event: { type: string; [key: string]: unknown }) => void) | null = null;
 
-      constructor() {
+      constructor(options: { cwd?: string; agentSessionId?: string; piSessionId?: string }) {
         rpcClients.push({
+          options,
           emit: (event) => {
             this.#listener?.(event);
           },
@@ -125,6 +127,16 @@ describe("PiCodingAgentAdapter", () => {
     await vi.waitFor(async () => {
       expect(await adapter.isBusy()).toBe(false);
     });
+  });
+
+  it("forwards the configured cwd to the pi RPC client", async () => {
+    const adapter = new PiCodingAgentAdapter({ agentSessionId: "agent-1", cwd: "/tmp/workspace" });
+
+    await adapter.start(() => {});
+
+    expect(rpcClients[0]?.options).toEqual(
+      expect.objectContaining({ cwd: "/tmp/workspace", agentSessionId: "agent-1" }),
+    );
   });
 
   it("forwards tool execution events with tool ids and labels but without generic display text", async () => {

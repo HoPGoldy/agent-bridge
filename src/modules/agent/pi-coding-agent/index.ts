@@ -2,6 +2,7 @@ import { randomUUID } from "node:crypto";
 import os from "node:os";
 import path from "node:path";
 import { PiCodingAgentAdapter } from "./adapter/pi-coding-agent-adapter";
+import { resolveWorkingDirectory } from "./working-directory";
 import { createLogger } from "../../../core/logger";
 import type { AgentAdapter, AgentModule, ConfigAdapter, PiCodingAgentConfig } from "../../../types";
 
@@ -15,10 +16,15 @@ function parseExtraArgs(raw: string | undefined): string[] {
     .filter(Boolean);
 }
 
-function buildAdapter(config: PiCodingAgentConfig, agentSessionId: string): AgentAdapter {
+async function buildAdapter(
+  config: PiCodingAgentConfig,
+  agentSessionId: string,
+  workingDirectory?: string,
+): Promise<AgentAdapter> {
+  const cwd = await resolveWorkingDirectory(workingDirectory);
   return new PiCodingAgentAdapter({
     agentSessionId,
-    cwd: process.cwd(),
+    cwd,
     sessionDir:
       config.sessionDir ??
       process.env.PI_SESSION_DIR ??
@@ -53,16 +59,16 @@ function createPiCodingAgentConfigCollector(): ConfigAdapter<PiCodingAgentConfig
 export const piCodingAgentModule: AgentModule<PiCodingAgentConfig> = {
   type: "pi-coding-agent",
   createConfigCollector: createPiCodingAgentConfigCollector,
-  async createAgentSession({ config, common }) {
+  async createAgentSession({ config, common, workingDirectory }) {
     const agentSessionId = `pi-coding-agent:${randomUUID()}`;
     logger.info(`creating agent session ${agentSessionId} for channel ${common.channelName}`);
     return {
       agentSessionId,
-      agentAdapter: buildAdapter(config, agentSessionId),
+      agentAdapter: await buildAdapter(config, agentSessionId, workingDirectory),
     };
   },
-  async resumeAgentSession({ config, common, agentSessionId }) {
+  async resumeAgentSession({ config, common, agentSessionId, workingDirectory }) {
     logger.info(`resuming agent session ${agentSessionId} for channel ${common.channelName}`);
-    return buildAdapter(config, agentSessionId);
+    return buildAdapter(config, agentSessionId, workingDirectory);
   },
 };
