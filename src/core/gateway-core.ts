@@ -5,6 +5,7 @@ import type {
   ClientInputEvent,
   ClientOutputEvent,
   GatewayCoreOptions,
+  SessionBinding,
 } from "../types";
 import { getTranslatorForCommon, type Translator } from "../i18n";
 import { createLogger, type Logger } from "./logger";
@@ -26,8 +27,17 @@ export class GatewayCore {
   readonly #common?: ChannelCommonContext;
   readonly #t: Translator;
   readonly #logger: Logger = createLogger("core");
-  readonly #clientToAgentSession = new Map<string, string>();
+  readonly #clientToAgentSession = new Map<string, SessionBinding>();
   readonly #agentRuntimes = new Map<string, AgentRuntime>();
+  /**
+   * Client-output handlers that have already entered and are still settling.
+   * Used by stop() to wait for in-flight work (for example a `/new` whose
+   * agent create is still pending) so no runtime leaks and no binding save is
+   * enqueued after the drain. Each tracked promise never rejects.
+   */
+  readonly #inFlightHandlers = new Set<Promise<void>>();
+  /** Tail of the serialized binding-save queue; never rejects. */
+  #persistTail: Promise<void> = Promise.resolve();
   #started = false;
 
   constructor({ imAdapter, agentModule, agentConfig, agentIdleTimeoutMs, bindingStore, common }: GatewayCoreOptions) {
@@ -46,34 +56,73 @@ export class GatewayCore {
 
     if (this.#bindingStore) {
       const bindings = await this.#bindingStore.load();
-      for (const [clientSessionId, agentSessionId] of Object.entries(bindings)) {
-        this.#clientToAgentSession.set(clientSessionId, agentSessionId);
+      for (const [clientSessionId, binding] of Object.entries(bindings)) {
+        this.#clientToAgentSession.set(clientSessionId, binding);
       }
     }
 
     await this.#imAdapter.start(async (event) => {
+      // Reject new client output once stop has begun: the adapter may still
+      // deliver events while it is shutting down, and those must not start
+      // any new work after we have decided to stop.
+      if (!this.#started) return;
+
+      // The handled promise never rejects, so a failing handler can never
+      // produce an unhandled rejection; the adapter still awaits it so per-
+      // channel backpressure and ordering are preserved.
+      const handled = this.#handleClientOutput(event).then(
+        () => undefined,
+        (error: unknown) => {
+          this.#logger.error("failed to process client output event:", error);
+        },
+      );
+      this.#inFlightHandlers.add(handled);
       try {
-        await this.#handleClientOutput(event);
-      } catch (error) {
-        this.#logger.error("failed to process client output event:", error);
+        await handled;
+      } finally {
+        this.#inFlightHandlers.delete(handled);
       }
     });
   }
 
   async stop(): Promise<void> {
     if (!this.#started) return;
+    // Stop accepting new client output first, before anything else, so no new
+    // handler can enter after this point.
     this.#started = false;
 
-    for (const runtime of [...this.#agentRuntimes.values()]) {
-      await this.#stopRuntime(runtime);
+    await this.#imAdapter.stop();
+
+    // Drain-until-quiescent: an already-entered handler (for example a `/new`
+    // whose agent create is still pending) can start a new runtime, bind it,
+    // and enqueue a binding save while we are waiting. Stopping runtimes or
+    // draining before it settles would leak the runtime and lose the binding
+    // when the process exits right after stop.
+    while (true) {
+      while (this.#inFlightHandlers.size > 0) {
+        await Promise.allSettled([...this.#inFlightHandlers]);
+      }
+      await this.#drainPersist();
+      if (this.#inFlightHandlers.size === 0) break;
     }
 
-    await this.#imAdapter.stop();
+    // Best-effort stop of every runtime: a single throwing stop must not
+    // prevent the remaining runtimes from being stopped or the bindings from
+    // being drained.
+    const runtimes = [...this.#agentRuntimes.values()];
+    const results = await Promise.allSettled(runtimes.map((runtime) => this.#stopRuntime(runtime)));
+    for (const result of results) {
+      if (result.status === "rejected") {
+        this.#logger.error("failed to stop agent session:", result.reason);
+      }
+    }
+
+    await this.#drainPersist();
   }
 
   async #handleClientOutput(event: ClientOutputEvent): Promise<void> {
     if (event.type === "command.session.new") {
-      await this.#handleSessionNew(event.clientSessionId);
+      await this.#handleSessionNew(event.clientSessionId, event.workingDirectory);
       return;
     }
 
@@ -286,17 +335,48 @@ export class GatewayCore {
     }
   }
 
-  async #handleSessionNew(clientSessionId: string): Promise<void> {
-    const previousAgentSessionId = this.#clientToAgentSession.get(clientSessionId);
-    if (previousAgentSessionId) {
-      const previousRuntime = this.#agentRuntimes.get(previousAgentSessionId);
+  async #handleSessionNew(clientSessionId: string, workingDirectory?: string): Promise<void> {
+    // Transactional switch: create and start the new runtime first so a failed
+    // creation never tears down the previous session, its binding, or its runtime.
+    let newRuntime: AgentRuntime;
+    try {
+      newRuntime = await this.#createRuntimeForClient(clientSessionId, workingDirectory);
+    } catch (error) {
+      const detail = error instanceof Error ? error.message : String(error);
+      this.#logger.error(`failed to create new agent session for ${clientSessionId}:`, error);
+      await this.#deliverClientInput({
+        type: "assistant.message",
+        clientSessionId,
+        text: this.#t("gateway.failedToStartNewSession", { detail }),
+      });
+      return;
+    }
+
+    const previousBinding = this.#clientToAgentSession.get(clientSessionId);
+    if (previousBinding) {
+      const previousRuntime = this.#agentRuntimes.get(previousBinding.agentSessionId);
       if (previousRuntime) {
-        await this.#stopRuntime(previousRuntime);
+        // #stopRuntime always removes the runtime from the map (finally), so a
+        // throwing stop must not abort the switch: log it and continue so the
+        // new runtime gets bound and the user receives a deterministic reply.
+        try {
+          await this.#stopRuntime(previousRuntime);
+        } catch (error) {
+          this.#logger.error(
+            `failed to stop previous agent session ${previousRuntime.agentSessionId}:`,
+            error,
+          );
+        }
       }
     }
 
-    const runtime = await this.#createRuntimeForClient(clientSessionId);
-    this.#bindClientToAgent(clientSessionId, runtime.agentSessionId);
+    // Wait for the binding save before confirming success so the new binding is
+    // durable when the user reads the reply. The save never rejects; failures
+    // are logged and the in-memory binding stays authoritative.
+    await this.#bindClientToAgent(clientSessionId, {
+      agentSessionId: newRuntime.agentSessionId,
+      ...(workingDirectory !== undefined ? { workingDirectory } : {}),
+    });
     await this.#deliverClientInput({
       type: "assistant.message",
       clientSessionId,
@@ -313,11 +393,11 @@ export class GatewayCore {
   }
 
   async #getActiveRuntime(clientSessionId: string): Promise<AgentRuntime | null> {
-    const agentSessionId = this.#clientToAgentSession.get(clientSessionId);
-    if (!agentSessionId) {
+    const binding = this.#clientToAgentSession.get(clientSessionId);
+    if (!binding) {
       return null;
     }
-    return this.#getOrRestoreRuntime(clientSessionId, agentSessionId);
+    return this.#getOrRestoreRuntime(clientSessionId, binding);
   }
 
   async #getOrCreateActiveRuntime(clientSessionId: string): Promise<AgentRuntime> {
@@ -327,12 +407,12 @@ export class GatewayCore {
     }
 
     const runtime = await this.#createRuntimeForClient(clientSessionId);
-    this.#bindClientToAgent(clientSessionId, runtime.agentSessionId);
+    void this.#bindClientToAgent(clientSessionId, { agentSessionId: runtime.agentSessionId });
     return runtime;
   }
 
-  async #getOrRestoreRuntime(clientSessionId: string, agentSessionId: string): Promise<AgentRuntime> {
-    const existing = this.#agentRuntimes.get(agentSessionId);
+  async #getOrRestoreRuntime(clientSessionId: string, binding: SessionBinding): Promise<AgentRuntime> {
+    const existing = this.#agentRuntimes.get(binding.agentSessionId);
     if (existing) {
       this.#touchRuntime(existing);
       return existing;
@@ -342,22 +422,53 @@ export class GatewayCore {
       const agentAdapter = await this.#agentModule.resumeAgentSession({
         config: this.#agentConfig,
         common: this.#common ?? { channelName: "", language: "en-US" },
-        agentSessionId,
+        agentSessionId: binding.agentSessionId,
+        ...(binding.workingDirectory !== undefined ? { workingDirectory: binding.workingDirectory } : {}),
       });
-      return this.#startRuntime(clientSessionId, agentSessionId, agentAdapter);
+      try {
+        return await this.#startRuntime(clientSessionId, binding.agentSessionId, agentAdapter);
+      } catch (error) {
+        // Mirror #createRuntimeForClient: a partially started resumed adapter
+        // must be cleaned up best-effort and the persisted binding must stay
+        // untouched so a later message can retry the restore.
+        this.#logger.error(`resumed agent session ${binding.agentSessionId} failed to start, cleaning up:`, error);
+        try {
+          await agentAdapter.stop();
+        } catch (stopError) {
+          this.#logger.error(
+            `failed to stop partially resumed agent adapter ${binding.agentSessionId}:`,
+            stopError,
+          );
+        }
+        throw error;
+      }
     }
 
-    const runtime = await this.#createRuntimeForClient(clientSessionId);
-    this.#bindClientToAgent(clientSessionId, runtime.agentSessionId);
+    const runtime = await this.#createRuntimeForClient(clientSessionId, binding.workingDirectory);
+    void this.#bindClientToAgent(clientSessionId, {
+      agentSessionId: runtime.agentSessionId,
+      ...(binding.workingDirectory !== undefined ? { workingDirectory: binding.workingDirectory } : {}),
+    });
     return runtime;
   }
 
-  async #createRuntimeForClient(clientSessionId: string): Promise<AgentRuntime> {
+  async #createRuntimeForClient(clientSessionId: string, workingDirectory?: string): Promise<AgentRuntime> {
     const { agentSessionId, agentAdapter } = await this.#agentModule.createAgentSession({
       config: this.#agentConfig,
       common: this.#common ?? { channelName: "", language: "en-US" },
+      ...(workingDirectory !== undefined ? { workingDirectory } : {}),
     });
-    return this.#startRuntime(clientSessionId, agentSessionId, agentAdapter);
+    try {
+      return await this.#startRuntime(clientSessionId, agentSessionId, agentAdapter);
+    } catch (error) {
+      this.#logger.error(`agent session ${agentSessionId} failed to start, cleaning up:`, error);
+      try {
+        await agentAdapter.stop();
+      } catch (stopError) {
+        this.#logger.error(`failed to stop partially created agent adapter ${agentSessionId}:`, stopError);
+      }
+      throw error;
+    }
   }
 
   async #startRuntime(
@@ -381,20 +492,38 @@ export class GatewayCore {
     return runtime;
   }
 
-  #bindClientToAgent(clientSessionId: string, agentSessionId: string): void {
-    this.#clientToAgentSession.set(clientSessionId, agentSessionId);
-    void this.#persistBindings();
+  /**
+   * Serializes binding-store writes: the snapshot is captured synchronously at
+   * enqueue time and written strictly in order through a promise tail, so an
+   * older snapshot can never overwrite a newer one and at most one save is in
+   * flight at a time. The returned promise never rejects: failures are logged
+   * and the queue stays alive for the next save. Await it when durability
+   * matters (for example before replying success to `/new`).
+   */
+  #enqueuePersist(): Promise<void> {
+    if (!this.#bindingStore) {
+      return Promise.resolve();
+    }
+    const snapshot = Object.fromEntries(this.#clientToAgentSession);
+    const save = this.#persistTail.then(() => this.#bindingStore!.save(snapshot));
+    const handled = save.then(
+      () => undefined,
+      (error: unknown) => {
+        this.#logger.error("failed to persist session bindings:", error);
+      },
+    );
+    this.#persistTail = handled;
+    return handled;
   }
 
-  async #persistBindings(): Promise<void> {
-    if (!this.#bindingStore) {
-      return;
-    }
-    try {
-      await this.#bindingStore.save(Object.fromEntries(this.#clientToAgentSession));
-    } catch (error) {
-      this.#logger.error("failed to persist session bindings:", error);
-    }
+  /** Resolves once every enqueued binding save has finished (drain on stop). */
+  #drainPersist(): Promise<void> {
+    return this.#persistTail;
+  }
+
+  #bindClientToAgent(clientSessionId: string, binding: SessionBinding): Promise<void> {
+    this.#clientToAgentSession.set(clientSessionId, binding);
+    return this.#enqueuePersist();
   }
 
   #resolveModelCommandError(error: unknown): { kind: string; detail?: string } {
@@ -419,8 +548,8 @@ export class GatewayCore {
     }
 
     const clientSessionId = runtime.clientSessionId;
-    const activeAgentSessionId = this.#clientToAgentSession.get(clientSessionId);
-    if (activeAgentSessionId !== agentSessionId) {
+    const activeBinding = this.#clientToAgentSession.get(clientSessionId);
+    if (activeBinding?.agentSessionId !== agentSessionId) {
       this.#logger.info(
         `dropping late output from inactive agent session ${agentSessionId} for client ${clientSessionId}`,
       );

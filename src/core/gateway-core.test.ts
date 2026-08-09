@@ -9,6 +9,7 @@ import type {
   ClientInputEvent,
   ClientOutputEvent,
   IMAdapter,
+  SessionBinding,
   SessionBindingStore,
 } from "../types";
 
@@ -70,18 +71,26 @@ class FakeAgentAdapter implements AgentAdapter {
   setModelResult?: { provider: string; modelId: string };
   setModelError?: Error;
   setModelCalls: string[] = [];
+  startError?: Error;
+  stopError?: Error;
   #onOutput: ((event: AgentOutputEvent) => Promise<void> | void) | null = null;
 
   constructor(readonly agentSessionId: string) {}
 
   async start(onOutput: (event: AgentOutputEvent) => Promise<void> | void): Promise<void> {
     this.#onOutput = onOutput;
+    if (this.startError) {
+      throw this.startError;
+    }
   }
 
   async stop(): Promise<void> {
     this.stopCount += 1;
     if (!this.retainOutputCallback) {
       this.#onOutput = null;
+    }
+    if (this.stopError) {
+      throw this.stopError;
     }
   }
 
@@ -144,16 +153,62 @@ class FakeAgentAdapter implements AgentAdapter {
 }
 
 class FakeBindingStore implements SessionBindingStore {
-  readonly saved: Array<Record<string, string>> = [];
+  readonly saved: Array<Record<string, SessionBinding>> = [];
 
-  constructor(readonly initial: Record<string, string> = {}) {}
+  constructor(readonly initial: Record<string, string | SessionBinding> = {}) {}
 
-  async load(): Promise<Record<string, string>> {
-    return this.initial;
+  async load(): Promise<Record<string, SessionBinding>> {
+    const bindings: Record<string, SessionBinding> = {};
+    for (const [clientSessionId, value] of Object.entries(this.initial)) {
+      bindings[clientSessionId] =
+        typeof value === "string" ? { agentSessionId: value } : value;
+    }
+    return bindings;
   }
 
-  async save(bindings: Record<string, string>): Promise<void> {
+  async save(bindings: Record<string, SessionBinding>): Promise<void> {
     this.saved.push({ ...bindings });
+  }
+}
+
+/**
+ * Binding store whose saves stay in flight until explicitly released, so tests
+ * can observe save ordering, concurrency, and failure recovery.
+ */
+class DeferredBindingStore implements SessionBindingStore {
+  readonly saved: Array<Record<string, SessionBinding>> = [];
+  readonly deferreds: Array<{ resolve: () => void; reject: (error: Error) => void }> = [];
+  maxConcurrent = 0;
+  failNextSave = false;
+  #inFlight = 0;
+
+  async load(): Promise<Record<string, SessionBinding>> {
+    return {};
+  }
+
+  async save(bindings: Record<string, SessionBinding>): Promise<void> {
+    this.#inFlight += 1;
+    this.maxConcurrent = Math.max(this.maxConcurrent, this.#inFlight);
+    if (this.failNextSave) {
+      this.failNextSave = false;
+      this.#inFlight -= 1;
+      throw new Error("save boom");
+    }
+    this.saved.push({ ...bindings });
+    await new Promise<void>((resolve, reject) => {
+      this.deferreds.push({ resolve, reject });
+    });
+    this.#inFlight -= 1;
+  }
+}
+
+/**
+ * FakeIMAdapter variant that keeps its output callback after stop(), so tests
+ * can simulate a late event racing in while the core is shutting down.
+ */
+class KeepCallbackOnStopAdapter extends FakeIMAdapter {
+  async stop(): Promise<void> {
+    // Intentionally keep the output callback so emit() still works after stop().
   }
 }
 
@@ -432,8 +487,727 @@ describe("GatewayCore", () => {
     });
 
     await waitFor(() => {
-      expect(bindingStore.saved.at(-1)).toEqual({ "client-1": "agent-1" });
+      expect(bindingStore.saved.at(-1)).toEqual({ "client-1": { agentSessionId: "agent-1" } });
     });
+  });
+
+  it("passes workingDirectory from /new into createAgentSession and persists it in the binding", async () => {
+    const imAdapter = new FakeIMAdapter();
+    const bindingStore = new FakeBindingStore();
+    const createdDirs: Array<string | undefined> = [];
+    const createdAdapters: FakeAgentAdapter[] = [];
+
+    const agentModule: AgentModule<Record<string, never>> = {
+      type: "fake",
+      async createAgentSession(args) {
+        createdDirs.push(args.workingDirectory);
+        const agentSessionId = `agent-${createdAdapters.length + 1}`;
+        const agentAdapter = new FakeAgentAdapter(agentSessionId);
+        createdAdapters.push(agentAdapter);
+        return { agentSessionId, agentAdapter };
+      },
+    };
+
+    const core = new GatewayCore({
+      imAdapter,
+      agentModule,
+      agentConfig: {},
+      agentIdleTimeoutMs: 60_000,
+      bindingStore,
+    });
+    running.push(core);
+    await core.start();
+
+    await imAdapter.emit({
+      type: "user.message",
+      clientSessionId: "client-1",
+      text: "hello",
+    });
+    await waitFor(() => {
+      expect(createdAdapters).toHaveLength(1);
+    });
+
+    await imAdapter.emit({
+      type: "command.session.new",
+      clientSessionId: "client-1",
+      workingDirectory: "/tmp/project-a",
+    });
+
+    await waitFor(() => {
+      expect(createdDirs.at(-1)).toBe("/tmp/project-a");
+      expect(createdAdapters[0]!.stopCount).toBe(1);
+      expect(bindingStore.saved.at(-1)).toEqual({
+        "client-1": { agentSessionId: "agent-2", workingDirectory: "/tmp/project-a" },
+      });
+      expect(imAdapter.outputs.some((event) => event.text === "Started a new session.")).toBe(true);
+    });
+  });
+
+  it("keeps the no-argument /new behavior and omits workingDirectory", async () => {
+    const imAdapter = new FakeIMAdapter();
+    const bindingStore = new FakeBindingStore();
+    const createdDirs: Array<string | undefined> = [];
+
+    const agentModule: AgentModule<Record<string, never>> = {
+      type: "fake",
+      async createAgentSession(args) {
+        createdDirs.push(args.workingDirectory);
+        return {
+          agentSessionId: `agent-${createdDirs.length}`,
+          agentAdapter: new FakeAgentAdapter(`agent-${createdDirs.length}`),
+        };
+      },
+    };
+
+    const core = new GatewayCore({
+      imAdapter,
+      agentModule,
+      agentConfig: {},
+      agentIdleTimeoutMs: 60_000,
+      bindingStore,
+    });
+    running.push(core);
+    await core.start();
+
+    await imAdapter.emit({
+      type: "command.session.new",
+      clientSessionId: "client-1",
+    });
+
+    await waitFor(() => {
+      expect(createdDirs).toEqual([undefined]);
+      expect(bindingStore.saved.at(-1)).toEqual({
+        "client-1": { agentSessionId: "agent-1" },
+      });
+      expect(imAdapter.outputs.some((event) => event.text === "Started a new session.")).toBe(true);
+    });
+  });
+
+  it("passes the persisted workingDirectory to resumeAgentSession on restore", async () => {
+    const imAdapter = new FakeIMAdapter();
+    const bindingStore = new FakeBindingStore({
+      "client-1": { agentSessionId: "agent-1", workingDirectory: "/tmp/project-a" },
+    });
+    const resumed: Array<{ agentSessionId: string; workingDirectory?: string }> = [];
+
+    const agentModule: AgentModule<Record<string, never>> = {
+      type: "fake",
+      async createAgentSession() {
+        return {
+          agentSessionId: "agent-new",
+          agentAdapter: new FakeAgentAdapter("agent-new"),
+        };
+      },
+      async resumeAgentSession(args) {
+        resumed.push({ agentSessionId: args.agentSessionId, workingDirectory: args.workingDirectory });
+        return new FakeAgentAdapter(args.agentSessionId);
+      },
+    };
+
+    const core = new GatewayCore({
+      imAdapter,
+      agentModule,
+      agentConfig: {},
+      agentIdleTimeoutMs: 60_000,
+      bindingStore,
+    });
+    running.push(core);
+    await core.start();
+
+    await imAdapter.emit({
+      type: "user.message",
+      clientSessionId: "client-1",
+      text: "hello again",
+    });
+
+    await waitFor(() => {
+      expect(resumed).toEqual([{ agentSessionId: "agent-1", workingDirectory: "/tmp/project-a" }]);
+    });
+  });
+
+  it("re-resumes with the persisted workingDirectory after idle release", async () => {
+    const imAdapter = new FakeIMAdapter();
+    const bindingStore = new FakeBindingStore({
+      "client-1": { agentSessionId: "agent-1", workingDirectory: "/tmp/project-a" },
+    });
+    const resumedDirs: Array<string | undefined> = [];
+
+    const agentModule: AgentModule<Record<string, never>> = {
+      type: "fake",
+      async createAgentSession() {
+        return {
+          agentSessionId: "agent-new",
+          agentAdapter: new FakeAgentAdapter("agent-new"),
+        };
+      },
+      async resumeAgentSession(args) {
+        resumedDirs.push(args.workingDirectory);
+        return new FakeAgentAdapter(args.agentSessionId);
+      },
+    };
+
+    const core = new GatewayCore({
+      imAdapter,
+      agentModule,
+      agentConfig: {},
+      agentIdleTimeoutMs: 20,
+      bindingStore,
+    });
+    running.push(core);
+    await core.start();
+
+    await imAdapter.emit({
+      type: "user.message",
+      clientSessionId: "client-1",
+      text: "first",
+    });
+    await waitFor(() => {
+      expect(resumedDirs).toEqual(["/tmp/project-a"]);
+    });
+
+    await sleep(60);
+
+    await imAdapter.emit({
+      type: "user.message",
+      clientSessionId: "client-1",
+      text: "second",
+    });
+    await waitFor(() => {
+      expect(resumedDirs).toEqual(["/tmp/project-a", "/tmp/project-a"]);
+    });
+  });
+
+  it("keeps the previous session and binding when /new creation fails", async () => {
+    const imAdapter = new FakeIMAdapter();
+    const bindingStore = new FakeBindingStore();
+    const createdAdapters: FakeAgentAdapter[] = [];
+    let failNextCreate = false;
+
+    const agentModule: AgentModule<Record<string, never>> = {
+      type: "fake",
+      async createAgentSession() {
+        if (failNextCreate) {
+          throw new Error("boom: cannot create");
+        }
+        const agentAdapter = new FakeAgentAdapter(`agent-${createdAdapters.length + 1}`);
+        createdAdapters.push(agentAdapter);
+        return { agentSessionId: `agent-${createdAdapters.length}`, agentAdapter };
+      },
+    };
+
+    const core = new GatewayCore({
+      imAdapter,
+      agentModule,
+      agentConfig: {},
+      agentIdleTimeoutMs: 60_000,
+      bindingStore,
+    });
+    running.push(core);
+    await core.start();
+
+    await imAdapter.emit({
+      type: "user.message",
+      clientSessionId: "client-1",
+      text: "hello",
+    });
+    await waitFor(() => {
+      expect(createdAdapters).toHaveLength(1);
+    });
+
+    failNextCreate = true;
+    await imAdapter.emit({
+      type: "command.session.new",
+      clientSessionId: "client-1",
+      workingDirectory: "/tmp/missing",
+    });
+
+    await waitFor(() => {
+      expect(createdAdapters[0]!.stopCount).toBe(0);
+      expect(bindingStore.saved.at(-1)).toEqual({
+        "client-1": { agentSessionId: "agent-1" },
+      });
+      expect(
+        imAdapter.outputs.some(
+          (event) =>
+            event.type === "assistant.message" && event.text.includes("Failed to start a new session"),
+        ),
+      ).toBe(true);
+    });
+
+    await createdAdapters[0]!.emitAssistant("still alive");
+    await waitFor(() => {
+      expect(imAdapter.outputs.some((event) => event.text === "still alive")).toBe(true);
+    });
+  });
+
+  it("cleans up a partially created adapter when start fails and keeps the old session", async () => {
+    const imAdapter = new FakeIMAdapter();
+    const bindingStore = new FakeBindingStore();
+    const createdAdapters: FakeAgentAdapter[] = [];
+
+    const agentModule: AgentModule<Record<string, never>> = {
+      type: "fake",
+      async createAgentSession() {
+        const agentAdapter = new FakeAgentAdapter(`agent-${createdAdapters.length + 1}`);
+        if (createdAdapters.length > 0) {
+          agentAdapter.startError = new Error("start boom");
+        }
+        createdAdapters.push(agentAdapter);
+        return { agentSessionId: `agent-${createdAdapters.length}`, agentAdapter };
+      },
+    };
+
+    const core = new GatewayCore({
+      imAdapter,
+      agentModule,
+      agentConfig: {},
+      agentIdleTimeoutMs: 60_000,
+      bindingStore,
+    });
+    running.push(core);
+    await core.start();
+
+    await imAdapter.emit({
+      type: "user.message",
+      clientSessionId: "client-1",
+      text: "hello",
+    });
+    await waitFor(() => {
+      expect(createdAdapters).toHaveLength(1);
+    });
+
+    await imAdapter.emit({
+      type: "command.session.new",
+      clientSessionId: "client-1",
+      workingDirectory: "/tmp/project-b",
+    });
+
+    await waitFor(() => {
+      expect(createdAdapters[1]!.stopCount).toBe(1);
+      expect(createdAdapters[0]!.stopCount).toBe(0);
+      expect(bindingStore.saved.at(-1)).toEqual({
+        "client-1": { agentSessionId: "agent-1" },
+      });
+      expect(
+        imAdapter.outputs.some(
+          (event) =>
+            event.type === "assistant.message" && event.text.includes("Failed to start a new session"),
+        ),
+      ).toBe(true);
+    });
+  });
+
+  it("continues the /new switch when stopping the previous runtime throws", async () => {
+    const imAdapter = new FakeIMAdapter();
+    const bindingStore = new FakeBindingStore();
+    const createdAdapters: FakeAgentAdapter[] = [];
+
+    const agentModule: AgentModule<Record<string, never>> = {
+      type: "fake",
+      async createAgentSession() {
+        const id = `agent-${createdAdapters.length + 1}`;
+        const agentAdapter = new FakeAgentAdapter(id);
+        createdAdapters.push(agentAdapter);
+        return { agentSessionId: id, agentAdapter };
+      },
+    };
+
+    const core = new GatewayCore({
+      imAdapter,
+      agentModule,
+      agentConfig: {},
+      agentIdleTimeoutMs: 60_000,
+      bindingStore,
+    });
+    running.push(core);
+    await core.start();
+
+    await imAdapter.emit({
+      type: "user.message",
+      clientSessionId: "client-1",
+      text: "hello",
+    });
+    await waitFor(() => {
+      expect(createdAdapters).toHaveLength(1);
+    });
+
+    createdAdapters[0]!.stopError = new Error("stop boom");
+
+    // Must not reject: the failed previous stop is logged and the switch completes.
+    await imAdapter.emit({
+      type: "command.session.new",
+      clientSessionId: "client-1",
+      workingDirectory: "/tmp/project-a",
+    });
+
+    expect(createdAdapters).toHaveLength(2);
+    expect(createdAdapters[0]!.stopCount).toBe(1);
+    expect(createdAdapters[1]!.stopCount).toBe(0);
+    expect(bindingStore.saved.at(-1)).toEqual({
+      "client-1": { agentSessionId: "agent-2", workingDirectory: "/tmp/project-a" },
+    });
+    expect(imAdapter.outputs.some((event) => event.text === "Started a new session.")).toBe(true);
+
+    // The new runtime is bound and reachable: a follow-up message goes to agent-2
+    // and is never routed to the stale (failed-stop) runtime.
+    await imAdapter.emit({
+      type: "user.message",
+      clientSessionId: "client-1",
+      text: "next",
+    });
+    await waitFor(() => {
+      expect(createdAdapters[1]!.inputs).toContainEqual({ type: "user.message", text: "next" });
+    });
+    expect(createdAdapters[0]!.inputs.some((event) => event.text === "next")).toBe(false);
+  });
+
+  it("serializes binding saves so the latest binding wins with at most one concurrent save", async () => {
+    const imAdapter = new FakeIMAdapter();
+    const store = new DeferredBindingStore();
+    const createdAdapters: FakeAgentAdapter[] = [];
+
+    const agentModule: AgentModule<Record<string, never>> = {
+      type: "fake",
+      async createAgentSession() {
+        const id = `agent-${createdAdapters.length + 1}`;
+        const agentAdapter = new FakeAgentAdapter(id);
+        createdAdapters.push(agentAdapter);
+        return { agentSessionId: id, agentAdapter };
+      },
+    };
+
+    const core = new GatewayCore({
+      imAdapter,
+      agentModule,
+      agentConfig: {},
+      agentIdleTimeoutMs: 60_000,
+      bindingStore: store,
+    });
+    running.push(core);
+    await core.start();
+
+    const first = imAdapter.emit({
+      type: "command.session.new",
+      clientSessionId: "client-1",
+      workingDirectory: "/tmp/project-a",
+    });
+    await waitFor(() => {
+      expect(store.deferreds).toHaveLength(1);
+    });
+    expect(store.maxConcurrent).toBe(1);
+
+    const second = imAdapter.emit({
+      type: "command.session.new",
+      clientSessionId: "client-1",
+      workingDirectory: "/tmp/project-b",
+    });
+    // The second save is queued behind the first: it must not be in flight yet.
+    await sleep(30);
+    expect(store.saved).toHaveLength(1);
+    expect(store.maxConcurrent).toBe(1);
+
+    store.deferreds[0]!.resolve();
+    await waitFor(() => {
+      expect(store.deferreds).toHaveLength(2);
+    });
+    expect(store.maxConcurrent).toBe(1);
+    store.deferreds[1]!.resolve();
+
+    await first;
+    await second;
+
+    expect(store.saved).toHaveLength(2);
+    expect(store.saved.at(-1)).toEqual({
+      "client-1": { agentSessionId: "agent-2", workingDirectory: "/tmp/project-b" },
+    });
+    expect(store.maxConcurrent).toBe(1);
+    expect(
+      imAdapter.outputs.filter((event) => event.type === "assistant.message" && event.text === "Started a new session."),
+    ).toHaveLength(2);
+  });
+
+  it("recovers the binding-save queue after a failed save and still persists the latest binding", async () => {
+    const imAdapter = new FakeIMAdapter();
+    const store = new DeferredBindingStore();
+    store.failNextSave = true;
+    const createdAdapters: FakeAgentAdapter[] = [];
+
+    const agentModule: AgentModule<Record<string, never>> = {
+      type: "fake",
+      async createAgentSession() {
+        const id = `agent-${createdAdapters.length + 1}`;
+        const agentAdapter = new FakeAgentAdapter(id);
+        createdAdapters.push(agentAdapter);
+        return { agentSessionId: id, agentAdapter };
+      },
+    };
+
+    const core = new GatewayCore({
+      imAdapter,
+      agentModule,
+      agentConfig: {},
+      agentIdleTimeoutMs: 60_000,
+      bindingStore: store,
+    });
+    running.push(core);
+    await core.start();
+
+    // First save fails synchronously; the /new flow must not reject and must
+    // still confirm success (the in-memory binding stays authoritative).
+    await imAdapter.emit({
+      type: "command.session.new",
+      clientSessionId: "client-1",
+      workingDirectory: "/tmp/project-a",
+    });
+    expect(store.saved).toHaveLength(0);
+    expect(imAdapter.outputs.some((event) => event.text === "Started a new session.")).toBe(true);
+
+    // The queue stays alive: the next save runs and persists the latest binding.
+    const second = imAdapter.emit({
+      type: "command.session.new",
+      clientSessionId: "client-1",
+      workingDirectory: "/tmp/project-b",
+    });
+    await waitFor(() => {
+      expect(store.deferreds).toHaveLength(1);
+    });
+    store.deferreds[0]!.resolve();
+    await second;
+
+    expect(store.saved.at(-1)).toEqual({
+      "client-1": { agentSessionId: "agent-2", workingDirectory: "/tmp/project-b" },
+    });
+  });
+
+  it("drains pending binding saves before core.stop resolves", async () => {
+    const imAdapter = new FakeIMAdapter();
+    const store = new DeferredBindingStore();
+
+    const agentModule: AgentModule<Record<string, never>> = {
+      type: "fake",
+      async createAgentSession() {
+        return { agentSessionId: "agent-1", agentAdapter: new FakeAgentAdapter("agent-1") };
+      },
+    };
+
+    const core = new GatewayCore({
+      imAdapter,
+      agentModule,
+      agentConfig: {},
+      agentIdleTimeoutMs: 60_000,
+      bindingStore: store,
+    });
+    running.push(core);
+    await core.start();
+
+    // user.message binds through the fire-and-forget path, so the save is still
+    // pending after emit resolves.
+    await imAdapter.emit({
+      type: "user.message",
+      clientSessionId: "client-1",
+      text: "hello",
+    });
+    await waitFor(() => {
+      expect(store.deferreds).toHaveLength(1);
+    });
+
+    let stopped = false;
+    const stopPromise = core.stop().then(() => {
+      stopped = true;
+    });
+    await sleep(30);
+    expect(stopped).toBe(false);
+
+    store.deferreds[0]!.resolve();
+    await stopPromise;
+    expect(stopped).toBe(true);
+    expect(store.saved.at(-1)).toEqual({
+      "client-1": { agentSessionId: "agent-1" },
+    });
+  });
+
+  it("waits for an in-flight /new handler during stop and cleans up its runtime and binding", async () => {
+    const imAdapter = new KeepCallbackOnStopAdapter();
+    const bindingStore = new FakeBindingStore();
+    const createdAdapters: FakeAgentAdapter[] = [];
+    let releaseCreate!: () => void;
+    const createGate = new Promise<void>((resolve) => {
+      releaseCreate = resolve;
+    });
+    let createEntered = false;
+
+    const agentModule: AgentModule<Record<string, never>> = {
+      type: "fake",
+      async createAgentSession() {
+        createEntered = true;
+        await createGate;
+        const agentAdapter = new FakeAgentAdapter("agent-new");
+        createdAdapters.push(agentAdapter);
+        return { agentSessionId: "agent-new", agentAdapter };
+      },
+    };
+
+    const core = new GatewayCore({
+      imAdapter,
+      agentModule,
+      agentConfig: {},
+      agentIdleTimeoutMs: 60_000,
+      bindingStore,
+    });
+    running.push(core);
+    await core.start();
+
+    try {
+      // The /new handler enters and blocks on the deferred create.
+      const newEmit = imAdapter.emit({
+        type: "command.session.new",
+        clientSessionId: "client-1",
+        workingDirectory: "/tmp/project-a",
+      });
+      await waitFor(() => {
+        expect(createEntered).toBe(true);
+      });
+
+      // Stop while the handler is in flight: it must not resolve early.
+      let stopped = false;
+      const stopPromise = core.stop().then(() => {
+        stopped = true;
+      });
+      await sleep(30);
+      expect(stopped).toBe(false);
+
+      // A late event racing in after stop began must be ignored.
+      await imAdapter.emit({
+        type: "user.message",
+        clientSessionId: "client-2",
+        text: "ignored",
+      });
+
+      // Release the create; stop may now finish its drain and cleanup.
+      releaseCreate();
+      await newEmit;
+      await waitFor(() => {
+        expect(stopped).toBe(true);
+      });
+
+      // The new runtime was stopped by the stop drain, the binding was saved,
+      // and the late event never created a second runtime or reached any agent.
+      expect(createdAdapters[0]!.stopCount).toBe(1);
+      expect(bindingStore.saved.at(-1)).toEqual({
+        "client-1": { agentSessionId: "agent-new", workingDirectory: "/tmp/project-a" },
+      });
+      expect(imAdapter.outputs.some((event) => event.text === "Started a new session.")).toBe(true);
+      expect(createdAdapters).toHaveLength(1);
+      expect(createdAdapters[0]!.inputs).toEqual([]);
+    } finally {
+      // Always release the gate so stop()/afterEach cleanup cannot hang.
+      releaseCreate();
+    }
+  });
+
+  it("stops the remaining runtimes and drains bindings when one runtime stop throws", async () => {
+    const imAdapter = new FakeIMAdapter();
+    const bindingStore = new FakeBindingStore();
+    const adapters = [new FakeAgentAdapter("agent-1"), new FakeAgentAdapter("agent-2")];
+    adapters[0]!.stopError = new Error("stop boom");
+    let next = 0;
+
+    const agentModule: AgentModule<Record<string, never>> = {
+      type: "fake",
+      async createAgentSession() {
+        const agentAdapter = adapters[next]!;
+        next += 1;
+        return { agentSessionId: agentAdapter.agentSessionId, agentAdapter };
+      },
+    };
+
+    const core = new GatewayCore({
+      imAdapter,
+      agentModule,
+      agentConfig: {},
+      agentIdleTimeoutMs: 60_000,
+      bindingStore,
+    });
+    running.push(core);
+    await core.start();
+
+    await imAdapter.emit({ type: "user.message", clientSessionId: "client-1", text: "hello" });
+    await imAdapter.emit({ type: "user.message", clientSessionId: "client-2", text: "hello" });
+    await waitFor(() => {
+      expect(adapters[0]!.inputs).toEqual([{ type: "user.message", text: "hello" }]);
+      expect(adapters[1]!.inputs).toEqual([{ type: "user.message", text: "hello" }]);
+    });
+
+    await core.stop();
+
+    // The throwing stop did not prevent the healthy runtime from being stopped
+    // or the bindings from being drained.
+    expect(adapters[0]!.stopCount).toBe(1);
+    expect(adapters[1]!.stopCount).toBe(1);
+    expect(bindingStore.saved.at(-1)).toEqual({
+      "client-1": { agentSessionId: "agent-1" },
+      "client-2": { agentSessionId: "agent-2" },
+    });
+  });
+
+  it("cleans up a partially started resumed adapter and keeps the persisted binding", async () => {
+    const imAdapter = new FakeIMAdapter();
+    const bindingStore = new FakeBindingStore({
+      "client-1": { agentSessionId: "agent-1", workingDirectory: "/tmp/project-a" },
+    });
+    const resumedAdapters: FakeAgentAdapter[] = [];
+
+    const agentModule: AgentModule<Record<string, never>> = {
+      type: "fake",
+      async createAgentSession() {
+        return { agentSessionId: "agent-new", agentAdapter: new FakeAgentAdapter("agent-new") };
+      },
+      async resumeAgentSession({ agentSessionId }) {
+        const agentAdapter = new FakeAgentAdapter(agentSessionId);
+        agentAdapter.startError = new Error("resume start boom");
+        resumedAdapters.push(agentAdapter);
+        return agentAdapter;
+      },
+    };
+
+    const core = new GatewayCore({
+      imAdapter,
+      agentModule,
+      agentConfig: {},
+      agentIdleTimeoutMs: 60_000,
+      bindingStore,
+    });
+    running.push(core);
+    await core.start();
+
+    await imAdapter.emit({
+      type: "user.message",
+      clientSessionId: "client-1",
+      text: "hello",
+    });
+
+    await waitFor(() => {
+      expect(resumedAdapters).toHaveLength(1);
+      expect(resumedAdapters[0]!.stopCount).toBe(1);
+    });
+
+    // The persisted binding is untouched: no save happened and the loaded
+    // mapping is unchanged.
+    expect(bindingStore.saved).toHaveLength(0);
+    expect(bindingStore.initial).toEqual({
+      "client-1": { agentSessionId: "agent-1", workingDirectory: "/tmp/project-a" },
+    });
+
+    // A later message retries the restore from the same binding.
+    await imAdapter.emit({
+      type: "user.message",
+      clientSessionId: "client-1",
+      text: "retry",
+    });
+    await waitFor(() => {
+      expect(resumedAdapters).toHaveLength(2);
+    });
+    expect(bindingStore.saved).toHaveLength(0);
   });
 
   it("returns a message when compact is requested without an active agent session", async () => {
