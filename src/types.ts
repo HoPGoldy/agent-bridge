@@ -7,6 +7,7 @@ export type ClientOutputEvent =
   | {
       type: "command.session.new";
       clientSessionId: string;
+      workingDirectory?: string;
     }
   | {
       type: "command.session.compact";
