@@ -123,4 +123,85 @@ describe("Pi coding agent module working directory", () => {
 
     expect(adapterOptions).toHaveLength(0);
   });
+
+  it("allows a working directory inside an allowed root on create and resume", async () => {
+    const root = path.join(base, "projects");
+    const target = path.join(root, "project-a");
+    await mkdir(target, { recursive: true });
+    const expected = await realpath(target);
+
+    const created = await piCodingAgentModule.createAgentSession({
+      config: {},
+      common,
+      workingDirectory: target,
+      allowedWorkingDirectoryRoots: [root],
+    });
+    await piCodingAgentModule.resumeAgentSession!({
+      config: {},
+      common,
+      agentSessionId: created.agentSessionId,
+      workingDirectory: target,
+      allowedWorkingDirectoryRoots: [root],
+    });
+
+    expect(adapterOptions).toHaveLength(2);
+    expect(adapterOptions[0]!.cwd).toBe(expected);
+    expect(adapterOptions[1]!.cwd).toBe(expected);
+  });
+
+  it("rejects a working directory outside the allowed roots on create and resume", async () => {
+    const root = path.join(base, "projects");
+    const outside = path.join(base, "outside");
+    await mkdir(root, { recursive: true });
+    await mkdir(outside, { recursive: true });
+
+    await expect(
+      piCodingAgentModule.createAgentSession({
+        config: {},
+        common,
+        workingDirectory: outside,
+        allowedWorkingDirectoryRoots: [root],
+      }),
+    ).rejects.toThrow(/not inside an allowed root/);
+
+    await expect(
+      piCodingAgentModule.resumeAgentSession!({
+        config: {},
+        common,
+        agentSessionId: "pi-coding-agent:resumed",
+        workingDirectory: outside,
+        allowedWorkingDirectoryRoots: [root],
+      }),
+    ).rejects.toThrow(/not inside an allowed root/);
+
+    expect(adapterOptions).toHaveLength(0);
+  });
+
+  it("keeps the default cwd behavior for a bare /new even when roots are configured", async () => {
+    const root = path.join(base, "projects");
+    await mkdir(root, { recursive: true });
+
+    await piCodingAgentModule.createAgentSession({
+      config: {},
+      common,
+      allowedWorkingDirectoryRoots: [root],
+    });
+
+    expect(adapterOptions.at(-1)?.cwd).toBe(process.cwd());
+  });
+
+  it("is permissive with an empty allowlist", async () => {
+    const target = path.join(base, "anywhere");
+    await mkdir(target, { recursive: true });
+
+    const created = await piCodingAgentModule.createAgentSession({
+      config: {},
+      common,
+      workingDirectory: target,
+      allowedWorkingDirectoryRoots: [],
+    });
+
+    expect(adapterOptions.at(-1)?.cwd).toBe(await realpath(target));
+    expect(created.agentSessionId).toMatch(/^pi-coding-agent:/);
+  });
 });

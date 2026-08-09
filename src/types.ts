@@ -198,6 +198,13 @@ export interface AgentModule<TConfig = unknown> {
     config: TConfig;
     common: ChannelCommonContext;
     workingDirectory?: string;
+    /**
+     * Optional list of allowed working-directory roots. When present and
+     * non-empty, `workingDirectory` overrides must resolve inside one of the
+     * roots; when absent/empty the provider is permissive. Provider-specific
+     * enforcement applies (local realpath for Pi, lexical-only for OpenCode).
+     */
+    allowedWorkingDirectoryRoots?: string[];
   }): Promise<{
     agentSessionId: string;
     agentAdapter: AgentAdapter;
@@ -207,6 +214,7 @@ export interface AgentModule<TConfig = unknown> {
     common: ChannelCommonContext;
     agentSessionId: string;
     workingDirectory?: string;
+    allowedWorkingDirectoryRoots?: string[];
   }): Promise<AgentAdapter>;
 }
 
@@ -281,6 +289,12 @@ export interface ChannelConfig {
 
 export interface AppDefaults {
   agentIdleTimeoutMs: number;
+  /**
+   * Optional allowlist of working-directory roots for `/new <path>`. When
+   * configured (non-empty), each override must resolve inside one of these
+   * roots; when absent or empty the bridge is permissive.
+   */
+  allowedWorkingDirectoryRoots?: string[];
 }
 
 export interface AppConfig {
@@ -297,6 +311,7 @@ export interface GatewayCoreOptions {
   agentModule: AgentModule<any>;
   agentConfig: AgentConfig["config"];
   agentIdleTimeoutMs: number;
+  allowedWorkingDirectoryRoots?: string[];
   bindingStore?: SessionBindingStore;
   common?: ChannelCommonContext;
 }

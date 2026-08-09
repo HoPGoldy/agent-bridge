@@ -187,6 +187,16 @@ describe("OpenCode agent module", () => {
       expect(apiConfigs[0]?.directory).toBeUndefined();
     });
 
+    it("passes a relative override through to the server when no allowlist is configured", async () => {
+      const { module, apiConfigs } = recordingModule();
+      const config = { baseUrl: "http://127.0.0.1:4096" };
+
+      await module.createAgentSession({ config, common, workingDirectory: "./project-a" });
+
+      expect(apiConfigs).toHaveLength(1);
+      expect(apiConfigs[0]?.directory).toBe("./project-a");
+    });
+
     it("creates independent runtimes and APIs for different directories", async () => {
       const { module, apiConfigs } = recordingModule();
       const config = { baseUrl: "http://127.0.0.1:4096" };
@@ -228,6 +238,236 @@ describe("OpenCode agent module", () => {
       expect(apis[0]?.getSession).toHaveBeenCalledWith("session-1");
       expect(apis[0]?.getMessages).toHaveBeenCalledWith("session-1", 50);
       expect(config.directory).toBeUndefined();
+    });
+  });
+
+  describe("working directory allowlist", () => {
+    function recordingModule(): {
+      module: ReturnType<typeof createOpenCodeAgentModule>;
+      apiConfigs: OpenCodeAgentConfig[];
+    } {
+      const apiConfigs: OpenCodeAgentConfig[] = [];
+      const module = createOpenCodeAgentModule({
+        apiFactory: (config) => {
+          apiConfigs.push(config);
+          return createApi();
+        },
+      });
+      return { module, apiConfigs };
+    }
+
+    it("allows an override equal to an allowed root", async () => {
+      const { module, apiConfigs } = recordingModule();
+      const config = { baseUrl: "http://127.0.0.1:4096" };
+
+      await module.createAgentSession({
+        config,
+        common,
+        workingDirectory: "/srv/projects",
+        allowedWorkingDirectoryRoots: ["/srv/projects"],
+      });
+
+      expect(apiConfigs[0]?.directory).toBe("/srv/projects");
+    });
+
+    it("allows a strict descendant of an allowed root", async () => {
+      const { module, apiConfigs } = recordingModule();
+      const config = { baseUrl: "http://127.0.0.1:4096" };
+
+      await module.createAgentSession({
+        config,
+        common,
+        workingDirectory: "/srv/projects/project-a/sub",
+        allowedWorkingDirectoryRoots: ["/srv/projects"],
+      });
+
+      expect(apiConfigs[0]?.directory).toBe("/srv/projects/project-a/sub");
+    });
+
+    it("rejects an override outside the allowed roots", async () => {
+      const { module, apiConfigs } = recordingModule();
+      const config = { baseUrl: "http://127.0.0.1:4096" };
+
+      await expect(
+        module.createAgentSession({
+          config,
+          common,
+          workingDirectory: "/etc",
+          allowedWorkingDirectoryRoots: ["/srv/projects"],
+        }),
+      ).rejects.toThrow(/not inside an allowed root/);
+      expect(apiConfigs).toHaveLength(0);
+    });
+
+    it("rejects a sibling-prefix root bypass (root /srv/work vs target /srv/work2)", async () => {
+      const { module } = recordingModule();
+      const config = { baseUrl: "http://127.0.0.1:4096" };
+
+      await expect(
+        module.createAgentSession({
+          config,
+          common,
+          workingDirectory: "/srv/work2/project",
+          allowedWorkingDirectoryRoots: ["/srv/work"],
+        }),
+      ).rejects.toThrow(/not inside an allowed root/);
+    });
+
+    it("rejects a .. escape that lexically leaves the root", async () => {
+      const { module } = recordingModule();
+      const config = { baseUrl: "http://127.0.0.1:4096" };
+
+      await expect(
+        module.createAgentSession({
+          config,
+          common,
+          workingDirectory: "/srv/projects/project-a/../../etc",
+          allowedWorkingDirectoryRoots: ["/srv/projects"],
+        }),
+      ).rejects.toThrow(/not inside an allowed root/);
+    });
+
+    it("allows when any of multiple roots matches", async () => {
+      const { module, apiConfigs } = recordingModule();
+      const config = { baseUrl: "http://127.0.0.1:4096" };
+
+      await module.createAgentSession({
+        config,
+        common,
+        workingDirectory: "/home/me/work/project",
+        allowedWorkingDirectoryRoots: ["/srv/projects", "/home/me/work"],
+      });
+
+      expect(apiConfigs[0]?.directory).toBe("/home/me/work/project");
+    });
+
+    it("is permissive with an empty allowlist", async () => {
+      const { module, apiConfigs } = recordingModule();
+      const config = { baseUrl: "http://127.0.0.1:4096" };
+
+      await module.createAgentSession({
+        config,
+        common,
+        workingDirectory: "/anywhere",
+        allowedWorkingDirectoryRoots: [],
+      });
+
+      expect(apiConfigs[0]?.directory).toBe("/anywhere");
+    });
+
+    it("never checks a bare /new even when roots are configured", async () => {
+      const { module, apiConfigs } = recordingModule();
+      const config = { baseUrl: "http://127.0.0.1:4096", directory: "/srv/configured" };
+
+      await module.createAgentSession({
+        config,
+        common,
+        allowedWorkingDirectoryRoots: ["/srv/projects"],
+      });
+
+      expect(apiConfigs[0]?.directory).toBe("/srv/configured");
+    });
+
+    it("enforces consistently on create and resume", async () => {
+      const { module, apiConfigs } = recordingModule();
+      const config = { baseUrl: "http://127.0.0.1:4096" };
+
+      const created = await module.createAgentSession({
+        config,
+        common,
+        workingDirectory: "/srv/projects/project-a",
+        allowedWorkingDirectoryRoots: ["/srv/projects"],
+      });
+      await module.resumeAgentSession?.({
+        config,
+        common,
+        agentSessionId: created.agentSessionId,
+        workingDirectory: "/srv/projects/project-a",
+        allowedWorkingDirectoryRoots: ["/srv/projects"],
+      });
+
+      expect(apiConfigs).toHaveLength(1);
+      expect(apiConfigs[0]?.directory).toBe("/srv/projects/project-a");
+
+      await expect(
+        module.createAgentSession({
+          config,
+          common,
+          workingDirectory: "/outside",
+          allowedWorkingDirectoryRoots: ["/srv/projects"],
+        }),
+      ).rejects.toThrow(/not inside an allowed root/);
+      await expect(
+        module.resumeAgentSession?.({
+          config,
+          common,
+          agentSessionId: "opencode:session-1",
+          workingDirectory: "/outside",
+          allowedWorkingDirectoryRoots: ["/srv/projects"],
+        }),
+      ).rejects.toThrow(/not inside an allowed root/);
+    });
+
+    it("rejects a relative override when an allowlist is configured (fail closed)", async () => {
+      const { module, apiConfigs } = recordingModule();
+      const config = { baseUrl: "http://127.0.0.1:4096" };
+
+      await expect(
+        module.createAgentSession({
+          config,
+          common,
+          workingDirectory: "relative/project",
+          allowedWorkingDirectoryRoots: ["/srv/projects"],
+        }),
+      ).rejects.toThrow(/must be an absolute path/);
+
+      await expect(
+        module.resumeAgentSession?.({
+          config,
+          common,
+          agentSessionId: "opencode:session-1",
+          workingDirectory: "relative/project",
+          allowedWorkingDirectoryRoots: ["/srv/projects"],
+        }),
+      ).rejects.toThrow(/must be an absolute path/);
+
+      expect(apiConfigs).toHaveLength(0);
+    });
+
+    it("allows child names that start with two dots (e.g. ..foo, ...) inside a root", async () => {
+      const { module, apiConfigs } = recordingModule();
+      const config = { baseUrl: "http://127.0.0.1:4096" };
+
+      await module.createAgentSession({
+        config,
+        common,
+        workingDirectory: "/srv/projects/..foo",
+        allowedWorkingDirectoryRoots: ["/srv/projects"],
+      });
+      await module.createAgentSession({
+        config,
+        common,
+        workingDirectory: "/srv/projects/...",
+        allowedWorkingDirectoryRoots: ["/srv/projects"],
+      });
+
+      expect(apiConfigs.map((c) => c.directory)).toEqual(["/srv/projects/..foo", "/srv/projects/..."]);
+    });
+
+    it("does not rewrite the directory sent to the server (lexical check only)", async () => {
+      const { module, apiConfigs } = recordingModule();
+      const config = { baseUrl: "http://127.0.0.1:4096" };
+
+      // path.resolve collapses the segment to /srv/projects/project-a for the
+      // boundary check, but the value forwarded to the server stays trimmed.
+      await module.createAgentSession({
+        config,
+        common,
+        workingDirectory: "/srv/projects/./project-a",
+        allowedWorkingDirectoryRoots: ["/srv/projects"],
+      });
+
+      expect(apiConfigs[0]?.directory).toBe("/srv/projects/./project-a");
     });
   });
 });

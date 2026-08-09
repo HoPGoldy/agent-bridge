@@ -23,6 +23,7 @@ export class GatewayCore {
   readonly #agentModule: GatewayCoreOptions["agentModule"];
   readonly #agentConfig: GatewayCoreOptions["agentConfig"];
   readonly #agentIdleTimeoutMs: number;
+  readonly #allowedWorkingDirectoryRoots?: string[];
   readonly #bindingStore: GatewayCoreOptions["bindingStore"];
   readonly #common?: ChannelCommonContext;
   readonly #t: Translator;
@@ -40,11 +41,12 @@ export class GatewayCore {
   #persistTail: Promise<void> = Promise.resolve();
   #started = false;
 
-  constructor({ imAdapter, agentModule, agentConfig, agentIdleTimeoutMs, bindingStore, common }: GatewayCoreOptions) {
+  constructor({ imAdapter, agentModule, agentConfig, agentIdleTimeoutMs, allowedWorkingDirectoryRoots, bindingStore, common }: GatewayCoreOptions) {
     this.#imAdapter = imAdapter;
     this.#agentModule = agentModule;
     this.#agentConfig = agentConfig;
     this.#agentIdleTimeoutMs = agentIdleTimeoutMs;
+    this.#allowedWorkingDirectoryRoots = allowedWorkingDirectoryRoots;
     this.#bindingStore = bindingStore;
     this.#common = common;
     this.#t = getTranslatorForCommon(common);
@@ -424,6 +426,9 @@ export class GatewayCore {
         common: this.#common ?? { channelName: "", language: "en-US" },
         agentSessionId: binding.agentSessionId,
         ...(binding.workingDirectory !== undefined ? { workingDirectory: binding.workingDirectory } : {}),
+        ...(this.#allowedWorkingDirectoryRoots !== undefined
+          ? { allowedWorkingDirectoryRoots: this.#allowedWorkingDirectoryRoots }
+          : {}),
       });
       try {
         return await this.#startRuntime(clientSessionId, binding.agentSessionId, agentAdapter);
@@ -457,6 +462,9 @@ export class GatewayCore {
       config: this.#agentConfig,
       common: this.#common ?? { channelName: "", language: "en-US" },
       ...(workingDirectory !== undefined ? { workingDirectory } : {}),
+      ...(this.#allowedWorkingDirectoryRoots !== undefined
+        ? { allowedWorkingDirectoryRoots: this.#allowedWorkingDirectoryRoots }
+        : {}),
     });
     try {
       return await this.#startRuntime(clientSessionId, agentSessionId, agentAdapter);

@@ -797,6 +797,148 @@ describe("GatewayCore", () => {
     });
   });
 
+  it("passes the configured roots into createAgentSession and keeps the old session when the allowlist rejects /new", async () => {
+    const imAdapter = new FakeIMAdapter();
+    const bindingStore = new FakeBindingStore();
+    const createdAdapters: FakeAgentAdapter[] = [];
+    const createCalls: Array<{ workingDirectory?: string; allowedWorkingDirectoryRoots?: string[] }> = [];
+
+    // Fake module enforcing the same contract the real providers implement:
+    // a user-supplied workingDirectory must resolve inside an allowed root.
+    const agentModule: AgentModule<Record<string, never>> = {
+      type: "fake",
+      async createAgentSession(args) {
+        createCalls.push({
+          workingDirectory: args.workingDirectory,
+          allowedWorkingDirectoryRoots: args.allowedWorkingDirectoryRoots,
+        });
+        const roots = args.allowedWorkingDirectoryRoots ?? [];
+        const wd = args.workingDirectory;
+        if (wd !== undefined && roots.length > 0) {
+          const allowed = roots.some(
+            (root) => wd === root || wd.startsWith(`${root.replace(/\/+$/, "")}/`),
+          );
+          if (!allowed) {
+            throw new Error(`working directory "${wd}" is not inside an allowed root`);
+          }
+        }
+        const agentAdapter = new FakeAgentAdapter(`agent-${createdAdapters.length + 1}`);
+        createdAdapters.push(agentAdapter);
+        return { agentSessionId: `agent-${createdAdapters.length}`, agentAdapter };
+      },
+    };
+
+    const core = new GatewayCore({
+      imAdapter,
+      agentModule,
+      agentConfig: {},
+      agentIdleTimeoutMs: 60_000,
+      allowedWorkingDirectoryRoots: ["/tmp/allowed"],
+      bindingStore,
+    });
+    running.push(core);
+    await core.start();
+
+    // Bare /new (no workingDirectory) is not allowlist-checked and succeeds.
+    await imAdapter.emit({
+      type: "command.session.new",
+      clientSessionId: "client-1",
+    });
+    await waitFor(() => {
+      expect(createdAdapters).toHaveLength(1);
+    });
+    expect(createCalls[0]!.workingDirectory).toBeUndefined();
+    expect(createCalls[0]!.allowedWorkingDirectoryRoots).toEqual(["/tmp/allowed"]);
+
+    // The out-of-root override is rejected before any teardown of the old session.
+    await imAdapter.emit({
+      type: "command.session.new",
+      clientSessionId: "client-1",
+      workingDirectory: "/tmp/outside",
+    });
+
+    await waitFor(() => {
+      expect(createdAdapters).toHaveLength(1);
+      expect(createdAdapters[0]!.stopCount).toBe(0);
+      expect(bindingStore.saved.at(-1)).toEqual({
+        "client-1": { agentSessionId: "agent-1" },
+      });
+      expect(
+        imAdapter.outputs.some(
+          (event) =>
+            event.type === "assistant.message" &&
+            event.text.includes("Failed to start a new session") &&
+            event.text.includes("not inside an allowed root"),
+        ),
+      ).toBe(true);
+    });
+    expect(createCalls[1]!.workingDirectory).toBe("/tmp/outside");
+    expect(createCalls[1]!.allowedWorkingDirectoryRoots).toEqual(["/tmp/allowed"]);
+
+    // The old session is still bound and usable after the rejection.
+    await imAdapter.emit({
+      type: "user.message",
+      clientSessionId: "client-1",
+      text: "still here",
+    });
+    await waitFor(() => {
+      expect(createdAdapters[0]!.inputs).toContainEqual({ type: "user.message", text: "still here" });
+    });
+  });
+
+  it("passes the configured roots into resumeAgentSession on restore", async () => {
+    const imAdapter = new FakeIMAdapter();
+    const bindingStore = new FakeBindingStore({
+      "client-1": { agentSessionId: "agent-1", workingDirectory: "/tmp/allowed/project" },
+    });
+    const resumed: Array<{ agentSessionId: string; workingDirectory?: string; allowedWorkingDirectoryRoots?: string[] }> = [];
+
+    const agentModule: AgentModule<Record<string, never>> = {
+      type: "fake",
+      async createAgentSession() {
+        return {
+          agentSessionId: "agent-new",
+          agentAdapter: new FakeAgentAdapter("agent-new"),
+        };
+      },
+      async resumeAgentSession(args) {
+        resumed.push({
+          agentSessionId: args.agentSessionId,
+          workingDirectory: args.workingDirectory,
+          allowedWorkingDirectoryRoots: args.allowedWorkingDirectoryRoots,
+        });
+        return new FakeAgentAdapter(args.agentSessionId);
+      },
+    };
+
+    const core = new GatewayCore({
+      imAdapter,
+      agentModule,
+      agentConfig: {},
+      agentIdleTimeoutMs: 60_000,
+      allowedWorkingDirectoryRoots: ["/tmp/allowed"],
+      bindingStore,
+    });
+    running.push(core);
+    await core.start();
+
+    await imAdapter.emit({
+      type: "user.message",
+      clientSessionId: "client-1",
+      text: "resume me",
+    });
+
+    await waitFor(() => {
+      expect(resumed).toEqual([
+        {
+          agentSessionId: "agent-1",
+          workingDirectory: "/tmp/allowed/project",
+          allowedWorkingDirectoryRoots: ["/tmp/allowed"],
+        },
+      ]);
+    });
+  });
+
   it("continues the /new switch when stopping the previous runtime throws", async () => {
     const imAdapter = new FakeIMAdapter();
     const bindingStore = new FakeBindingStore();

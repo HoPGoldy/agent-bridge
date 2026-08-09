@@ -1,4 +1,5 @@
 import { createHash } from "node:crypto";
+import path from "node:path";
 import { createLogger } from "../../../core/logger";
 import type {
   AgentAdapter,
@@ -88,6 +89,52 @@ function startupCommand(config: OpenCodeAgentConfig): string {
 }
 
 /**
+ * Lexical-only boundary check for a remote/container path override against the
+ * configured allowed roots. The OpenCode Server may run on a different host or
+ * inside a container, so no local filesystem access happens here: both sides
+ * are normalized purely lexically with `path.resolve` and `path.relative`, and
+ * final validation plus symlink resolution is the remote service's
+ * responsibility (documented, not enforced locally).
+ *
+ * Equal paths and strict descendants of any root are allowed; sibling prefixes
+ * (`/srv/work` vs `/srv/work2`) and any `..` escape are rejected, while literal
+ * child names that merely start with two dots (`..foo`, `...`) stay allowed.
+ *
+ * When an allowlist is configured the override must be an absolute path: the
+ * server may be remote, so a relative directory would be resolved against the
+ * server's cwd rather than the bridge's, and the bridge cannot verify it. With
+ * no allowlist configured, relative overrides are allowed and forwarded to the
+ * server unchanged. The returned value is never used to rewrite the directory
+ * sent to the server.
+ */
+function assertAllowedWorkingDirectory(
+  workingDirectory: string,
+  allowedWorkingDirectoryRoots: string[] | undefined,
+): void {
+  const roots = (allowedWorkingDirectoryRoots ?? [])
+    .map((root) => root.trim())
+    .filter((root) => root.length > 0);
+  if (roots.length === 0) return;
+
+  const trimmed = workingDirectory.trim();
+  if (!path.isAbsolute(trimmed)) {
+    throw new Error(
+      `working directory "${trimmed}" must be an absolute path when allowed working directory roots are configured`,
+    );
+  }
+
+  const target = path.resolve(trimmed);
+  for (const rawRoot of roots) {
+    const root = path.resolve(rawRoot);
+    const rel = path.relative(root, target);
+    if (rel === "" || (rel !== ".." && !rel.startsWith(`..${path.sep}`) && !path.isAbsolute(rel))) {
+      return;
+    }
+  }
+  throw new Error(`working directory "${trimmed}" is not inside an allowed root`);
+}
+
+/**
  * Returns a config whose `directory` reflects the per-session working directory
  * override for this lifecycle call, without mutating the shared channel config.
  *
@@ -98,14 +145,18 @@ function startupCommand(config: OpenCodeAgentConfig): string {
  * Gateway's session-new transaction.
  *
  * An empty/whitespace override is treated as "no override", falling back to the
- * channel-level `directory` (or the agent-bridge process cwd).
+ * channel-level `directory` (or the agent-bridge process cwd). The allowlist is
+ * enforced only for user-supplied overrides; the channel-level configured
+ * directory and a bare `/new` are never checked.
  */
 function withWorkingDirectory(
   config: OpenCodeAgentConfig,
   workingDirectory: string | undefined,
+  allowedWorkingDirectoryRoots: string[] | undefined,
 ): OpenCodeAgentConfig {
   const trimmed = workingDirectory?.trim();
   if (!trimmed) return config;
+  assertAllowedWorkingDirectory(trimmed, allowedWorkingDirectoryRoots);
   return { ...config, directory: trimmed };
 }
 
@@ -270,8 +321,8 @@ export function createOpenCodeAgentModule(dependencies: OpenCodeModuleDependenci
     type: "opencode",
     createConfigCollector: () => createOpenCodeConfigCollector(apiFactory, writeLine),
 
-    async createAgentSession({ config, common, workingDirectory }) {
-      const effective = withWorkingDirectory(config, workingDirectory);
+    async createAgentSession({ config, common, workingDirectory, allowedWorkingDirectoryRoots }) {
+      const effective = withWorkingDirectory(config, workingDirectory, allowedWorkingDirectoryRoots);
       const runtime = getRuntime(common.channelName, effective);
       const configuredModel = parseConfiguredModel(effective.model);
       const session = await runtime.api.createSession({
@@ -287,9 +338,9 @@ export function createOpenCodeAgentModule(dependencies: OpenCodeModuleDependenci
       };
     },
 
-    async resumeAgentSession({ config, common, agentSessionId, workingDirectory }) {
+    async resumeAgentSession({ config, common, agentSessionId, workingDirectory, allowedWorkingDirectoryRoots }) {
       const sessionID = openCodeSessionId(agentSessionId);
-      const effective = withWorkingDirectory(config, workingDirectory);
+      const effective = withWorkingDirectory(config, workingDirectory, allowedWorkingDirectoryRoots);
       const runtime = getRuntime(common.channelName, effective);
       const [session, messages] = await Promise.all([
         runtime.api.getSession(sessionID),
