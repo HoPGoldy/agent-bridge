@@ -194,7 +194,11 @@ export interface ClientModule<TConfig = unknown> {
 export interface AgentModule<TConfig = unknown> {
   readonly type: string;
   createConfigCollector?: () => ConfigAdapter<TConfig>;
-  createAgentSession(args: { config: TConfig; common: ChannelCommonContext }): Promise<{
+  createAgentSession(args: {
+    config: TConfig;
+    common: ChannelCommonContext;
+    workingDirectory?: string;
+  }): Promise<{
     agentSessionId: string;
     agentAdapter: AgentAdapter;
   }>;
@@ -202,6 +206,7 @@ export interface AgentModule<TConfig = unknown> {
     config: TConfig;
     common: ChannelCommonContext;
     agentSessionId: string;
+    workingDirectory?: string;
   }): Promise<AgentAdapter>;
 }
 
@@ -296,9 +301,14 @@ export interface GatewayCoreOptions {
   common?: ChannelCommonContext;
 }
 
+export interface SessionBinding {
+  agentSessionId: string;
+  workingDirectory?: string;
+}
+
 export interface SessionBindingStore {
-  load(): Promise<Record<string, string>>;
-  save(bindings: Record<string, string>): Promise<void>;
+  load(): Promise<Record<string, SessionBinding>>;
+  save(bindings: Record<string, SessionBinding>): Promise<void>;
 }
 
 export interface RunChannelOptions {
