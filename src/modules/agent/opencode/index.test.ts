@@ -1,6 +1,6 @@
 import { describe, expect, it, vi } from "vitest";
 import type { Session } from "@opencode-ai/sdk/v2/types";
-import type { ConfigCollectContext } from "../../../types";
+import type { ConfigCollectContext, OpenCodeAgentConfig } from "../../../types";
 import { createOpenCodeAgentModule } from "./index";
 import type { OpenCodeApi } from "./adapter/opencode-api";
 
@@ -126,5 +126,108 @@ describe("OpenCode agent module", () => {
     await expect(
       collector?.validate({ baseUrl: "http://user:password@127.0.0.1:4096" }),
     ).rejects.toThrow("Do not include credentials");
+  });
+
+  describe("working directory override", () => {
+    function recordingModule(): {
+      module: ReturnType<typeof createOpenCodeAgentModule>;
+      apiConfigs: OpenCodeAgentConfig[];
+      apis: OpenCodeApi[];
+    } {
+      const apiConfigs: OpenCodeAgentConfig[] = [];
+      const apis: OpenCodeApi[] = [];
+      const module = createOpenCodeAgentModule({
+        apiFactory: (config) => {
+          apiConfigs.push(config);
+          const api = createApi();
+          apis.push(api);
+          return api;
+        },
+      });
+      return { module, apiConfigs, apis };
+    }
+
+    it("passes the override into the api factory and createSession without mutating the shared config", async () => {
+      const { module, apiConfigs, apis } = recordingModule();
+      const config = { baseUrl: "http://127.0.0.1:4096", model: "anthropic/sonnet" };
+
+      const created = await module.createAgentSession({ config, common, workingDirectory: "/srv/project-a" });
+
+      expect(created.agentSessionId).toBe("opencode:session-1");
+      expect(apiConfigs).toHaveLength(1);
+      expect(apiConfigs[0]?.directory).toBe("/srv/project-a");
+      expect(apis[0]?.createSession).toHaveBeenCalledWith({
+        title: "agent-bridge:test",
+        agent: undefined,
+        model: { providerID: "anthropic", modelID: "sonnet" },
+      });
+      expect(config.directory).toBeUndefined();
+    });
+
+    it("keeps the channel directory when no override is given", async () => {
+      const { module, apiConfigs } = recordingModule();
+      const config = { baseUrl: "http://127.0.0.1:4096", directory: "/srv/default" };
+
+      await module.createAgentSession({ config, common });
+
+      expect(apiConfigs).toHaveLength(1);
+      expect(apiConfigs[0]?.directory).toBe("/srv/default");
+      // No override short-circuits without copying, so the shared config is
+      // passed through untouched (and therefore cannot have been mutated).
+      expect(apiConfigs[0]).toBe(config);
+    });
+
+    it("treats a whitespace-only override as no override", async () => {
+      const { module, apiConfigs } = recordingModule();
+      const config = { baseUrl: "http://127.0.0.1:4096" };
+
+      await module.createAgentSession({ config, common, workingDirectory: "   " });
+
+      expect(apiConfigs).toHaveLength(1);
+      expect(apiConfigs[0]?.directory).toBeUndefined();
+    });
+
+    it("creates independent runtimes and APIs for different directories", async () => {
+      const { module, apiConfigs } = recordingModule();
+      const config = { baseUrl: "http://127.0.0.1:4096" };
+
+      const first = await module.createAgentSession({ config, common, workingDirectory: "/srv/a" });
+      const second = await module.createAgentSession({ config, common, workingDirectory: "/srv/b" });
+
+      expect(first.agentSessionId).toBe("opencode:session-1");
+      expect(second.agentSessionId).toBe("opencode:session-1");
+      expect(apiConfigs.map((c) => c.directory)).toEqual(["/srv/a", "/srv/b"]);
+    });
+
+    it("reuses the runtime and API for the same directory", async () => {
+      const { module, apiConfigs, apis } = recordingModule();
+      const config = { baseUrl: "http://127.0.0.1:4096" };
+
+      await module.createAgentSession({ config, common, workingDirectory: "/srv/a" });
+      await module.createAgentSession({ config, common, workingDirectory: "/srv/a" });
+
+      expect(apiConfigs).toHaveLength(1);
+      expect(apis).toHaveLength(1);
+    });
+
+    it("resumes through the runtime bound to the persisted override directory", async () => {
+      const { module, apiConfigs, apis } = recordingModule();
+      const config = { baseUrl: "http://127.0.0.1:4096" };
+
+      const created = await module.createAgentSession({ config, common, workingDirectory: "/srv/project-a" });
+      const resumed = await module.resumeAgentSession?.({
+        config,
+        common,
+        agentSessionId: created.agentSessionId,
+        workingDirectory: "/srv/project-a",
+      });
+
+      expect(resumed).toBeDefined();
+      expect(apiConfigs).toHaveLength(1);
+      expect(apiConfigs[0]?.directory).toBe("/srv/project-a");
+      expect(apis[0]?.getSession).toHaveBeenCalledWith("session-1");
+      expect(apis[0]?.getMessages).toHaveBeenCalledWith("session-1", 50);
+      expect(config.directory).toBeUndefined();
+    });
   });
 });

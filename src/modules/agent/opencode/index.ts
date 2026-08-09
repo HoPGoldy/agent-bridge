@@ -87,6 +87,28 @@ function startupCommand(config: OpenCodeAgentConfig): string {
   return `${auth}OPENCODE_CONFIG_CONTENT='${PERMISSION_CONFIG}' \\\nopencode serve --hostname ${hostname} --port ${port}`;
 }
 
+/**
+ * Returns a config whose `directory` reflects the per-session working directory
+ * override for this lifecycle call, without mutating the shared channel config.
+ *
+ * The OpenCode Server may run remotely or inside a container, so the override is
+ * only trimmed here: no local filesystem checks and no shell/env/`~` expansion
+ * happen in agent-bridge. The OpenCode Server itself validates the directory
+ * when the session is created or resumed, and errors propagate back through the
+ * Gateway's session-new transaction.
+ *
+ * An empty/whitespace override is treated as "no override", falling back to the
+ * channel-level `directory` (or the agent-bridge process cwd).
+ */
+function withWorkingDirectory(
+  config: OpenCodeAgentConfig,
+  workingDirectory: string | undefined,
+): OpenCodeAgentConfig {
+  const trimmed = workingDirectory?.trim();
+  if (!trimmed) return config;
+  return { ...config, directory: trimmed };
+}
+
 function runtimeKey(channelName: string, config: OpenCodeAgentConfig): string {
   const digest = createHash("sha256")
     .update(config.password ?? "")
@@ -248,35 +270,37 @@ export function createOpenCodeAgentModule(dependencies: OpenCodeModuleDependenci
     type: "opencode",
     createConfigCollector: () => createOpenCodeConfigCollector(apiFactory, writeLine),
 
-    async createAgentSession({ config, common }) {
-      const runtime = getRuntime(common.channelName, config);
-      const configuredModel = parseConfiguredModel(config.model);
+    async createAgentSession({ config, common, workingDirectory }) {
+      const effective = withWorkingDirectory(config, workingDirectory);
+      const runtime = getRuntime(common.channelName, effective);
+      const configuredModel = parseConfiguredModel(effective.model);
       const session = await runtime.api.createSession({
         title: `agent-bridge:${common.channelName}`,
-        agent: config.agent,
+        agent: effective.agent,
         model: configuredModel,
       });
       const agentSessionId = bridgeSessionId(session.id);
       logger.info(`created OpenCode session ${agentSessionId} for channel ${common.channelName}`);
       return {
         agentSessionId,
-        agentAdapter: buildAdapter(config, common.channelName, session.id, currentModelFromSessionData(session, [], config.model)),
+        agentAdapter: buildAdapter(effective, common.channelName, session.id, currentModelFromSessionData(session, [], effective.model)),
       };
     },
 
-    async resumeAgentSession({ config, common, agentSessionId }) {
+    async resumeAgentSession({ config, common, agentSessionId, workingDirectory }) {
       const sessionID = openCodeSessionId(agentSessionId);
-      const runtime = getRuntime(common.channelName, config);
+      const effective = withWorkingDirectory(config, workingDirectory);
+      const runtime = getRuntime(common.channelName, effective);
       const [session, messages] = await Promise.all([
         runtime.api.getSession(sessionID),
         runtime.api.getMessages(sessionID, 50),
       ]);
       logger.info(`resumed OpenCode session ${agentSessionId} for channel ${common.channelName}`);
       return buildAdapter(
-        config,
+        effective,
         common.channelName,
         sessionID,
-        currentModelFromSessionData(session, messages, config.model),
+        currentModelFromSessionData(session, messages, effective.model),
       );
     },
   };
