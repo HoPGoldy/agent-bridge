@@ -38,22 +38,42 @@ function parseModelCommand(text: string, clientSessionId: string): ClientOutputE
   };
 }
 
+function parseNewCommand(text: string, clientSessionId: string): ClientOutputEvent | null {
+  const match = text.match(/^\/(new|n)(?:\s+(.*))?$/i);
+  if (!match) {
+    return null;
+  }
+
+  const workingDirectory = match[2]?.trim();
+  if (!workingDirectory) {
+    return { type: "command.session.new", clientSessionId };
+  }
+
+  return {
+    type: "command.session.new",
+    clientSessionId,
+    workingDirectory,
+  };
+}
+
 /**
  * Parses a trimmed inbound text as one of the standard agent-bridge slash
- * commands (`/new`, `/n`, `/compact`, `/c`, `/stop`, `/s`, `/status`, `/st`, `/model`, `/m`) and returns the
+ * commands (`/new [path]`, `/n [path]`, `/compact`, `/c`, `/stop`, `/s`, `/status`, `/st`, `/model`, `/m`) and returns the
  * corresponding `ClientOutputEvent`, or `null` if `text` is not a recognized
  * command and should be treated as a regular user message.
  */
 export function parseSlashCommand(text: string, clientSessionId: string): ClientOutputEvent | null {
+  const newCommand = parseNewCommand(text, clientSessionId);
+  if (newCommand) {
+    return newCommand;
+  }
+
   const modelCommand = parseModelCommand(text, clientSessionId);
   if (modelCommand) {
     return modelCommand;
   }
 
   switch (text.toLowerCase()) {
-    case "/new":
-    case "/n":
-      return { type: "command.session.new", clientSessionId };
     case "/compact":
     case "/c":
       return { type: "command.session.compact", clientSessionId };

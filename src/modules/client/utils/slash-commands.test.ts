@@ -23,14 +23,84 @@ describe("resolveHelpMarkdown", () => {
 });
 
 describe("parseSlashCommand", () => {
-  it("parses /new and /n into a command.session.new event", () => {
-    expect(parseSlashCommand("/new", "session-1")).toEqual({
+  it("parses /new and /n into a command.session.new event without a workingDirectory key", () => {
+    expect(parseSlashCommand("/new", "session-1")).toStrictEqual({
       type: "command.session.new",
       clientSessionId: "session-1",
     });
-    expect(parseSlashCommand("/n", "session-1")).toEqual({
+    expect(parseSlashCommand("/n", "session-1")).toStrictEqual({
       type: "command.session.new",
       clientSessionId: "session-1",
+    });
+    expect("workingDirectory" in parseSlashCommand("/new", "session-1")!).toBe(false);
+    expect("workingDirectory" in parseSlashCommand("/n", "session-1")!).toBe(false);
+  });
+
+  it("parses /new <path> and /n <path> into a command.session.new event with a working directory", () => {
+    expect(parseSlashCommand("/new /Users/wesley/project", "session-1")).toEqual({
+      type: "command.session.new",
+      clientSessionId: "session-1",
+      workingDirectory: "/Users/wesley/project",
+    });
+    expect(parseSlashCommand("/n /tmp/demo", "session-1")).toEqual({
+      type: "command.session.new",
+      clientSessionId: "session-1",
+      workingDirectory: "/tmp/demo",
+    });
+  });
+
+  it("preserves relative paths as the working directory", () => {
+    expect(parseSlashCommand("/new ./demo", "session-1")).toEqual({
+      type: "command.session.new",
+      clientSessionId: "session-1",
+      workingDirectory: "./demo",
+    });
+    expect(parseSlashCommand("/new ../up", "session-1")).toEqual({
+      type: "command.session.new",
+      clientSessionId: "session-1",
+      workingDirectory: "../up",
+    });
+    expect(parseSlashCommand("/new please", "session-1")).toEqual({
+      type: "command.session.new",
+      clientSessionId: "session-1",
+      workingDirectory: "please",
+    });
+  });
+
+  it("keeps the full tail as a single path including spaces", () => {
+    expect(parseSlashCommand("/new /Users/wesley/My Project", "session-1")).toEqual({
+      type: "command.session.new",
+      clientSessionId: "session-1",
+      workingDirectory: "/Users/wesley/My Project",
+    });
+  });
+
+  it("supports Unicode working directory paths", () => {
+    expect(parseSlashCommand("/new /Users/wesley/中文项目", "session-1")).toEqual({
+      type: "command.session.new",
+      clientSessionId: "session-1",
+      workingDirectory: "/Users/wesley/中文项目",
+    });
+  });
+
+  it("matches the /new command name case-insensitively while preserving path case", () => {
+    expect(parseSlashCommand("/New /Users/Wesley/MyProject", "session-1")).toEqual({
+      type: "command.session.new",
+      clientSessionId: "session-1",
+      workingDirectory: "/Users/Wesley/MyProject",
+    });
+    expect(parseSlashCommand("/N /tmp/Demo", "session-1")).toEqual({
+      type: "command.session.new",
+      clientSessionId: "session-1",
+      workingDirectory: "/tmp/Demo",
+    });
+  });
+
+  it("trims whitespace around the working directory argument", () => {
+    expect(parseSlashCommand("/new   /Users/wesley/project  ", "session-1")).toEqual({
+      type: "command.session.new",
+      clientSessionId: "session-1",
+      workingDirectory: "/Users/wesley/project",
     });
   });
 
@@ -92,7 +162,7 @@ describe("parseSlashCommand", () => {
   });
 
   it("parses supported commands case-insensitively", () => {
-    expect(parseSlashCommand("/New", "session-1")).toEqual({
+    expect(parseSlashCommand("/New", "session-1")).toStrictEqual({
       type: "command.session.new",
       clientSessionId: "session-1",
     });
@@ -134,7 +204,6 @@ describe("parseSlashCommand", () => {
   it("returns null for unrecognized command-like text", () => {
     expect(parseSlashCommand("/help", "session-1")).toBeNull();
     expect(parseSlashCommand("/h", "session-1")).toBeNull();
-    expect(parseSlashCommand("/new please", "session-1")).toBeNull();
     expect(parseSlashCommand("/compact please", "session-1")).toBeNull();
     expect(parseSlashCommand("/status now", "session-1")).toBeNull();
     expect(parseSlashCommand("hello /model anthropic/claude-sonnet-4-5", "session-1")).toBeNull();
