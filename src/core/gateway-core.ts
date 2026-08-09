@@ -95,6 +95,12 @@ export class GatewayCore {
 
     await this.#imAdapter.stop();
 
+    // Best-effort stop pass 1: stop the current runtimes before waiting on the
+    // in-flight handlers. A handler can be blocked inside agentAdapter.input()
+    // (for example a user.message awaiting the agent run); stopping the
+    // adapter aborts/unblocks it, so the drain below cannot hang on it.
+    await this.#stopAllRuntimes();
+
     // Drain-until-quiescent: an already-entered handler (for example a `/new`
     // whose agent create is still pending) can start a new runtime, bind it,
     // and enqueue a binding save while we are waiting. Stopping runtimes or
@@ -108,9 +114,17 @@ export class GatewayCore {
       if (this.#inFlightHandlers.size === 0) break;
     }
 
-    // Best-effort stop of every runtime: a single throwing stop must not
-    // prevent the remaining runtimes from being stopped or the bindings from
-    // being drained.
+    // Best-effort stop pass 2: stop any runtime a handler created while the
+    // drain was waiting (for example a `/new` whose create completed during
+    // stop). A single throwing stop must not prevent the remaining runtimes
+    // from being stopped or the bindings from being drained.
+    await this.#stopAllRuntimes();
+
+    await this.#drainPersist();
+  }
+
+  /** Best-effort stop of every tracked runtime; a throwing stop cannot prevent the rest. */
+  async #stopAllRuntimes(): Promise<void> {
     const runtimes = [...this.#agentRuntimes.values()];
     const results = await Promise.allSettled(runtimes.map((runtime) => this.#stopRuntime(runtime)));
     for (const result of results) {
@@ -118,8 +132,6 @@ export class GatewayCore {
         this.#logger.error("failed to stop agent session:", result.reason);
       }
     }
-
-    await this.#drainPersist();
   }
 
   async #handleClientOutput(event: ClientOutputEvent): Promise<void> {
@@ -421,30 +433,49 @@ export class GatewayCore {
     }
 
     if (this.#agentModule.resumeAgentSession) {
-      const agentAdapter = await this.#agentModule.resumeAgentSession({
-        config: this.#agentConfig,
-        common: this.#common ?? { channelName: "", language: "en-US" },
-        agentSessionId: binding.agentSessionId,
-        ...(binding.workingDirectory !== undefined ? { workingDirectory: binding.workingDirectory } : {}),
-        ...(this.#allowedWorkingDirectoryRoots !== undefined
-          ? { allowedWorkingDirectoryRoots: this.#allowedWorkingDirectoryRoots }
-          : {}),
-      });
       try {
-        return await this.#startRuntime(clientSessionId, binding.agentSessionId, agentAdapter);
-      } catch (error) {
-        // Mirror #createRuntimeForClient: a partially started resumed adapter
-        // must be cleaned up best-effort and the persisted binding must stay
-        // untouched so a later message can retry the restore.
-        this.#logger.error(`resumed agent session ${binding.agentSessionId} failed to start, cleaning up:`, error);
+        const agentAdapter = await this.#agentModule.resumeAgentSession({
+          config: this.#agentConfig,
+          common: this.#common ?? { channelName: "", language: "en-US" },
+          agentSessionId: binding.agentSessionId,
+          ...(binding.workingDirectory !== undefined ? { workingDirectory: binding.workingDirectory } : {}),
+          ...(this.#allowedWorkingDirectoryRoots !== undefined
+            ? { allowedWorkingDirectoryRoots: this.#allowedWorkingDirectoryRoots }
+            : {}),
+        });
         try {
-          await agentAdapter.stop();
-        } catch (stopError) {
-          this.#logger.error(
-            `failed to stop partially resumed agent adapter ${binding.agentSessionId}:`,
-            stopError,
-          );
+          return await this.#startRuntime(clientSessionId, binding.agentSessionId, agentAdapter);
+        } catch (error) {
+          // Mirror #createRuntimeForClient: a partially started resumed adapter
+          // must be cleaned up best-effort and the persisted binding must stay
+          // untouched so a later message can retry the restore.
+          this.#logger.error(`resumed agent session ${binding.agentSessionId} failed to start, cleaning up:`, error);
+          try {
+            await agentAdapter.stop();
+          } catch (stopError) {
+            this.#logger.error(
+              `failed to stop partially resumed agent adapter ${binding.agentSessionId}:`,
+              stopError,
+            );
+          }
+          throw error;
         }
+      } catch (error) {
+        // The user asked the agent for work and got silence: surface a
+        // localized failure with the detail and a `/new` hint. The persisted
+        // binding is intentionally kept so the session can be retried once the
+        // configuration is fixed, and exactly one message is delivered for a
+        // single failed resume.
+        const detail = error instanceof Error ? error.message : String(error);
+        this.#logger.error(
+          `failed to resume agent session ${binding.agentSessionId} for client ${clientSessionId}:`,
+          error,
+        );
+        await this.#deliverClientInput({
+          type: "assistant.message",
+          clientSessionId,
+          text: this.#t("gateway.failedToResumeSession", { detail }),
+        });
         throw error;
       }
     }

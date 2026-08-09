@@ -212,6 +212,35 @@ class KeepCallbackOnStopAdapter extends FakeIMAdapter {
   }
 }
 
+/**
+ * FakeAgentAdapter whose input() blocks until stop() releases it, simulating a
+ * user.message handler waiting on a long-running agent turn.
+ */
+class BlockingInputAdapter extends FakeAgentAdapter {
+  #releaseInput: (() => void) | null = null;
+  inputEntered = 0;
+  inputResolved = 0;
+
+  async input(event: AgentInputEvent): Promise<void> {
+    this.inputs.push(event);
+    this.inputEntered += 1;
+    await new Promise<void>((resolve) => {
+      this.#releaseInput = resolve;
+    });
+    this.inputResolved += 1;
+  }
+
+  releaseInput(): void {
+    this.#releaseInput?.();
+    this.#releaseInput = null;
+  }
+
+  async stop(): Promise<void> {
+    await super.stop();
+    this.releaseInput();
+  }
+}
+
 describe("GatewayCore", () => {
   const running: Array<{ stop: () => Promise<void> }> = [];
 
@@ -1292,6 +1321,210 @@ describe("GatewayCore", () => {
     });
   });
 
+  it("unblocks an in-flight user message during stop by stopping its adapter", async () => {
+    const imAdapter = new FakeIMAdapter();
+    const adapter = new BlockingInputAdapter("agent-1");
+
+    const agentModule: AgentModule<Record<string, never>> = {
+      type: "fake",
+      async createAgentSession() {
+        return { agentSessionId: adapter.agentSessionId, agentAdapter: adapter };
+      },
+    };
+
+    const core = new GatewayCore({
+      imAdapter,
+      agentModule,
+      agentConfig: {},
+      agentIdleTimeoutMs: 60_000,
+    });
+    running.push(core);
+    await core.start();
+
+    // The user message handler enters and blocks inside agentAdapter.input().
+    const messageEmit = imAdapter.emit({
+      type: "user.message",
+      clientSessionId: "client-1",
+      text: "hello",
+    });
+    await waitFor(() => {
+      expect(adapter.inputEntered).toBe(1);
+    });
+
+    // stop() must not wait forever on the blocked handler: it stops the
+    // adapter first, which unblocks input() and lets the handler settle.
+    await core.stop();
+    expect(adapter.stopCount).toBe(1);
+
+    await messageEmit;
+    expect(adapter.inputResolved).toBe(1);
+  });
+
+  it("replies with a localized resume-failure message and keeps the binding when resume throws", async () => {
+    const imAdapter = new FakeIMAdapter();
+    const bindingStore = new FakeBindingStore({
+      "client-1": { agentSessionId: "agent-1", workingDirectory: "/tmp/project-a" },
+    });
+    let resumeCalls = 0;
+
+    const agentModule: AgentModule<Record<string, never>> = {
+      type: "fake",
+      async createAgentSession() {
+        return { agentSessionId: "agent-new", agentAdapter: new FakeAgentAdapter("agent-new") };
+      },
+      async resumeAgentSession() {
+        resumeCalls += 1;
+        throw new Error("resume boom");
+      },
+    };
+
+    const core = new GatewayCore({
+      imAdapter,
+      agentModule,
+      agentConfig: {},
+      agentIdleTimeoutMs: 60_000,
+      bindingStore,
+    });
+    running.push(core);
+    await core.start();
+
+    await imAdapter.emit({
+      type: "user.message",
+      clientSessionId: "client-1",
+      text: "hello",
+    });
+
+    await waitFor(() => {
+      expect(imAdapter.outputs).toContainEqual({
+        type: "assistant.message",
+        clientSessionId: "client-1",
+        text: "Failed to resume the agent session: resume boom\nStart a new session with `/new`.",
+      });
+    });
+
+    // Exactly one reply is delivered for this single failure.
+    const replies = imAdapter.outputs.filter(
+      (event) => event.type === "assistant.message" && event.clientSessionId === "client-1",
+    );
+    expect(replies).toHaveLength(1);
+
+    // The persisted binding is untouched so a later message retries the restore.
+    expect(bindingStore.saved).toHaveLength(0);
+    expect(bindingStore.initial).toEqual({
+      "client-1": { agentSessionId: "agent-1", workingDirectory: "/tmp/project-a" },
+    });
+    expect(resumeCalls).toBe(1);
+  });
+
+  it("replies with a localized resume-failure message when /status hits a failing restore", async () => {
+    const imAdapter = new FakeIMAdapter();
+    const bindingStore = new FakeBindingStore({ "client-1": "agent-1" });
+
+    const agentModule: AgentModule<Record<string, never>> = {
+      type: "fake",
+      async createAgentSession() {
+        return { agentSessionId: "agent-new", agentAdapter: new FakeAgentAdapter("agent-new") };
+      },
+      async resumeAgentSession() {
+        throw new Error("resume status boom");
+      },
+    };
+
+    const core = new GatewayCore({
+      imAdapter,
+      agentModule,
+      agentConfig: {},
+      agentIdleTimeoutMs: 60_000,
+      bindingStore,
+      common: {
+        channelName: "demo-channel",
+        language: "zh-CN",
+      },
+    });
+    running.push(core);
+    await core.start();
+
+    await imAdapter.emit({
+      type: "command.session.status",
+      clientSessionId: "client-1",
+    });
+
+    await waitFor(() => {
+      expect(imAdapter.outputs).toContainEqual({
+        type: "assistant.message",
+        clientSessionId: "client-1",
+        text: "恢复智能体会话失败：resume status boom\n请使用 `/new` 开始新会话。",
+      });
+    });
+
+    // The generic status-unavailable error must not also be emitted for the
+    // same failure.
+    expect(
+      imAdapter.outputs.some((event) => event.type === "error" && event.kind === "agent.status.unavailable"),
+    ).toBe(false);
+  });
+
+  it("replies with a localized resume-failure message when /compact hits a failing restore", async () => {
+    const imAdapter = new FakeIMAdapter();
+    const bindingStore = new FakeBindingStore({
+      "client-1": { agentSessionId: "agent-1", workingDirectory: "/tmp/project-a" },
+    });
+    let resumeCalls = 0;
+
+    const agentModule: AgentModule<Record<string, never>> = {
+      type: "fake",
+      async createAgentSession() {
+        return { agentSessionId: "agent-new", agentAdapter: new FakeAgentAdapter("agent-new") };
+      },
+      async resumeAgentSession() {
+        resumeCalls += 1;
+        throw new Error("resume compact boom");
+      },
+    };
+
+    const core = new GatewayCore({
+      imAdapter,
+      agentModule,
+      agentConfig: {},
+      agentIdleTimeoutMs: 60_000,
+      bindingStore,
+    });
+    running.push(core);
+    await core.start();
+
+    await imAdapter.emit({
+      type: "command.session.compact",
+      clientSessionId: "client-1",
+    });
+
+    await waitFor(() => {
+      expect(imAdapter.outputs).toContainEqual({
+        type: "assistant.message",
+        clientSessionId: "client-1",
+        text: "Failed to resume the agent session: resume compact boom\nStart a new session with `/new`.",
+      });
+    });
+
+    // Exactly one reply is delivered for this single failure: the compact
+    // command must not additionally fall through to the no-active-session
+    // message or emit any error event.
+    const replies = imAdapter.outputs.filter(
+      (event) => event.type === "assistant.message" && event.clientSessionId === "client-1",
+    );
+    expect(replies).toHaveLength(1);
+    expect(
+      imAdapter.outputs.some((event) => event.text === "No active agent session to compact."),
+    ).toBe(false);
+
+    // The persisted binding is untouched: no save happened and the loaded
+    // mapping is unchanged.
+    expect(bindingStore.saved).toHaveLength(0);
+    expect(bindingStore.initial).toEqual({
+      "client-1": { agentSessionId: "agent-1", workingDirectory: "/tmp/project-a" },
+    });
+    expect(resumeCalls).toBe(1);
+  });
+
   it("cleans up a partially started resumed adapter and keeps the persisted binding", async () => {
     const imAdapter = new FakeIMAdapter();
     const bindingStore = new FakeBindingStore({
@@ -1332,6 +1565,20 @@ describe("GatewayCore", () => {
       expect(resumedAdapters).toHaveLength(1);
       expect(resumedAdapters[0]!.stopCount).toBe(1);
     });
+
+    // The user receives the localized resume-failure message with the detail
+    // and a /new hint, and no other reply is delivered for this failure.
+    await waitFor(() => {
+      expect(imAdapter.outputs).toContainEqual({
+        type: "assistant.message",
+        clientSessionId: "client-1",
+        text: "Failed to resume the agent session: resume start boom\nStart a new session with `/new`.",
+      });
+    });
+    const replies = imAdapter.outputs.filter(
+      (event) => event.type === "assistant.message" && event.clientSessionId === "client-1",
+    );
+    expect(replies).toHaveLength(1);
 
     // The persisted binding is untouched: no save happened and the loaded
     // mapping is unchanged.

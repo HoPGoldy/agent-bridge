@@ -18,6 +18,12 @@ describe("i18n", () => {
     expect(zh("client.helpMessage")).toContain("/new [path]");
     expect(zh("client.helpMessage")).toContain("/n [path]");
     expect(zh("client.helpMessage")).toContain("/new /path/to/project");
+    expect(en("gateway.failedToResumeSession", { detail: "boom" })).toBe(
+      "Failed to resume the agent session: boom\nStart a new session with `/new`.",
+    );
+    expect(zh("gateway.failedToResumeSession", { detail: "boom" })).toBe(
+      "恢复智能体会话失败：boom\n请使用 `/new` 开始新会话。",
+    );
   });
 
   it("does not leak locale state across fixed translators", () => {

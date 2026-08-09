@@ -46,6 +46,8 @@ const resources = {
         noActiveRunToStop: "No active agent run to stop.",
         startedNewSession: "Started a new session.",
         failedToStartNewSession: "Failed to start a new session: {{detail}}",
+        failedToResumeSession:
+          "Failed to resume the agent session: {{detail}}\nStart a new session with `/new`.",
       },
     },
   },
@@ -91,6 +93,7 @@ const resources = {
         noActiveRunToStop: "当前没有正在运行的智能体任务可停止。",
         startedNewSession: "已开始新会话。",
         failedToStartNewSession: "无法开启新会话：{{detail}}",
+        failedToResumeSession: "恢复智能体会话失败：{{detail}}\n请使用 `/new` 开始新会话。",
       },
     },
   },
