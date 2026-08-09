@@ -8,6 +8,12 @@ export interface ResolveWorkingDirectoryOptions {
   cwd?: string;
   /** Home directory used for `~` expansion; defaults to `os.homedir()`. */
   homedir?: string;
+  /**
+   * Optional allowlist of allowed working-directory roots. When present and
+   * non-empty, a user-supplied working directory must resolve inside one of
+   * the roots. Bare `/new` (no working directory) is never checked.
+   */
+  allowedWorkingDirectoryRoots?: string[];
 }
 
 function expandHome(input: string, homedir: string): string {
@@ -32,6 +38,69 @@ function describeFsError(error: unknown): string {
 }
 
 /**
+ * Canonicalizes every configured root with `realpath` and verifies each one is
+ * an existing directory. A broken root is a configuration error and surfaces as
+ * a clear error instead of silently weakening the allowlist.
+ */
+async function resolveAllowedRoots(
+  roots: string[],
+  options: { cwd?: string; homedir?: string },
+): Promise<string[]> {
+  const homedir = options.homedir ?? os.homedir();
+  const baseCwd = options.cwd ?? process.cwd();
+  const canonical: string[] = [];
+  for (const rawRoot of roots) {
+    const trimmedRoot = rawRoot.trim();
+    // Defense in depth: the config store already drops empty entries, but a
+    // direct module caller could pass one; an empty root would silently resolve
+    // to the base cwd and widen the allowlist.
+    if (!trimmedRoot) continue;
+    const expanded = expandHome(trimmedRoot, homedir);
+    const resolved = path.isAbsolute(expanded) ? expanded : path.resolve(baseCwd, expanded);
+
+    let root: string;
+    try {
+      root = await realpath(resolved);
+    } catch (error) {
+      throw new Error(`invalid allowed working directory root "${resolved}": ${describeFsError(error)}`);
+    }
+
+    const info = await stat(root);
+    if (!info.isDirectory()) {
+      throw new Error(`invalid allowed working directory root "${root}": not a directory`);
+    }
+    canonical.push(root);
+  }
+  return canonical;
+}
+
+/**
+ * Boundary check against a single canonical root. Equal paths and strict
+ * descendants are allowed; sibling prefixes (`/work` vs `/work2`) and any `..`
+ * escape resolve outside the root and are rejected, while literal child names
+ * that merely start with two dots (`..foo`, `...`) stay allowed. Both inputs
+ * are already canonical (`realpath`), so symlinks cannot bypass the check.
+ */
+function isInsideRoot(root: string, target: string): boolean {
+  const rel = path.relative(root, target);
+  if (rel === "") return true;
+  return rel !== ".." && !rel.startsWith(`..${path.sep}`) && !path.isAbsolute(rel);
+}
+
+/**
+ * Enforces the optional allowlist. Throws a user-facing error when the
+ * canonical target is not inside any allowed root.
+ */
+async function assertAllowed(canonical: string, roots: string[], options: { cwd?: string; homedir?: string }): Promise<void> {
+  if (roots.length === 0) return;
+  const allowedRoots = await resolveAllowedRoots(roots, options);
+  if (allowedRoots.some((root) => isInsideRoot(root, canonical))) return;
+  throw new Error(
+    `working directory "${canonical}" is not inside an allowed root (${allowedRoots.join(", ")})`,
+  );
+}
+
+/**
  * Normalizes and validates a user-supplied working directory for a new agent
  * session.
  *
@@ -45,6 +114,9 @@ function describeFsError(error: unknown): string {
  *
  * Throws a user-facing error that includes the resolved target path and the
  * reason, so it can be surfaced directly through the gateway failure message.
+ *
+ * The allowlist is enforced only for user-supplied working directories: a bare
+ * `/new` (empty input) keeps the default cwd without any allowlist check.
  */
 export async function resolveWorkingDirectory(
   raw: string | undefined,
@@ -76,6 +148,8 @@ export async function resolveWorkingDirectory(
   } catch (error) {
     throw new Error(`invalid working directory "${canonical}": ${describeFsError(error)}`);
   }
+
+  await assertAllowed(canonical, options.allowedWorkingDirectoryRoots ?? [], { homedir, cwd: baseCwd });
 
   return canonical;
 }

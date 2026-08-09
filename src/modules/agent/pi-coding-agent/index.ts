@@ -20,8 +20,9 @@ async function buildAdapter(
   config: PiCodingAgentConfig,
   agentSessionId: string,
   workingDirectory?: string,
+  allowedWorkingDirectoryRoots?: string[],
 ): Promise<AgentAdapter> {
-  const cwd = await resolveWorkingDirectory(workingDirectory);
+  const cwd = await resolveWorkingDirectory(workingDirectory, { allowedWorkingDirectoryRoots });
   return new PiCodingAgentAdapter({
     agentSessionId,
     cwd,
@@ -59,16 +60,16 @@ function createPiCodingAgentConfigCollector(): ConfigAdapter<PiCodingAgentConfig
 export const piCodingAgentModule: AgentModule<PiCodingAgentConfig> = {
   type: "pi-coding-agent",
   createConfigCollector: createPiCodingAgentConfigCollector,
-  async createAgentSession({ config, common, workingDirectory }) {
+  async createAgentSession({ config, common, workingDirectory, allowedWorkingDirectoryRoots }) {
     const agentSessionId = `pi-coding-agent:${randomUUID()}`;
     logger.info(`creating agent session ${agentSessionId} for channel ${common.channelName}`);
     return {
       agentSessionId,
-      agentAdapter: await buildAdapter(config, agentSessionId, workingDirectory),
+      agentAdapter: await buildAdapter(config, agentSessionId, workingDirectory, allowedWorkingDirectoryRoots),
     };
   },
-  async resumeAgentSession({ config, common, agentSessionId, workingDirectory }) {
+  async resumeAgentSession({ config, common, agentSessionId, workingDirectory, allowedWorkingDirectoryRoots }) {
     logger.info(`resuming agent session ${agentSessionId} for channel ${common.channelName}`);
-    return buildAdapter(config, agentSessionId, workingDirectory);
+    return buildAdapter(config, agentSessionId, workingDirectory, allowedWorkingDirectoryRoots);
   },
 };

@@ -89,4 +89,59 @@ describe("runChannel", () => {
     );
     expect(gatewayCoreStart).toHaveBeenCalledTimes(1);
   });
+
+  it("passes defaults.allowedWorkingDirectoryRoots into the gateway core", async () => {
+    const { runChannel } = await import("./channel-runner");
+    const channelConfig: ChannelConfig = {
+      common: { language: "en-US" },
+      client: {
+        type: "wecom",
+        config: { botId: "bot-id", secret: "secret" },
+      },
+      agent: {
+        type: "pi-coding-agent",
+        config: {},
+      },
+    };
+
+    await runChannel({
+      channelName: "demo-channel",
+      channelConfig,
+      defaults: {
+        agentIdleTimeoutMs: 60_000,
+        allowedWorkingDirectoryRoots: ["/srv/projects", "/home/me/work"],
+      },
+    });
+
+    expect(gatewayCoreCtor).toHaveBeenCalledWith(
+      expect.objectContaining({
+        allowedWorkingDirectoryRoots: ["/srv/projects", "/home/me/work"],
+      }),
+    );
+  });
+
+  it("omits allowedWorkingDirectoryRoots when the defaults do not configure it", async () => {
+    const { runChannel } = await import("./channel-runner");
+    const channelConfig: ChannelConfig = {
+      common: { language: "en-US" },
+      client: {
+        type: "wecom",
+        config: { botId: "bot-id", secret: "secret" },
+      },
+      agent: {
+        type: "pi-coding-agent",
+        config: {},
+      },
+    };
+
+    await runChannel({
+      channelName: "demo-channel",
+      channelConfig,
+      defaults: { agentIdleTimeoutMs: 60_000 },
+    });
+
+    expect(gatewayCoreCtor).toHaveBeenCalledWith(
+      expect.not.objectContaining({ allowedWorkingDirectoryRoots: expect.anything() }),
+    );
+  });
 });

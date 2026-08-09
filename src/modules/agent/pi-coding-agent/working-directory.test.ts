@@ -93,3 +93,200 @@ describe("resolveWorkingDirectory", () => {
     await expect(resolveWorkingDirectory(missing)).rejects.toThrow(/invalid working directory/);
   });
 });
+
+describe("resolveWorkingDirectory allowlist", () => {
+  it("allows a target equal to the allowed root", async () => {
+    const base = await makeBaseDir();
+    const root = path.join(base, "projects");
+    await mkdir(root, { recursive: true });
+
+    await expect(
+      resolveWorkingDirectory(root, { allowedWorkingDirectoryRoots: [root] }),
+    ).resolves.toBe(await realpath(root));
+  });
+
+  it("allows a strict descendant of an allowed root", async () => {
+    const base = await makeBaseDir();
+    const root = path.join(base, "projects");
+    const target = path.join(root, "project-a", "sub");
+    await mkdir(target, { recursive: true });
+
+    await expect(
+      resolveWorkingDirectory(target, { allowedWorkingDirectoryRoots: [root] }),
+    ).resolves.toBe(await realpath(target));
+  });
+
+  it("allows relative and ~ inputs that resolve inside the root", async () => {
+    const base = await makeBaseDir();
+    const root = path.join(base, "projects");
+    const target = path.join(root, "project-a");
+    await mkdir(target, { recursive: true });
+
+    await expect(
+      resolveWorkingDirectory("./projects/project-a", { cwd: base, allowedWorkingDirectoryRoots: [root] }),
+    ).resolves.toBe(await realpath(target));
+    await expect(
+      resolveWorkingDirectory("~/projects/project-a", {
+        homedir: base,
+        allowedWorkingDirectoryRoots: [root],
+      }),
+    ).resolves.toBe(await realpath(target));
+  });
+
+  it("rejects a sibling-prefix root bypass (root /work vs target /work2)", async () => {
+    const base = await makeBaseDir();
+    const root = path.join(base, "work");
+    const target = path.join(base, "work2");
+    await mkdir(root, { recursive: true });
+    await mkdir(target, { recursive: true });
+
+    await expect(
+      resolveWorkingDirectory(target, { allowedWorkingDirectoryRoots: [root] }),
+    ).rejects.toThrow(/not inside an allowed root/);
+  });
+
+  it("rejects a target outside the root", async () => {
+    const base = await makeBaseDir();
+    const root = path.join(base, "projects");
+    const target = path.join(base, "elsewhere");
+    await mkdir(root, { recursive: true });
+    await mkdir(target, { recursive: true });
+
+    await expect(
+      resolveWorkingDirectory(target, { allowedWorkingDirectoryRoots: [root] }),
+    ).rejects.toThrow(/not inside an allowed root/);
+  });
+
+  it("rejects a .. escape that lexically starts inside the root", async () => {
+    const base = await makeBaseDir();
+    const root = path.join(base, "projects");
+    const target = path.join(base, "projects", "project-a");
+    await mkdir(target, { recursive: true });
+
+    const escape = path.join(target, "..", "..", "elsewhere");
+    await mkdir(path.join(base, "elsewhere"), { recursive: true });
+
+    await expect(
+      resolveWorkingDirectory(escape, { allowedWorkingDirectoryRoots: [root] }),
+    ).rejects.toThrow(/not inside an allowed root/);
+  });
+
+  it("rejects a symlink inside the root that escapes it", async () => {
+    const base = await makeBaseDir();
+    const root = path.join(base, "projects");
+    const outside = path.join(base, "outside");
+    await mkdir(root, { recursive: true });
+    await mkdir(outside, { recursive: true });
+    const link = path.join(root, "escape");
+    await symlink(outside, link);
+
+    await expect(
+      resolveWorkingDirectory(link, { allowedWorkingDirectoryRoots: [root] }),
+    ).rejects.toThrow(/not inside an allowed root/);
+  });
+
+  it("allows child directories whose names start with two dots (e.g. ..foo, ...)", async () => {
+    const base = await makeBaseDir();
+    const root = path.join(base, "projects");
+    await mkdir(path.join(root, "..foo"), { recursive: true });
+    await mkdir(path.join(root, "..."), { recursive: true });
+
+    await expect(
+      resolveWorkingDirectory(path.join(root, "..foo"), { allowedWorkingDirectoryRoots: [root] }),
+    ).resolves.toBe(await realpath(path.join(root, "..foo")));
+    await expect(
+      resolveWorkingDirectory(path.join(root, "..."), { allowedWorkingDirectoryRoots: [root] }),
+    ).resolves.toBe(await realpath(path.join(root, "...")));
+  });
+
+  it("allows when any of multiple roots matches", async () => {
+    const base = await makeBaseDir();
+    const first = path.join(base, "one");
+    const second = path.join(base, "two");
+    const target = path.join(second, "project");
+    await mkdir(first, { recursive: true });
+    await mkdir(target, { recursive: true });
+
+    await expect(
+      resolveWorkingDirectory(target, {
+        allowedWorkingDirectoryRoots: [first, second],
+      }),
+    ).resolves.toBe(await realpath(target));
+  });
+
+  it("allows a ~-expanded root", async () => {
+    const homedir = await makeBaseDir();
+    const root = path.join(homedir, "projects");
+    const target = path.join(root, "project-a");
+    await mkdir(target, { recursive: true });
+
+    await expect(
+      resolveWorkingDirectory(target, {
+        homedir,
+        allowedWorkingDirectoryRoots: ["~/projects"],
+      }),
+    ).resolves.toBe(await realpath(target));
+  });
+
+  it("is permissive with an empty allowlist", async () => {
+    const base = await makeBaseDir();
+    const target = path.join(base, "anywhere");
+    await mkdir(target, { recursive: true });
+
+    await expect(
+      resolveWorkingDirectory(target, { allowedWorkingDirectoryRoots: [] }),
+    ).resolves.toBe(await realpath(target));
+  });
+
+  it("never checks the default cwd for a bare /new even when roots are configured", async () => {
+    const base = await makeBaseDir();
+    const root = path.join(base, "projects");
+    await mkdir(root, { recursive: true });
+
+    await expect(
+      resolveWorkingDirectory(undefined, { cwd: base, allowedWorkingDirectoryRoots: [root] }),
+    ).resolves.toBe(base);
+    await expect(
+      resolveWorkingDirectory("", { cwd: base, allowedWorkingDirectoryRoots: [root] }),
+    ).resolves.toBe(base);
+  });
+
+  it("canonicalizes an allowed root through realpath (symlinked root)", async () => {
+    const base = await makeBaseDir();
+    const realRoot = path.join(base, "real-projects");
+    const rootLink = path.join(base, "projects-link");
+    const target = path.join(rootLink, "project-a");
+    await mkdir(realRoot, { recursive: true });
+    await symlink(realRoot, rootLink);
+    await mkdir(target, { recursive: true });
+
+    // target itself is reached through the symlinked root; both canonicalize to
+    // the same real location so the boundary check passes.
+    await expect(
+      resolveWorkingDirectory(target, { allowedWorkingDirectoryRoots: [rootLink] }),
+    ).resolves.toBe(await realpath(path.join(realRoot, "project-a")));
+  });
+
+  it("rejects a root that is not a directory with a clear error", async () => {
+    const base = await makeBaseDir();
+    const target = path.join(base, "projects", "project-a");
+    const rootFile = path.join(base, "root-file.txt");
+    await mkdir(target, { recursive: true });
+    await writeFile(rootFile, "file");
+
+    await expect(
+      resolveWorkingDirectory(target, { allowedWorkingDirectoryRoots: [rootFile] }),
+    ).rejects.toThrow(/invalid allowed working directory root.*not a directory/);
+  });
+
+  it("rejects a missing root with a clear error", async () => {
+    const base = await makeBaseDir();
+    const missing = path.join(base, "missing-root");
+    const target = path.join(base, "anywhere");
+    await mkdir(target, { recursive: true });
+
+    await expect(
+      resolveWorkingDirectory(target, { allowedWorkingDirectoryRoots: [missing] }),
+    ).rejects.toThrow(/invalid allowed working directory root.*no such file or directory/);
+  });
+});

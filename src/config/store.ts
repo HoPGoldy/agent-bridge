@@ -21,6 +21,36 @@ function normalizeLanguage(language: unknown): LocaleCode {
   return language === "en-US" || language === "zh-CN" ? language : DEFAULT_LOCALE;
 }
 
+/**
+ * Normalizes `defaults.allowedWorkingDirectoryRoots` from raw config input.
+ *
+ * - `undefined` stays `undefined` (permissive, legacy configs keep working)
+ * - a non-array value is a hard config error
+ * - entries must be strings; non-string entries are a hard config error
+ * - entries are trimmed; empty/whitespace entries are dropped; duplicates are
+ *   removed (first occurrence wins, order preserved)
+ * - an empty array (or one that normalizes to empty) means permissive
+ */
+function normalizeAllowedWorkingDirectoryRoots(raw: unknown): string[] | undefined {
+  if (raw === undefined) return undefined;
+  if (!Array.isArray(raw)) {
+    throw new Error("defaults.allowedWorkingDirectoryRoots must be an array of non-empty strings");
+  }
+
+  const seen = new Set<string>();
+  const roots: string[] = [];
+  for (const entry of raw) {
+    if (typeof entry !== "string") {
+      throw new Error("defaults.allowedWorkingDirectoryRoots must contain only non-empty strings");
+    }
+    const trimmed = entry.trim();
+    if (!trimmed || seen.has(trimmed)) continue;
+    seen.add(trimmed);
+    roots.push(trimmed);
+  }
+  return roots;
+}
+
 function normalizeChannelConfig(channel: RawChannelConfig): ChannelConfig {
   if (!channel.client || !channel.agent) {
     throw new Error("Invalid channel config shape");
@@ -39,10 +69,15 @@ function mergeDefaults(config: RawAppConfig = {}): AppConfig {
     Object.entries(config.channels ?? {}).map(([name, channel]) => [name, normalizeChannelConfig(channel)]),
   );
 
+  const allowedWorkingDirectoryRoots = normalizeAllowedWorkingDirectoryRoots(
+    config.defaults?.allowedWorkingDirectoryRoots,
+  );
+
   return {
     channels,
     defaults: {
       agentIdleTimeoutMs: config.defaults?.agentIdleTimeoutMs ?? DEFAULTS.agentIdleTimeoutMs,
+      ...(allowedWorkingDirectoryRoots !== undefined ? { allowedWorkingDirectoryRoots } : {}),
     },
   };
 }

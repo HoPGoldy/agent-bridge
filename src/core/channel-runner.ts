@@ -23,6 +23,9 @@ export async function runChannel({ channelName, channelConfig, defaults }: RunCh
     agentModule,
     agentConfig: channelConfig.agent.config,
     agentIdleTimeoutMs: defaults.agentIdleTimeoutMs,
+    ...(defaults.allowedWorkingDirectoryRoots !== undefined
+      ? { allowedWorkingDirectoryRoots: defaults.allowedWorkingDirectoryRoots }
+      : {}),
     bindingStore,
     common,
   });
