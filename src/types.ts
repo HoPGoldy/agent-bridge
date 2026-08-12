@@ -326,6 +326,37 @@ export interface SessionBindingStore {
   save(bindings: Record<string, SessionBinding>): Promise<void>;
 }
 
+/**
+ * Core-owned envelope for a persisted agent session. The `state` payload is
+ * opaque to the core: it is owned by the agent module (or by legacy binding
+ * migration) and must be JSON-compatible.
+ */
+export interface AgentSessionRecord {
+  recordVersion: 1;
+  agentType: string;
+  stateVersion: number;
+  createdAt: string;
+  updatedAt: string;
+  state: unknown;
+}
+
+/**
+ * Versioned per-channel persistent document. `bindings` is a pure routing map
+ * (client session id -> agent session id); agent-side metadata lives in
+ * `agentSessions`, keyed by agent session id.
+ */
+export interface ChannelPersistentState {
+  version: 2;
+  bindings: Record<string, string>;
+  agentSessions: Record<string, AgentSessionRecord>;
+}
+
+/** Store interface for the full per-channel persistent document. */
+export interface ChannelStateStore {
+  load(): Promise<ChannelPersistentState>;
+  save(state: ChannelPersistentState): Promise<void>;
+}
+
 export interface RunChannelOptions {
   channelName: string;
   channelConfig: ChannelConfig;
