@@ -1,4 +1,4 @@
-import { mkdir, mkdtemp, readFile, readdir, rm, writeFile } from "node:fs/promises";
+import { mkdir, mkdtemp, readFile, readdir, rm, rmdir, writeFile } from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 import { afterEach, describe, expect, it } from "vitest";
@@ -409,5 +409,118 @@ describe("createFileChannelStateStore", () => {
 
     const entries = await readdir(path.dirname(file));
     expect(entries.some((e) => e.endsWith(".tmp"))).toBe(false);
+  });
+
+  it("serializes concurrent transactions through a single queue", async () => {
+    const file = await tmpFilePath();
+    const store = createFileChannelStateStore(file);
+
+    await Promise.all([
+      store.transaction((draft) => {
+        draft.bindings["client-1"] = "pi-coding-agent:abc";
+      }),
+      store.transaction((draft) => {
+        draft.bindings["client-2"] = "opencode:def";
+      }),
+      store.transaction((draft) => {
+        draft.bindings["client-3"] = "pi-coding-agent:abc";
+      }),
+    ]);
+
+    const state = await store.load();
+    expect(state.bindings).toEqual({
+      "client-1": "pi-coding-agent:abc",
+      "client-2": "opencode:def",
+      "client-3": "pi-coding-agent:abc",
+    });
+  });
+
+  it("lets a transaction updater return the next state instead of mutating the draft", async () => {
+    const file = await tmpFilePath();
+    const store = createFileChannelStateStore(file);
+
+    await store.transaction((draft) => ({
+      ...draft,
+      bindings: { ...draft.bindings, "client-1": "pi-coding-agent:abc" },
+    }));
+
+    await expect(store.load()).resolves.toEqual({
+      version: CHANNEL_STATE_VERSION,
+      bindings: { "client-1": "pi-coding-agent:abc" },
+      agentSessions: {},
+    });
+  });
+
+  it("rejects asynchronous transaction updaters", async () => {
+    const file = await tmpFilePath();
+    const store = createFileChannelStateStore(file);
+
+    await expect(
+      store.transaction(async (draft) => {
+        draft.bindings["client-1"] = "pi-coding-agent:abc";
+      }) as Promise<unknown>,
+    ).rejects.toThrow(/must be synchronous/);
+
+    await expect(store.load()).resolves.toEqual(emptyChannelState());
+  });
+
+  it("keeps the write queue alive after a failed commit", async () => {
+    const file = await tmpFilePath();
+    const store = createFileChannelStateStore(file);
+
+    // Destination is a directory: the first commit fails at rename.
+    await mkdir(file);
+    await expect(
+      store.transaction((draft) => {
+        draft.bindings["client-1"] = "pi-coding-agent:abc";
+      }),
+    ).rejects.toThrow();
+    expect((await readdir(path.dirname(file))).some((e) => e.endsWith(".tmp"))).toBe(false);
+
+    // The queue continues: a later write commits successfully.
+    await rmdir(file);
+    await store.transaction((draft) => {
+      draft.bindings["client-2"] = "opencode:def";
+    });
+    await expect(store.load()).resolves.toEqual({
+      version: CHANNEL_STATE_VERSION,
+      bindings: { "client-2": "opencode:def" },
+      agentSessions: {},
+    });
+  });
+
+  it("rejects writes that are not JSON-compatible documents", async () => {
+    const file = await tmpFilePath();
+    const store = createFileChannelStateStore(file);
+
+    await expect(
+      store.save({
+        version: CHANNEL_STATE_VERSION as 2,
+        bindings: {},
+        agentSessions: {
+          "pi-coding-agent:abc": {
+            recordVersion: 1,
+            agentType: "pi-coding-agent",
+            stateVersion: 1,
+            createdAt: "2026-01-01T00:00:00.000Z",
+            updatedAt: "2026-01-01T00:00:00.000Z",
+            state: { bad: undefined },
+          },
+        },
+      }),
+    ).rejects.toThrow(/undefined/);
+
+    await expect(store.load()).resolves.toEqual(emptyChannelState());
+  });
+
+  it("rejects transactions that produce an invalid document", async () => {
+    const file = await tmpFilePath();
+    const store = createFileChannelStateStore(file);
+
+    await expect(
+      store.transaction((draft) => {
+        (draft as unknown as { version: number }).version = 3;
+      }),
+    ).rejects.toThrow(/invalid channel state document/);
   });
 });

@@ -351,10 +351,105 @@ export interface ChannelPersistentState {
   agentSessions: Record<string, AgentSessionRecord>;
 }
 
-/** Store interface for the full per-channel persistent document. */
+/**
+ * Store interface for the full per-channel persistent document.
+ *
+ * `load`/`save` are the legacy facade surface; `transaction` and `flush` are
+ * the serialized, atomic mutation surface. All mutations (bindings and agent
+ * session state) must share the same write queue so no two writers can
+ * overwrite each other.
+ */
 export interface ChannelStateStore {
   load(): Promise<ChannelPersistentState>;
   save(state: ChannelPersistentState): Promise<void>;
+  /**
+   * Runs `updater` strictly in order behind all earlier writes. The updater
+   * must be synchronous: it either mutates the provided draft in place or
+   * returns a complete next state. The resulting document is committed
+   * atomically (temp file + rename).
+   */
+  transaction<T>(
+    updater: (draft: ChannelPersistentState) => T | ChannelPersistentState,
+  ): Promise<T>;
+  /** Resolves once every enqueued write has been committed (queue drain). */
+  flush(): Promise<void>;
+}
+
+/**
+ * Runtime codec owned by an agent module. `encode` produces a
+ * JSON-compatible payload; `decode` validates (and optionally migrates) a
+ * persisted payload using the stored `stateVersion`.
+ */
+export interface AgentSessionStateCodec<TState extends object> {
+  readonly currentVersion: number;
+  decode(raw: unknown, stateVersion: number): TState;
+  encode(state: TState): unknown;
+}
+
+/**
+ * Adapter-visible, session-scoped state handle. Every operation is confined
+ * to the single agent session the handle was created for: the handle exposes
+ * no other session ids and no delete/lifecycle operations.
+ */
+export interface AgentSessionStateApi<TState extends object> {
+  readonly agentSessionId: string;
+  /** Returns the current persisted state (waiting for pending writes). */
+  read(): Promise<Readonly<TState>>;
+  /** Replaces the persisted state atomically. */
+  replace(next: TState): Promise<void>;
+  /**
+   * Atomic read-modify-write. `updater` must be synchronous; concurrent
+   * updates are serialized and never lose changes.
+   */
+  update(updater: (current: Readonly<TState>) => TState): Promise<Readonly<TState>>;
+  /** Waits until every pending write for this session has been persisted. */
+  flush(): Promise<void>;
+}
+
+/** Creation-phase state handle: adds a one-shot {@link AgentSessionStateApi}. */
+export interface NewAgentSessionStateApi<TState extends object>
+  extends AgentSessionStateApi<TState> {
+  /**
+   * Atomically creates the persisted record. Succeeds exactly once; before
+   * it is called, read/replace/update fail with a clear error.
+   */
+  initialize(initial: TState): Promise<void>;
+}
+
+/** Core-visible lifecycle surface for agent session state handles. */
+export interface AgentSessionStateRegistry {
+  /**
+   * Reserves an in-memory creation handle for a brand-new session. Fails if
+   * the id is already reserved/open or already persisted. Nothing is written
+   * until {@link NewAgentSessionStateApi.initialize} is called.
+   */
+  reserve<TState extends object>(args: {
+    agentSessionId: string;
+    agentType: string;
+    codec: AgentSessionStateCodec<TState>;
+  }): Promise<NewAgentSessionStateApi<TState>>;
+  /**
+   * Opens a read/write handle for an existing persisted session. Validates
+   * that the record exists, the agent type matches, and the stored state
+   * decodes with the supplied codec.
+   */
+  open<TState extends object>(args: {
+    agentSessionId: string;
+    agentType: string;
+    codec: AgentSessionStateCodec<TState>;
+  }): Promise<AgentSessionStateApi<TState>>;
+  /**
+   * Invalidates every live handle for the session. The persisted record is
+   * left intact so the session can be opened again later (for example after
+   * an idle release). Idempotent.
+   */
+  revoke(agentSessionId: string): Promise<void>;
+  /**
+   * Revokes every live handle and removes the persisted record. Idempotent:
+   * deleting a session that does not exist succeeds. Old handles can never
+   * resurrect the record.
+   */
+  delete(agentSessionId: string): Promise<void>;
 }
 
 export interface RunChannelOptions {
