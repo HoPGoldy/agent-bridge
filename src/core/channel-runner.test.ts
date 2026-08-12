@@ -21,6 +21,22 @@ const agentModule = {
   },
 };
 
+const fakeChannelStateStore = {
+  load: vi.fn(async () => ({ version: 2, bindings: {}, agentSessions: {} })),
+  save: vi.fn(async () => {}),
+  transaction: vi.fn(async (updater: (draft: { version: 2; bindings: object; agentSessions: object }) => unknown) => {
+    return updater({ version: 2, bindings: {}, agentSessions: {} });
+  }),
+  flush: vi.fn(async () => {}),
+};
+
+const createAgentSessionStateRegistry = vi.fn(() => ({
+  reserve: vi.fn(),
+  open: vi.fn(),
+  revoke: vi.fn(),
+  delete: vi.fn(),
+}));
+
 vi.mock("./gateway-core", () => ({
   GatewayCore: gatewayCoreCtor,
 }));
@@ -33,9 +49,13 @@ vi.mock("../modules/agent", () => ({
   getTypedAgentModule: () => agentModule,
 }));
 
-vi.mock("../config/session-bindings", () => ({
-  createFileSessionBindingStore: () => ({ load: async () => ({}), save: async () => {} }),
-  getSessionBindingStorePath: () => "/tmp/session-bindings.json",
+vi.mock("../config/channel-state", () => ({
+  createFileChannelStateStore: () => fakeChannelStateStore,
+  getChannelStateStorePath: () => "/tmp/channel-state.json",
+}));
+
+vi.mock("../config/agent-session-state", () => ({
+  createAgentSessionStateRegistry,
 }));
 
 describe("runChannel", () => {
@@ -51,6 +71,7 @@ describe("runChannel", () => {
     gatewayCoreCtor.mockClear();
     gatewayCoreStart.mockClear();
     gatewayCoreStop.mockClear();
+    createAgentSessionStateRegistry.mockClear();
   });
 
   it("builds a common context from the channel name and passes it to the client adapter and core", async () => {
@@ -88,6 +109,35 @@ describe("runChannel", () => {
       }),
     );
     expect(gatewayCoreStart).toHaveBeenCalledTimes(1);
+  });
+
+  it("injects the per-channel state store and a registry built on it into the gateway core", async () => {
+    const { runChannel } = await import("./channel-runner");
+    const channelConfig: ChannelConfig = {
+      common: { language: "en-US" },
+      client: {
+        type: "wecom",
+        config: { botId: "bot-id", secret: "secret" },
+      },
+      agent: {
+        type: "pi-coding-agent",
+        config: {},
+      },
+    };
+
+    await runChannel({
+      channelName: "demo-channel",
+      channelConfig,
+      defaults: { agentIdleTimeoutMs: 60_000 },
+    });
+
+    expect(gatewayCoreCtor).toHaveBeenCalledWith(
+      expect.objectContaining({
+        channelStateStore: fakeChannelStateStore,
+        agentSessionStateRegistry: expect.any(Object),
+      }),
+    );
+    expect(createAgentSessionStateRegistry).toHaveBeenCalledWith(fakeChannelStateStore);
   });
 
   it("passes defaults.allowedWorkingDirectoryRoots into the gateway core", async () => {

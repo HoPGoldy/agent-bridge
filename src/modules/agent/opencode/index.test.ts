@@ -1,8 +1,12 @@
 import { describe, expect, it, vi } from "vitest";
 import type { Session } from "@opencode-ai/sdk/v2/types";
-import type { ConfigCollectContext, OpenCodeAgentConfig } from "../../../types";
+import type { AgentSessionRecord, ConfigCollectContext, OpenCodeAgentConfig } from "../../../types";
+import { createAgentSessionStateRegistry } from "../../../config/agent-session-state";
+import { createInMemoryChannelStateStore } from "../../../config/channel-state";
 import { createOpenCodeAgentModule } from "./index";
 import type { OpenCodeApi } from "./adapter/opencode-api";
+
+type OpenCodeModule = ReturnType<typeof createOpenCodeAgentModule>;
 
 function createApi(overrides: Partial<OpenCodeApi> = {}): OpenCodeApi {
   return {
@@ -41,6 +45,39 @@ function context(args: {
 }
 
 const common = { channelName: "test", language: "en-US" as const };
+
+async function reserveHandle(module: OpenCodeModule, id: string) {
+  const store = createInMemoryChannelStateStore();
+  const registry = createAgentSessionStateRegistry(store);
+  const handle = await registry.reserve({
+    agentSessionId: id,
+    agentType: "opencode",
+    codec: module.sessionStateCodec,
+  });
+  return { store, registry, handle };
+}
+
+async function openHandle(module: OpenCodeModule, id: string, initialState: unknown) {
+  const store = createInMemoryChannelStateStore();
+  const registry = createAgentSessionStateRegistry(store);
+  const record: AgentSessionRecord = {
+    recordVersion: 1,
+    agentType: "opencode",
+    stateVersion: 1,
+    createdAt: "2026-01-01T00:00:00.000Z",
+    updatedAt: "2026-01-01T00:00:00.000Z",
+    state: initialState,
+  };
+  await store.transaction((draft) => {
+    draft.agentSessions[id] = record;
+  });
+  const handle = await registry.open({
+    agentSessionId: id,
+    agentType: "opencode",
+    codec: module.sessionStateCodec,
+  });
+  return { store, handle };
+}
 
 describe("OpenCode agent module", () => {
   it("collects and validates a reachable local server", async () => {
@@ -99,23 +136,42 @@ describe("OpenCode agent module", () => {
     expect(lines.join("\n")).toContain('"question":"deny"');
   });
 
-  it("creates and resumes exact OpenCode session IDs", async () => {
+  it("creates and resumes OpenCode sessions with core-owned ids and provider ids in state", async () => {
     const api = createApi({
       createSession: vi.fn(async () => ({ id: "session-1", model: { providerID: "anthropic", id: "sonnet" } }) as Session),
       getSession: vi.fn(async () => ({ id: "session-1" }) as Session),
     });
     const module = createOpenCodeAgentModule({ apiFactory: () => api });
     const config = { baseUrl: "http://127.0.0.1:4096", model: "anthropic/sonnet" };
+    const bridgeId = "opencode:core-generated-id";
 
-    const created = await module.createAgentSession({ config, common });
-    expect(created.agentSessionId).toBe("opencode:session-1");
+    const { handle } = await reserveHandle(module, bridgeId);
+    const created = await module.createAgentSession({
+      config,
+      common,
+      agentSessionId: bridgeId,
+      sessionState: handle,
+    });
+    expect(created).toBeDefined();
     expect(api.createSession).toHaveBeenCalledWith({
       title: "agent-bridge:test",
       agent: undefined,
       model: { providerID: "anthropic", modelID: "sonnet" },
     });
 
-    await module.resumeAgentSession?.({ config, common, agentSessionId: "opencode:session-1" });
+    // The provider session id lives in the state, never in the bridge id.
+    await expect(handle.read()).resolves.toEqual({ version: 1, openCodeSessionId: "session-1" });
+
+    const { handle: resumeHandle } = await openHandle(module, bridgeId, {
+      version: 1,
+      openCodeSessionId: "session-1",
+    });
+    await module.resumeAgentSession?.({
+      config,
+      common,
+      agentSessionId: bridgeId,
+      sessionState: resumeHandle,
+    });
     expect(api.getSession).toHaveBeenCalledWith("session-1");
     expect(api.getMessages).toHaveBeenCalledWith("session-1", 50);
   });
@@ -130,7 +186,7 @@ describe("OpenCode agent module", () => {
 
   describe("working directory override", () => {
     function recordingModule(): {
-      module: ReturnType<typeof createOpenCodeAgentModule>;
+      module: OpenCodeModule;
       apiConfigs: OpenCodeAgentConfig[];
       apis: OpenCodeApi[];
     } {
@@ -151,9 +207,15 @@ describe("OpenCode agent module", () => {
       const { module, apiConfigs, apis } = recordingModule();
       const config = { baseUrl: "http://127.0.0.1:4096", model: "anthropic/sonnet" };
 
-      const created = await module.createAgentSession({ config, common, workingDirectory: "/srv/project-a" });
+      const { handle } = await reserveHandle(module, "opencode:override-1");
+      await module.createAgentSession({
+        config,
+        common,
+        agentSessionId: "opencode:override-1",
+        sessionState: handle,
+        workingDirectory: "/srv/project-a",
+      });
 
-      expect(created.agentSessionId).toBe("opencode:session-1");
       expect(apiConfigs).toHaveLength(1);
       expect(apiConfigs[0]?.directory).toBe("/srv/project-a");
       expect(apis[0]?.createSession).toHaveBeenCalledWith({
@@ -162,59 +224,128 @@ describe("OpenCode agent module", () => {
         model: { providerID: "anthropic", modelID: "sonnet" },
       });
       expect(config.directory).toBeUndefined();
+      await expect(handle.read()).resolves.toEqual({
+        version: 1,
+        openCodeSessionId: "session-1",
+        workingDirectory: "/srv/project-a",
+      });
     });
 
     it("keeps the channel directory when no override is given", async () => {
       const { module, apiConfigs } = recordingModule();
       const config = { baseUrl: "http://127.0.0.1:4096", directory: "/srv/default" };
 
-      await module.createAgentSession({ config, common });
+      const { handle } = await reserveHandle(module, "opencode:default-1");
+      await module.createAgentSession({
+        config,
+        common,
+        agentSessionId: "opencode:default-1",
+        sessionState: handle,
+      });
 
       expect(apiConfigs).toHaveLength(1);
       expect(apiConfigs[0]?.directory).toBe("/srv/default");
       // No override short-circuits without copying, so the shared config is
       // passed through untouched (and therefore cannot have been mutated).
       expect(apiConfigs[0]).toBe(config);
+      // The channel-configured directory is trusted, so it is not persisted.
+      await expect(handle.read()).resolves.toEqual({ version: 1, openCodeSessionId: "session-1" });
     });
 
     it("treats a whitespace-only override as no override", async () => {
       const { module, apiConfigs } = recordingModule();
       const config = { baseUrl: "http://127.0.0.1:4096" };
 
-      await module.createAgentSession({ config, common, workingDirectory: "   " });
+      const { handle } = await reserveHandle(module, "opencode:blank-1");
+      await module.createAgentSession({
+        config,
+        common,
+        agentSessionId: "opencode:blank-1",
+        sessionState: handle,
+        workingDirectory: "   ",
+      });
 
       expect(apiConfigs).toHaveLength(1);
       expect(apiConfigs[0]?.directory).toBeUndefined();
+      await expect(handle.read()).resolves.toEqual({ version: 1, openCodeSessionId: "session-1" });
     });
 
     it("passes a relative override through to the server when no allowlist is configured", async () => {
       const { module, apiConfigs } = recordingModule();
       const config = { baseUrl: "http://127.0.0.1:4096" };
 
-      await module.createAgentSession({ config, common, workingDirectory: "./project-a" });
+      const { handle } = await reserveHandle(module, "opencode:relative-1");
+      await module.createAgentSession({
+        config,
+        common,
+        agentSessionId: "opencode:relative-1",
+        sessionState: handle,
+        workingDirectory: "./project-a",
+      });
 
       expect(apiConfigs).toHaveLength(1);
       expect(apiConfigs[0]?.directory).toBe("./project-a");
+      await expect(handle.read()).resolves.toEqual({
+        version: 1,
+        openCodeSessionId: "session-1",
+        workingDirectory: "./project-a",
+      });
     });
 
     it("creates independent runtimes and APIs for different directories", async () => {
       const { module, apiConfigs } = recordingModule();
       const config = { baseUrl: "http://127.0.0.1:4096" };
 
-      const first = await module.createAgentSession({ config, common, workingDirectory: "/srv/a" });
-      const second = await module.createAgentSession({ config, common, workingDirectory: "/srv/b" });
+      const first = await reserveHandle(module, "opencode:dir-a");
+      await module.createAgentSession({
+        config,
+        common,
+        agentSessionId: "opencode:dir-a",
+        sessionState: first.handle,
+        workingDirectory: "/srv/a",
+      });
+      const second = await reserveHandle(module, "opencode:dir-b");
+      await module.createAgentSession({
+        config,
+        common,
+        agentSessionId: "opencode:dir-b",
+        sessionState: second.handle,
+        workingDirectory: "/srv/b",
+      });
 
-      expect(first.agentSessionId).toBe("opencode:session-1");
-      expect(second.agentSessionId).toBe("opencode:session-1");
       expect(apiConfigs.map((c) => c.directory)).toEqual(["/srv/a", "/srv/b"]);
+      await expect(first.handle.read()).resolves.toEqual({
+        version: 1,
+        openCodeSessionId: "session-1",
+        workingDirectory: "/srv/a",
+      });
+      await expect(second.handle.read()).resolves.toEqual({
+        version: 1,
+        openCodeSessionId: "session-1",
+        workingDirectory: "/srv/b",
+      });
     });
 
     it("reuses the runtime and API for the same directory", async () => {
       const { module, apiConfigs, apis } = recordingModule();
       const config = { baseUrl: "http://127.0.0.1:4096" };
 
-      await module.createAgentSession({ config, common, workingDirectory: "/srv/a" });
-      await module.createAgentSession({ config, common, workingDirectory: "/srv/a" });
+      const first = await reserveHandle(module, "opencode:same-a");
+      await module.createAgentSession({
+        config,
+        common,
+        agentSessionId: "opencode:same-a",
+        sessionState: first.handle,
+        workingDirectory: "/srv/a",
+      });
+      const second = await reserveHandle(module, "opencode:same-b");
+      await module.createAgentSession({
+        config,
+        common,
+        agentSessionId: "opencode:same-b",
+        sessionState: second.handle,
+        workingDirectory: "/srv/a",
+      });
 
       expect(apiConfigs).toHaveLength(1);
       expect(apis).toHaveLength(1);
@@ -224,12 +355,25 @@ describe("OpenCode agent module", () => {
       const { module, apiConfigs, apis } = recordingModule();
       const config = { baseUrl: "http://127.0.0.1:4096" };
 
-      const created = await module.createAgentSession({ config, common, workingDirectory: "/srv/project-a" });
+      const { handle } = await reserveHandle(module, "opencode:resume-1");
+      await module.createAgentSession({
+        config,
+        common,
+        agentSessionId: "opencode:resume-1",
+        sessionState: handle,
+        workingDirectory: "/srv/project-a",
+      });
+
+      const { handle: resumeHandle } = await openHandle(module, "opencode:resume-1", {
+        version: 1,
+        openCodeSessionId: "session-1",
+        workingDirectory: "/srv/project-a",
+      });
       const resumed = await module.resumeAgentSession?.({
         config,
         common,
-        agentSessionId: created.agentSessionId,
-        workingDirectory: "/srv/project-a",
+        agentSessionId: "opencode:resume-1",
+        sessionState: resumeHandle,
       });
 
       expect(resumed).toBeDefined();
@@ -243,7 +387,7 @@ describe("OpenCode agent module", () => {
 
   describe("working directory allowlist", () => {
     function recordingModule(): {
-      module: ReturnType<typeof createOpenCodeAgentModule>;
+      module: OpenCodeModule;
       apiConfigs: OpenCodeAgentConfig[];
     } {
       const apiConfigs: OpenCodeAgentConfig[] = [];
@@ -260,9 +404,12 @@ describe("OpenCode agent module", () => {
       const { module, apiConfigs } = recordingModule();
       const config = { baseUrl: "http://127.0.0.1:4096" };
 
+      const { handle } = await reserveHandle(module, "opencode:root-eq");
       await module.createAgentSession({
         config,
         common,
+        agentSessionId: "opencode:root-eq",
+        sessionState: handle,
         workingDirectory: "/srv/projects",
         allowedWorkingDirectoryRoots: ["/srv/projects"],
       });
@@ -274,9 +421,12 @@ describe("OpenCode agent module", () => {
       const { module, apiConfigs } = recordingModule();
       const config = { baseUrl: "http://127.0.0.1:4096" };
 
+      const { handle } = await reserveHandle(module, "opencode:root-desc");
       await module.createAgentSession({
         config,
         common,
+        agentSessionId: "opencode:root-desc",
+        sessionState: handle,
         workingDirectory: "/srv/projects/project-a/sub",
         allowedWorkingDirectoryRoots: ["/srv/projects"],
       });
@@ -288,10 +438,13 @@ describe("OpenCode agent module", () => {
       const { module, apiConfigs } = recordingModule();
       const config = { baseUrl: "http://127.0.0.1:4096" };
 
+      const { handle } = await reserveHandle(module, "opencode:root-outside");
       await expect(
         module.createAgentSession({
           config,
           common,
+          agentSessionId: "opencode:root-outside",
+          sessionState: handle,
           workingDirectory: "/etc",
           allowedWorkingDirectoryRoots: ["/srv/projects"],
         }),
@@ -303,10 +456,13 @@ describe("OpenCode agent module", () => {
       const { module } = recordingModule();
       const config = { baseUrl: "http://127.0.0.1:4096" };
 
+      const { handle } = await reserveHandle(module, "opencode:root-sibling");
       await expect(
         module.createAgentSession({
           config,
           common,
+          agentSessionId: "opencode:root-sibling",
+          sessionState: handle,
           workingDirectory: "/srv/work2/project",
           allowedWorkingDirectoryRoots: ["/srv/work"],
         }),
@@ -317,10 +473,13 @@ describe("OpenCode agent module", () => {
       const { module } = recordingModule();
       const config = { baseUrl: "http://127.0.0.1:4096" };
 
+      const { handle } = await reserveHandle(module, "opencode:root-dotdot");
       await expect(
         module.createAgentSession({
           config,
           common,
+          agentSessionId: "opencode:root-dotdot",
+          sessionState: handle,
           workingDirectory: "/srv/projects/project-a/../../etc",
           allowedWorkingDirectoryRoots: ["/srv/projects"],
         }),
@@ -331,9 +490,12 @@ describe("OpenCode agent module", () => {
       const { module, apiConfigs } = recordingModule();
       const config = { baseUrl: "http://127.0.0.1:4096" };
 
+      const { handle } = await reserveHandle(module, "opencode:root-multi");
       await module.createAgentSession({
         config,
         common,
+        agentSessionId: "opencode:root-multi",
+        sessionState: handle,
         workingDirectory: "/home/me/work/project",
         allowedWorkingDirectoryRoots: ["/srv/projects", "/home/me/work"],
       });
@@ -345,9 +507,12 @@ describe("OpenCode agent module", () => {
       const { module, apiConfigs } = recordingModule();
       const config = { baseUrl: "http://127.0.0.1:4096" };
 
+      const { handle } = await reserveHandle(module, "opencode:root-empty");
       await module.createAgentSession({
         config,
         common,
+        agentSessionId: "opencode:root-empty",
+        sessionState: handle,
         workingDirectory: "/anywhere",
         allowedWorkingDirectoryRoots: [],
       });
@@ -359,9 +524,12 @@ describe("OpenCode agent module", () => {
       const { module, apiConfigs } = recordingModule();
       const config = { baseUrl: "http://127.0.0.1:4096", directory: "/srv/configured" };
 
+      const { handle } = await reserveHandle(module, "opencode:root-bare");
       await module.createAgentSession({
         config,
         common,
+        agentSessionId: "opencode:root-bare",
+        sessionState: handle,
         allowedWorkingDirectoryRoots: ["/srv/projects"],
       });
 
@@ -372,37 +540,55 @@ describe("OpenCode agent module", () => {
       const { module, apiConfigs } = recordingModule();
       const config = { baseUrl: "http://127.0.0.1:4096" };
 
-      const created = await module.createAgentSession({
+      const { handle } = await reserveHandle(module, "opencode:root-both");
+      await module.createAgentSession({
         config,
         common,
+        agentSessionId: "opencode:root-both",
+        sessionState: handle,
         workingDirectory: "/srv/projects/project-a",
         allowedWorkingDirectoryRoots: ["/srv/projects"],
+      });
+
+      const { handle: resumeHandle } = await openHandle(module, "opencode:root-both", {
+        version: 1,
+        openCodeSessionId: "session-1",
+        workingDirectory: "/srv/projects/project-a",
       });
       await module.resumeAgentSession?.({
         config,
         common,
-        agentSessionId: created.agentSessionId,
-        workingDirectory: "/srv/projects/project-a",
+        agentSessionId: "opencode:root-both",
+        sessionState: resumeHandle,
         allowedWorkingDirectoryRoots: ["/srv/projects"],
       });
 
       expect(apiConfigs).toHaveLength(1);
       expect(apiConfigs[0]?.directory).toBe("/srv/projects/project-a");
 
+      const outside = await reserveHandle(module, "opencode:root-outside-2");
       await expect(
         module.createAgentSession({
           config,
           common,
+          agentSessionId: "opencode:root-outside-2",
+          sessionState: outside.handle,
           workingDirectory: "/outside",
           allowedWorkingDirectoryRoots: ["/srv/projects"],
         }),
       ).rejects.toThrow(/not inside an allowed root/);
+
+      const { handle: outsideResume } = await openHandle(module, "opencode:root-outside-2", {
+        version: 1,
+        openCodeSessionId: "session-1",
+        workingDirectory: "/outside",
+      });
       await expect(
         module.resumeAgentSession?.({
           config,
           common,
-          agentSessionId: "opencode:session-1",
-          workingDirectory: "/outside",
+          agentSessionId: "opencode:root-outside-2",
+          sessionState: outsideResume,
           allowedWorkingDirectoryRoots: ["/srv/projects"],
         }),
       ).rejects.toThrow(/not inside an allowed root/);
@@ -412,21 +598,29 @@ describe("OpenCode agent module", () => {
       const { module, apiConfigs } = recordingModule();
       const config = { baseUrl: "http://127.0.0.1:4096" };
 
+      const { handle } = await reserveHandle(module, "opencode:root-relative");
       await expect(
         module.createAgentSession({
           config,
           common,
+          agentSessionId: "opencode:root-relative",
+          sessionState: handle,
           workingDirectory: "relative/project",
           allowedWorkingDirectoryRoots: ["/srv/projects"],
         }),
       ).rejects.toThrow(/must be an absolute path/);
 
+      const { handle: relativeResume } = await openHandle(module, "opencode:root-relative", {
+        version: 1,
+        openCodeSessionId: "session-1",
+        workingDirectory: "relative/project",
+      });
       await expect(
         module.resumeAgentSession?.({
           config,
           common,
-          agentSessionId: "opencode:session-1",
-          workingDirectory: "relative/project",
+          agentSessionId: "opencode:root-relative",
+          sessionState: relativeResume,
           allowedWorkingDirectoryRoots: ["/srv/projects"],
         }),
       ).rejects.toThrow(/must be an absolute path/);
@@ -438,15 +632,21 @@ describe("OpenCode agent module", () => {
       const { module, apiConfigs } = recordingModule();
       const config = { baseUrl: "http://127.0.0.1:4096" };
 
+      const first = await reserveHandle(module, "opencode:root-dotfoo");
       await module.createAgentSession({
         config,
         common,
+        agentSessionId: "opencode:root-dotfoo",
+        sessionState: first.handle,
         workingDirectory: "/srv/projects/..foo",
         allowedWorkingDirectoryRoots: ["/srv/projects"],
       });
+      const second = await reserveHandle(module, "opencode:root-dotdot");
       await module.createAgentSession({
         config,
         common,
+        agentSessionId: "opencode:root-dotdot",
+        sessionState: second.handle,
         workingDirectory: "/srv/projects/...",
         allowedWorkingDirectoryRoots: ["/srv/projects"],
       });
@@ -460,14 +660,73 @@ describe("OpenCode agent module", () => {
 
       // path.resolve collapses the segment to /srv/projects/project-a for the
       // boundary check, but the value forwarded to the server stays trimmed.
+      const { handle } = await reserveHandle(module, "opencode:root-lexical");
       await module.createAgentSession({
         config,
         common,
+        agentSessionId: "opencode:root-lexical",
+        sessionState: handle,
         workingDirectory: "/srv/projects/./project-a",
         allowedWorkingDirectoryRoots: ["/srv/projects"],
       });
 
       expect(apiConfigs[0]?.directory).toBe("/srv/projects/./project-a");
     });
+  });
+
+  it("recovers a legacy migrated record by deriving the provider id from the old bridge id", async () => {
+    const api = createApi();
+    const module = createOpenCodeAgentModule({ apiFactory: () => api });
+    const config = { baseUrl: "http://127.0.0.1:4096" };
+    const oldBridgeId = "opencode:session-1";
+
+    const { store, handle } = await openHandle(module, oldBridgeId, {
+      migratedFromBinding: true,
+      workingDirectory: "/srv/project-a",
+    });
+
+    await module.resumeAgentSession?.({
+      config,
+      common,
+      agentSessionId: oldBridgeId,
+      sessionState: handle,
+    });
+
+    // The provider id is derived from the old bridge id, not stored yet.
+    expect(api.getSession).toHaveBeenCalledWith("session-1");
+    expect(api.getMessages).toHaveBeenCalledWith("session-1", 50);
+
+    // The record is upgraded to the canonical versioned shape.
+    const document = await store.load();
+    expect(document.agentSessions[oldBridgeId]!.state).toEqual({
+      version: 1,
+      openCodeSessionId: "session-1",
+      workingDirectory: "/srv/project-a",
+    });
+  });
+
+  it("rejects a state record whose agent type does not match the module", async () => {
+    const module = createOpenCodeAgentModule({ apiFactory: () => createApi() });
+    const store = createInMemoryChannelStateStore();
+    const registry = createAgentSessionStateRegistry(store);
+    const record: AgentSessionRecord = {
+      recordVersion: 1,
+      agentType: "pi-coding-agent",
+      stateVersion: 1,
+      createdAt: "2026-01-01T00:00:00.000Z",
+      updatedAt: "2026-01-01T00:00:00.000Z",
+      state: { version: 1, openCodeSessionId: "session-1" },
+    };
+    await store.transaction((draft) => {
+      draft.agentSessions["opencode:wrong-type"] = record;
+    });
+
+    await expect(
+      registry.open({
+        agentSessionId: "opencode:wrong-type",
+        agentType: "opencode",
+        codec: module.sessionStateCodec,
+      }),
+    ).rejects.toThrow(/agentType/);
   });
 });

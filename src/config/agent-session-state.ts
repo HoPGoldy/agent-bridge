@@ -122,7 +122,9 @@ class StateHandleImpl<TState extends object> implements NewAgentSessionStateApi<
       // The codec never sees the live record.state reference, and its output
       // is cloned again so neither a mutating codec nor a caller-retained
       // decode result can reach the store cache or the persisted document.
-      const decoded = this.#codec.decode(defensiveClone(record.state), record.stateVersion);
+      const decoded = this.#codec.decode(defensiveClone(record.state), record.stateVersion, {
+        agentSessionId: this.agentSessionId,
+      });
       return defensiveClone(decoded);
     } catch (error) {
       const detail = error instanceof Error ? error.message : String(error);
@@ -331,7 +333,9 @@ class AgentSessionStateRegistryImpl implements AgentSessionStateRegistry {
     // codec. The codec only ever sees a defensive clone, never the live
     // record.state reference.
     try {
-      args.codec.decode(defensiveClone(record.state), record.stateVersion);
+      args.codec.decode(defensiveClone(record.state), record.stateVersion, {
+        agentSessionId: args.agentSessionId,
+      });
     } catch (error) {
       const detail = error instanceof Error ? error.message : String(error);
       throw new AgentSessionStateDecodeError(

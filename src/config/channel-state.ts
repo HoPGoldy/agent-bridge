@@ -539,3 +539,61 @@ export function createFileChannelStateStore(filePath: string): ChannelStateStore
     },
   };
 }
+
+/**
+ * In-memory {@link ChannelStateStore} with the same serialized transaction
+ * semantics as the file-backed store (single FIFO queue, atomic draft commits,
+ * no durability). Used when no durable store is injected, for example in unit
+ * tests or in-memory runtimes.
+ */
+export function createInMemoryChannelStateStore(): ChannelStateStore {
+  let cache: ChannelPersistentState = emptyChannelState();
+  let tail: Promise<void> = Promise.resolve();
+
+  function enqueue<T>(fn: () => Promise<T>): Promise<T> {
+    return new Promise<T>((resolve, reject) => {
+      const run = tail.then(fn);
+      const handled = run.then(
+        () => undefined,
+        () => undefined,
+      );
+      tail = handled;
+      run.then(resolve, reject);
+    });
+  }
+
+  return {
+    async load() {
+      return cache;
+    },
+
+    save(state: ChannelPersistentState): Promise<void> {
+      return enqueue(async () => {
+        assertWritableChannelState(state);
+        cache = cloneCommittedState(state);
+      });
+    },
+
+    transaction<T>(
+      updater: (draft: ChannelPersistentState) => T | ChannelPersistentState,
+    ): Promise<T> {
+      return enqueue(async () => {
+        const draft = cloneCommittedState(cache);
+        const result = updater(draft);
+        if (isThenable(result)) {
+          throw new ChannelStateTransactionError(
+            "transaction updater must be synchronous; do not await inside the updater",
+          );
+        }
+        const next: ChannelPersistentState = isChannelPersistentState(result) ? result : draft;
+        assertWritableChannelState(next);
+        cache = next;
+        return result as T;
+      });
+    },
+
+    async flush() {
+      await tail;
+    },
+  };
+}

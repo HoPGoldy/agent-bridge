@@ -114,7 +114,7 @@ function summarizeClient(module: ClientModule<any> | undefined, channel: Channel
   return summary ?? `type=${channel.client.type}`;
 }
 
-function summarizeAgent(module: AgentModule<any> | undefined, channel: ChannelConfig): string {
+function summarizeAgent(module: AgentModule<any, any> | undefined, channel: ChannelConfig): string {
   const summary = module?.createConfigCollector?.()?.summarize?.(channel.agent.config);
   return summary ?? `type=${channel.agent.type}`;
 }

@@ -191,12 +191,25 @@ export interface ClientModule<TConfig = unknown> {
   createClientAdapter(args: { config: TConfig; common: ChannelCommonContext }): IMAdapter;
 }
 
-export interface AgentModule<TConfig = unknown> {
+export interface AgentModule<TConfig = unknown, TState extends object = Record<string, never>> {
   readonly type: string;
+  /**
+   * Codec that validates and encodes this module's persisted session state.
+   * The core uses it to reserve/open state handles; the module must accept the
+   * handle in create/resume and keep its state JSON-compatible and versioned.
+   */
+  readonly sessionStateCodec: AgentSessionStateCodec<TState>;
   createConfigCollector?: () => ConfigAdapter<TConfig>;
   createAgentSession(args: {
     config: TConfig;
     common: ChannelCommonContext;
+    /**
+     * Core-owned bridge agent session id. The module must use it verbatim as
+     * the adapter's agentSessionId and must not derive provider ids from it:
+     * provider ids live in the session state.
+     */
+    agentSessionId: string;
+    sessionState: NewAgentSessionStateApi<TState>;
     workingDirectory?: string;
     /**
      * Optional list of allowed working-directory roots. When present and
@@ -205,15 +218,19 @@ export interface AgentModule<TConfig = unknown> {
      * enforcement applies (local realpath for Pi, lexical-only for OpenCode).
      */
     allowedWorkingDirectoryRoots?: string[];
-  }): Promise<{
-    agentSessionId: string;
-    agentAdapter: AgentAdapter;
-  }>;
-  resumeAgentSession?(args: {
+  }): Promise<AgentAdapter>;
+  /**
+   * Restores an adapter for an existing persisted agent session from its
+   * scoped state handle. Required for every persistable module: the core never
+   * reads adapter-owned state (for example the working directory) to guess how
+   * to restore a session; the module must read what it needs from
+   * `sessionState` itself.
+   */
+  resumeAgentSession(args: {
     config: TConfig;
     common: ChannelCommonContext;
     agentSessionId: string;
-    workingDirectory?: string;
+    sessionState: AgentSessionStateApi<TState>;
     allowedWorkingDirectoryRoots?: string[];
   }): Promise<AgentAdapter>;
 }
@@ -308,11 +325,21 @@ export interface ChannelRunner {
 
 export interface GatewayCoreOptions {
   imAdapter: IMAdapter;
-  agentModule: AgentModule<any>;
+  agentModule: AgentModule<any, any>;
   agentConfig: AgentConfig["config"];
   agentIdleTimeoutMs: number;
   allowedWorkingDirectoryRoots?: string[];
-  bindingStore?: SessionBindingStore;
+  /**
+   * Per-channel persistent document store. When omitted, an in-memory store is
+   * used (no durability). When `agentSessionStateRegistry` is also provided,
+   * this store must be the registry's backing store.
+   */
+  channelStateStore?: ChannelStateStore;
+  /**
+   * Registry for scoped agent session state handles. Derived from
+   * `channelStateStore` when omitted.
+   */
+  agentSessionStateRegistry?: AgentSessionStateRegistry;
   common?: ChannelCommonContext;
 }
 
@@ -382,7 +409,7 @@ export interface ChannelStateStore {
  */
 export interface AgentSessionStateCodec<TState extends object> {
   readonly currentVersion: number;
-  decode(raw: unknown, stateVersion: number): TState;
+  decode(raw: unknown, stateVersion: number, context: { agentSessionId: string }): TState;
   encode(state: TState): unknown;
 }
 

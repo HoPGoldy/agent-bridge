@@ -4,12 +4,14 @@ import type {
   AgentInputEvent,
   AgentOutputEvent,
   AgentSessionStatus,
+  AgentSessionStateApi,
   OutboundAttachment,
 } from "../../../../types";
 import { createLogger, type Logger } from "../../../../core/logger";
 import { extractMediaMarkers } from "../../media-convention";
 import { PiRpcClient } from "./pi-rpc-client";
 import { toPiSessionId } from "./pi-session-id";
+import type { PiCodingAgentSessionStateV1 } from "../index";
 
 class PiModelCommandError extends Error {
   readonly kind: "agent.model.invalid" | "agent.model.busy" | "agent.model.set.unavailable";
@@ -28,6 +30,7 @@ export class PiCodingAgentAdapter implements AgentAdapter {
   readonly #bin: string;
   readonly #model?: string;
   readonly #extraArgs: string[];
+  readonly #sessionState?: AgentSessionStateApi<PiCodingAgentSessionStateV1>;
   readonly #logger: Logger;
   #client: PiRpcClient | null = null;
   #onOutput: ((event: AgentOutputEvent) => Promise<void> | void) | null = null;
@@ -42,6 +45,7 @@ export class PiCodingAgentAdapter implements AgentAdapter {
     bin,
     model,
     extraArgs,
+    sessionState,
     logger,
   }: {
     agentSessionId: string;
@@ -50,6 +54,7 @@ export class PiCodingAgentAdapter implements AgentAdapter {
     bin?: string;
     model?: string;
     extraArgs?: string[];
+    sessionState?: AgentSessionStateApi<PiCodingAgentSessionStateV1>;
     logger?: Logger;
   }) {
     this.#agentSessionId = agentSessionId;
@@ -59,7 +64,13 @@ export class PiCodingAgentAdapter implements AgentAdapter {
     this.#bin = bin ?? "pi";
     this.#model = model;
     this.#extraArgs = extraArgs ?? [];
+    this.#sessionState = sessionState;
     this.#logger = logger ?? createLogger("pi-coding-agent");
+  }
+
+  /** The injected session-scoped state handle (owned by the gateway). */
+  get sessionState(): AgentSessionStateApi<PiCodingAgentSessionStateV1> | undefined {
+    return this.#sessionState;
   }
 
   async start(onOutput: (event: AgentOutputEvent) => Promise<void> | void): Promise<void> {

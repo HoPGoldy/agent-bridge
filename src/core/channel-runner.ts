@@ -1,7 +1,8 @@
 import type { ChannelRunner, RunChannelOptions } from "../types";
 import { GatewayCore } from "./gateway-core";
 import { createLogger } from "./logger";
-import { createFileSessionBindingStore, getSessionBindingStorePath } from "../config/session-bindings";
+import { createFileChannelStateStore, getChannelStateStorePath } from "../config/channel-state";
+import { createAgentSessionStateRegistry } from "../config/agent-session-state";
 import { getTypedAgentModule } from "../modules/agent";
 import { getTypedClientModule } from "../modules/client";
 
@@ -16,7 +17,8 @@ export async function runChannel({ channelName, channelConfig, defaults }: RunCh
   };
 
   const imAdapter = clientModule.createClientAdapter({ config: channelConfig.client.config, common });
-  const bindingStore = createFileSessionBindingStore(getSessionBindingStorePath(channelName));
+  const channelStateStore = createFileChannelStateStore(getChannelStateStorePath(channelName));
+  const agentSessionStateRegistry = createAgentSessionStateRegistry(channelStateStore);
 
   const core = new GatewayCore({
     imAdapter,
@@ -26,7 +28,8 @@ export async function runChannel({ channelName, channelConfig, defaults }: RunCh
     ...(defaults.allowedWorkingDirectoryRoots !== undefined
       ? { allowedWorkingDirectoryRoots: defaults.allowedWorkingDirectoryRoots }
       : {}),
-    bindingStore,
+    channelStateStore,
+    agentSessionStateRegistry,
     common,
   });
 

@@ -8,11 +8,13 @@ import type {
   AgentInputEvent,
   AgentOutputEvent,
   AgentSessionStatus,
+  AgentSessionStateApi,
   OpenCodeAgentConfig,
   OutboundAttachment,
 } from "../../../../types";
 import { describeOpenCodeError, type OpenCodeApi, type OpenCodeMessage } from "./opencode-api";
 import { OpenCodeRuntime, type OpenCodeRuntimeAdapter } from "./opencode-runtime";
+import type { OpenCodeAgentSessionStateV1 } from "../index";
 
 class OpenCodeModelCommandError extends Error {
   readonly kind: "agent.model.invalid" | "agent.model.busy" | "agent.model.set.unavailable";
@@ -41,6 +43,7 @@ export class OpenCodeAgentAdapter implements AgentAdapter, OpenCodeRuntimeAdapte
   readonly #config: OpenCodeAgentConfig;
   readonly #runtime: OpenCodeRuntime;
   readonly #api: OpenCodeApi;
+  readonly #sessionState?: AgentSessionStateApi<OpenCodeAgentSessionStateV1>;
   readonly #logger: Logger;
   #onOutput: ((event: AgentOutputEvent) => Promise<void> | void) | null = null;
   #started = false;
@@ -66,6 +69,7 @@ export class OpenCodeAgentAdapter implements AgentAdapter, OpenCodeRuntimeAdapte
     config,
     runtime,
     initialModel,
+    sessionState,
     logger,
   }: {
     agentSessionId: string;
@@ -73,6 +77,7 @@ export class OpenCodeAgentAdapter implements AgentAdapter, OpenCodeRuntimeAdapte
     config: OpenCodeAgentConfig;
     runtime: OpenCodeRuntime;
     initialModel?: SelectedModel;
+    sessionState?: AgentSessionStateApi<OpenCodeAgentSessionStateV1>;
     logger?: Logger;
   }) {
     this.#agentSessionId = agentSessionId;
@@ -80,12 +85,18 @@ export class OpenCodeAgentAdapter implements AgentAdapter, OpenCodeRuntimeAdapte
     this.#config = config;
     this.#runtime = runtime;
     this.#api = runtime.api;
+    this.#sessionState = sessionState;
     this.#model = initialModel;
     this.#logger = logger ?? createLogger("opencode-agent");
   }
 
   get openCodeSessionId(): string {
     return this.#openCodeSessionId;
+  }
+
+  /** The injected session-scoped state handle (owned by the gateway). */
+  get sessionState(): AgentSessionStateApi<OpenCodeAgentSessionStateV1> | undefined {
+    return this.#sessionState;
   }
 
   async start(onOutput: (event: AgentOutputEvent) => Promise<void> | void): Promise<void> {

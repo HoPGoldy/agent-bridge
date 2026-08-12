@@ -32,7 +32,7 @@ function makeCodec<TState extends object>(
 ): AgentSessionStateCodec<TState> {
   return {
     currentVersion,
-    decode(raw, stateVersion) {
+    decode(raw, stateVersion, _context) {
       if (stateVersion !== currentVersion) {
         throw new Error(`unsupported state version ${stateVersion}`);
       }
@@ -210,7 +210,7 @@ describe("agent session state registry", () => {
   /** Codec whose encode returns the caller's object untouched (risky alias pattern). */
   const passthroughCodec: AgentSessionStateCodec<TestState> = {
     currentVersion: 1,
-    decode(raw, stateVersion) {
+    decode(raw, stateVersion, _context) {
       if (stateVersion !== 1) {
         throw new Error(`unsupported state version ${stateVersion}`);
       }
@@ -750,7 +750,7 @@ describe("agent session state registry", () => {
 
     const mutatingCodec: AgentSessionStateCodec<TestState> = {
       currentVersion: 1,
-      decode(raw, stateVersion) {
+      decode(raw, stateVersion, _context) {
         if (stateVersion !== 1) {
           throw new Error(`unsupported state version ${stateVersion}`);
         }
