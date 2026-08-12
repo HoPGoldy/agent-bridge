@@ -1,12 +1,9 @@
 import os from "node:os";
 import path from "node:path";
-import { PiCodingAgentAdapter } from "./adapter/pi-coding-agent-adapter";
-import { resolveWorkingDirectory } from "./working-directory";
+import { PiCodingAgentAdapter, type PiCodingAgentAdapterOptions } from "./adapter/pi-coding-agent-adapter";
 import { createLogger } from "../../../core/logger";
 import type {
-  AgentAdapter,
   AgentModule,
-  AgentSessionStateApi,
   AgentSessionStateCodec,
   ConfigAdapter,
   PiCodingAgentConfig,
@@ -14,14 +11,25 @@ import type {
 
 const logger = createLogger("pi-coding-agent");
 
-/** Versioned per-session state owned by the Pi module. */
+/**
+ * Versioned per-session state owned by the Pi module. The adapter resolves and
+ * persists the canonical working directory (including the default cwd for a
+ * bare `/new`) before spawning the Pi process, so a resumed session always
+ * restarts in the same directory even when the bridge process cwd changed.
+ */
 export interface PiCodingAgentSessionStateV1 {
   version: 1;
+  /** Canonical (realpath-resolved) directory the Pi process is spawned in. */
+  workingDirectory: string;
+  /** Where the directory came from: `user` for `/new <path>`, `default` for a bare `/new`. */
+  workingDirectorySource: "default" | "user";
   /**
-   * Canonicalized working directory. Absent when the session was started with
-   * a bare `/new` (the adapter falls back to the bridge process cwd).
+   * Decode-only marker set while the persisted record is still the legacy
+   * binding-migrated form (`{ migratedFromBinding: true }`). The adapter
+   * rewrites the record to the canonical V1 shape on the first resume; encode
+   * never persists it.
    */
-  workingDirectory?: string;
+  migratedFromBinding?: true;
 }
 
 function isRecord(value: unknown): value is Record<string, unknown> {
@@ -35,39 +43,78 @@ function workingDirectoryOf(raw: Record<string, unknown>): string | undefined {
 }
 
 /**
- * Validates and encodes the Pi session state. Legacy binding-migrated records
- * (`{ migratedFromBinding: true, workingDirectory? }`) decode to the versioned
- * shape; the module rewrites them with `update` on resume so the persisted
- * record converges to the canonical form.
+ * Validates and encodes the Pi session state.
+ *
+ * Legacy binding-migrated records (`{ migratedFromBinding: true }`) decode to
+ * the versioned shape: a migrated `workingDirectory` is treated as user
+ * supplied, while a record without one is migrated to the current process cwd
+ * as a default. Both are marked `migratedFromBinding: true` so the adapter
+ * rewrites them into the canonical persisted form on the first resume.
+ *
+ * `stateVersion` is strictly validated: any version other than the current one
+ * fails decode (fail-safe) instead of being silently coerced.
  */
 export const piCodingAgentSessionStateCodec: AgentSessionStateCodec<PiCodingAgentSessionStateV1> = {
   currentVersion: 1,
 
-  decode(raw, _stateVersion, _context) {
-    if (isRecord(raw) && raw.migratedFromBinding === true) {
+  decode(raw, stateVersion, _context) {
+    if (!isRecord(raw)) {
+      throw new Error("invalid Pi agent session state: expected a state document");
+    }
+
+    if (raw.migratedFromBinding === true) {
+      if (stateVersion !== 1) {
+        throw new Error(`unsupported Pi agent session state version ${stateVersion}`);
+      }
       const workingDirectory = workingDirectoryOf(raw);
       return {
         version: 1,
-        ...(workingDirectory !== undefined ? { workingDirectory } : {}),
+        workingDirectory: workingDirectory ?? process.cwd(),
+        workingDirectorySource: workingDirectory !== undefined ? "user" : "default",
+        migratedFromBinding: true,
       };
     }
-    if (!isRecord(raw) || raw.version !== 1) {
+
+    if (raw.version !== 1) {
       throw new Error("invalid Pi agent session state: expected a versioned state document");
     }
-    if (
-      raw.workingDirectory !== undefined &&
-      (typeof raw.workingDirectory !== "string" || raw.workingDirectory.length === 0)
-    ) {
-      throw new Error("invalid Pi agent session state: workingDirectory must be a non-empty string when present");
+    if (stateVersion !== 1) {
+      throw new Error(`unsupported Pi agent session state version ${stateVersion}`);
     }
-    return {
-      version: 1,
-      ...(workingDirectoryOf(raw) !== undefined ? { workingDirectory: workingDirectoryOf(raw) } : {}),
-    };
+    const workingDirectory = workingDirectoryOf(raw);
+    if (workingDirectory === undefined) {
+      throw new Error("invalid Pi agent session state: workingDirectory must be a non-empty string");
+    }
+    const source = raw.workingDirectorySource;
+    if (source !== "default" && source !== "user") {
+      throw new Error(
+        'invalid Pi agent session state: workingDirectorySource must be "default" or "user"',
+      );
+    }
+    return { version: 1, workingDirectory, workingDirectorySource: source };
   },
 
   encode(state) {
-    return { ...state };
+    // Validate before persisting: a forged or partially-migrated state must
+    // fail here, while the writer still owns the failure, never on the next
+    // decode. The canonical persisted form never includes the decode-only
+    // migration marker.
+    if (state.version !== 1) {
+      throw new Error("invalid Pi agent session state: version must be 1");
+    }
+    if (typeof state.workingDirectory !== "string" || state.workingDirectory.length === 0) {
+      throw new Error("invalid Pi agent session state: workingDirectory must be a non-empty string");
+    }
+    if (state.workingDirectorySource !== "default" && state.workingDirectorySource !== "user") {
+      throw new Error(
+        'invalid Pi agent session state: workingDirectorySource must be "default" or "user"',
+      );
+    }
+    return {
+      version: 1,
+      workingDirectory: state.workingDirectory,
+      workingDirectorySource: state.workingDirectorySource,
+    };
   },
 };
 
@@ -79,26 +126,20 @@ function parseExtraArgs(raw: string | undefined): string[] {
     .filter(Boolean);
 }
 
-async function buildAdapter(
+function buildAdapterOptions(
   config: PiCodingAgentConfig,
   agentSessionId: string,
-  workingDirectory: string | undefined,
-  allowedWorkingDirectoryRoots: string[] | undefined,
-  sessionState: AgentSessionStateApi<PiCodingAgentSessionStateV1>,
-): Promise<AgentAdapter> {
-  const cwd = await resolveWorkingDirectory(workingDirectory, { allowedWorkingDirectoryRoots });
-  return buildAdapterWithCwd(config, agentSessionId, cwd, sessionState);
-}
-
-function buildAdapterWithCwd(
-  config: PiCodingAgentConfig,
-  agentSessionId: string,
-  cwd: string,
-  sessionState: AgentSessionStateApi<PiCodingAgentSessionStateV1>,
-): AgentAdapter {
-  return new PiCodingAgentAdapter({
+  sessionState: PiCodingAgentAdapterOptions["sessionState"],
+  options: { mode: "create" | "resume"; workingDirectory?: string; allowedWorkingDirectoryRoots?: string[] },
+): PiCodingAgentAdapterOptions {
+  return {
     agentSessionId,
-    cwd,
+    mode: options.mode,
+    sessionState,
+    ...(options.workingDirectory !== undefined ? { workingDirectory: options.workingDirectory } : {}),
+    ...(options.allowedWorkingDirectoryRoots !== undefined
+      ? { allowedWorkingDirectoryRoots: options.allowedWorkingDirectoryRoots }
+      : {}),
     sessionDir:
       config.sessionDir ??
       process.env.PI_SESSION_DIR ??
@@ -106,8 +147,7 @@ function buildAdapterWithCwd(
     bin: config.bin ?? process.env.PI_BIN ?? "pi",
     model: config.model ?? process.env.PI_MODEL,
     extraArgs: config.extraArgs ?? parseExtraArgs(process.env.PI_RPC_EXTRA_ARGS),
-    sessionState,
-  });
+  };
 }
 
 function createPiCodingAgentConfigCollector(): ConfigAdapter<PiCodingAgentConfig> {
@@ -131,38 +171,35 @@ function createPiCodingAgentConfigCollector(): ConfigAdapter<PiCodingAgentConfig
   };
 }
 
+/**
+ * Pi module. The module only assembles adapter dependencies: the adapter owns
+ * the working-directory resolution and its session state (initialize on
+ * create, read/rewrite on resume) inside `start()`, before the Pi process is
+ * spawned.
+ */
 export const piCodingAgentModule: AgentModule<PiCodingAgentConfig, PiCodingAgentSessionStateV1> = {
   type: "pi-coding-agent",
   sessionStateCodec: piCodingAgentSessionStateCodec,
   createConfigCollector: createPiCodingAgentConfigCollector,
+
   async createAgentSession({ config, common, agentSessionId, sessionState, workingDirectory, allowedWorkingDirectoryRoots }) {
     logger.info(`creating agent session ${agentSessionId} for channel ${common.channelName}`);
-    const cwd = await resolveWorkingDirectory(workingDirectory, { allowedWorkingDirectoryRoots });
-    const adapter = await buildAdapter(
-      config,
-      agentSessionId,
-      workingDirectory,
-      allowedWorkingDirectoryRoots,
-      sessionState,
+    return new PiCodingAgentAdapter(
+      buildAdapterOptions(config, agentSessionId, sessionState, {
+        mode: "create",
+        workingDirectory,
+        allowedWorkingDirectoryRoots,
+      }),
     );
-    await sessionState.initialize({
-      version: 1,
-      ...(workingDirectory !== undefined && workingDirectory.trim() !== "" ? { workingDirectory: cwd } : {}),
-    });
-    return adapter;
   },
+
   async resumeAgentSession({ config, common, agentSessionId, sessionState, allowedWorkingDirectoryRoots }) {
     logger.info(`resuming agent session ${agentSessionId} for channel ${common.channelName}`);
-    const state = await sessionState.read();
-    const cwd = await resolveWorkingDirectory(state.workingDirectory, { allowedWorkingDirectoryRoots });
-    const adapter = buildAdapterWithCwd(config, agentSessionId, cwd, sessionState);
-    // Normalize legacy binding-migrated records into the canonical versioned
-    // shape, storing the canonicalized working directory exactly like create
-    // does (a no-op rewrite for already-versioned records; a bare `/new` with
-    // no stored directory is left untouched).
-    await sessionState.update((current) =>
-      state.workingDirectory === undefined ? current : { ...current, workingDirectory: cwd },
+    return new PiCodingAgentAdapter(
+      buildAdapterOptions(config, agentSessionId, sessionState, {
+        mode: "resume",
+        allowedWorkingDirectoryRoots,
+      }),
     );
-    return adapter;
   },
 };

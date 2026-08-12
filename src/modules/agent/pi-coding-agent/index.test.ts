@@ -1,4 +1,4 @@
-import { mkdir, mkdtemp, realpath, rm } from "node:fs/promises";
+import { mkdir, mkdtemp, rm } from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
@@ -7,29 +7,37 @@ import { createAgentSessionStateRegistry } from "../../../config/agent-session-s
 import { createInMemoryChannelStateStore } from "../../../config/channel-state";
 import { piCodingAgentModule, type PiCodingAgentSessionStateV1 } from "./index";
 
-const adapterOptions: Array<{ agentSessionId: string; cwd: string; sessionState?: unknown }> = [];
+const adapterOptions: Array<{
+  agentSessionId: string;
+  mode?: "create" | "resume";
+  sessionState?: unknown;
+  workingDirectory?: string;
+  allowedWorkingDirectoryRoots?: string[];
+}> = [];
 
 vi.mock("./adapter/pi-coding-agent-adapter", () => ({
   PiCodingAgentAdapter: class FakePiCodingAgentAdapter {
-    constructor(options: { agentSessionId: string; cwd: string; sessionState?: unknown }) {
+    constructor(options: {
+      agentSessionId: string;
+      mode?: "create" | "resume";
+      sessionState?: unknown;
+      workingDirectory?: string;
+      allowedWorkingDirectoryRoots?: string[];
+    }) {
       adapterOptions.push(options);
     }
   },
 }));
 
-function makeHandle(id: string, codec: AgentSessionStateCodec<PiCodingAgentSessionStateV1>) {
+async function reserveHandle(id: string) {
   const store = createInMemoryChannelStateStore();
   const registry = createAgentSessionStateRegistry(store);
-  return { store, registry };
-}
-
-async function reserveHandle(id: string) {
-  const { registry } = makeHandle(id, piCodingAgentModule.sessionStateCodec);
-  return registry.reserve({
+  const handle = await registry.reserve({
     agentSessionId: id,
     agentType: piCodingAgentModule.type,
     codec: piCodingAgentModule.sessionStateCodec,
   });
+  return { store, handle };
 }
 
 async function openHandle(id: string, initialState: unknown) {
@@ -90,234 +98,331 @@ describe("Pi coding agent module working directory", () => {
 
   const common = { channelName: "test-channel", language: "en-US" as const };
 
-  it("passes the canonicalized working directory to the adapter and persists it in state on create", async () => {
-    const expected = await realpath(projectDir);
-    const sessionState = await reserveHandle("pi-coding-agent:created");
+  it("passes the raw requested working directory, roots and state handle to the adapter on create", async () => {
+    const { handle } = await reserveHandle("pi-coding-agent:created");
 
     const adapter = await piCodingAgentModule.createAgentSession({
       config: {},
       common,
       agentSessionId: "pi-coding-agent:created",
-      sessionState,
+      sessionState: handle,
       workingDirectory: projectDir,
+      allowedWorkingDirectoryRoots: [base],
     });
 
     expect(adapter).toBeDefined();
-    expect(adapterOptions.at(-1)).toEqual(
-      expect.objectContaining({
-        agentSessionId: "pi-coding-agent:created",
-        cwd: expected,
-        sessionState,
-      }),
-    );
-    await expect(sessionState.read()).resolves.toEqual({
-      version: 1,
-      workingDirectory: expected,
-    });
-  });
-
-  it("passes the canonicalized working directory to the adapter on resume from state", async () => {
-    const expected = await realpath(projectDir);
-    const { handle } = await openHandle("pi-coding-agent:resumed", {
-      version: 1,
-      workingDirectory: expected,
-    });
-
-    await piCodingAgentModule.resumeAgentSession!({
-      config: {},
-      common,
-      agentSessionId: "pi-coding-agent:resumed",
+    expect(adapterOptions.at(-1)).toEqual({
+      agentSessionId: "pi-coding-agent:created",
+      mode: "create",
       sessionState: handle,
+      workingDirectory: projectDir,
+      allowedWorkingDirectoryRoots: [base],
+      sessionDir: expect.any(String),
+      bin: expect.any(String),
+      extraArgs: [],
     });
-
-    expect(adapterOptions.at(-1)).toEqual(
-      expect.objectContaining({
-        agentSessionId: "pi-coding-agent:resumed",
-        cwd: expected,
-        sessionState: handle,
-      }),
-    );
   });
 
-  it("uses the same canonicalization for create and resume", async () => {
-    const expected = await realpath(projectDir);
+  it("does not initialize or otherwise touch the session state on create", async () => {
+    const { handle } = await reserveHandle("pi-coding-agent:created");
 
-    const createHandle = await reserveHandle("pi-coding-agent:created");
     await piCodingAgentModule.createAgentSession({
       config: {},
       common,
       agentSessionId: "pi-coding-agent:created",
-      sessionState: createHandle,
+      sessionState: handle,
       workingDirectory: projectDir,
     });
 
-    const { handle } = await openHandle("pi-coding-agent:created", {
-      version: 1,
-      workingDirectory: expected,
-    });
-    await piCodingAgentModule.resumeAgentSession!({
-      config: {},
-      common,
-      agentSessionId: "pi-coding-agent:created",
-      sessionState: handle,
-    });
-
-    expect(adapterOptions).toHaveLength(2);
-    expect(adapterOptions[0]!.cwd).toBe(expected);
-    expect(adapterOptions[1]!.cwd).toBe(expected);
+    // The module must leave state management to the adapter: the record is
+    // only created when the adapter's start() initializes it.
+    await expect(handle.read()).rejects.toThrow(/has not been initialized/);
   });
 
-  it("defaults to process.cwd() and omits workingDirectory from state for a bare /new", async () => {
-    const sessionState = await reserveHandle("pi-coding-agent:bare");
+  it("omits workingDirectory for a bare /new and still passes the state handle", async () => {
+    const { handle } = await reserveHandle("pi-coding-agent:bare");
 
     await piCodingAgentModule.createAgentSession({
       config: {},
       common,
       agentSessionId: "pi-coding-agent:bare",
-      sessionState,
-    });
-
-    expect(adapterOptions.at(-1)?.cwd).toBe(process.cwd());
-    await expect(sessionState.read()).resolves.toEqual({ version: 1 });
-  });
-
-  it("rejects an invalid working directory on create with a clear error", async () => {
-    const sessionState = await reserveHandle("pi-coding-agent:bad");
-
-    await expect(
-      piCodingAgentModule.createAgentSession({
-        config: {},
-        common,
-        agentSessionId: "pi-coding-agent:bad",
-        sessionState,
-        workingDirectory: path.join(base, "missing"),
-      }),
-    ).rejects.toThrow(/invalid working directory.*no such file or directory/);
-
-    expect(adapterOptions).toHaveLength(0);
-  });
-
-  it("allows a working directory inside an allowed root on create and resume", async () => {
-    const root = path.join(base, "projects");
-    const target = path.join(root, "project-a");
-    await mkdir(target, { recursive: true });
-    const expected = await realpath(target);
-
-    const createHandle = await reserveHandle("pi-coding-agent:in-root");
-    await piCodingAgentModule.createAgentSession({
-      config: {},
-      common,
-      agentSessionId: "pi-coding-agent:in-root",
-      sessionState: createHandle,
-      workingDirectory: target,
-      allowedWorkingDirectoryRoots: [root],
-    });
-
-    const { handle } = await openHandle("pi-coding-agent:in-root", {
-      version: 1,
-      workingDirectory: expected,
-    });
-    await piCodingAgentModule.resumeAgentSession!({
-      config: {},
-      common,
-      agentSessionId: "pi-coding-agent:in-root",
       sessionState: handle,
-      allowedWorkingDirectoryRoots: [root],
     });
 
-    expect(adapterOptions).toHaveLength(2);
-    expect(adapterOptions[0]!.cwd).toBe(expected);
-    expect(adapterOptions[1]!.cwd).toBe(expected);
-  });
-
-  it("rejects a working directory outside the allowed roots on create and resume", async () => {
-    const root = path.join(base, "projects");
-    const outside = path.join(base, "outside");
-    await mkdir(root, { recursive: true });
-    await mkdir(outside, { recursive: true });
-
-    const createHandle = await reserveHandle("pi-coding-agent:outside");
-    await expect(
-      piCodingAgentModule.createAgentSession({
-        config: {},
-        common,
-        agentSessionId: "pi-coding-agent:outside",
-        sessionState: createHandle,
-        workingDirectory: outside,
-        allowedWorkingDirectoryRoots: [root],
-      }),
-    ).rejects.toThrow(/not inside an allowed root/);
-
-    const { handle } = await openHandle("pi-coding-agent:outside", {
-      version: 1,
-      workingDirectory: outside,
-    });
-    await expect(
-      piCodingAgentModule.resumeAgentSession!({
-        config: {},
-        common,
-        agentSessionId: "pi-coding-agent:outside",
+    expect(adapterOptions.at(-1)).toEqual(
+      expect.objectContaining({
+        agentSessionId: "pi-coding-agent:bare",
         sessionState: handle,
-        allowedWorkingDirectoryRoots: [root],
       }),
-    ).rejects.toThrow(/not inside an allowed root/);
-
-    expect(adapterOptions).toHaveLength(0);
+    );
+    expect(adapterOptions.at(-1)?.workingDirectory).toBeUndefined();
   });
 
-  it("keeps the default cwd behavior for a bare /new even when roots are configured", async () => {
-    const root = path.join(base, "projects");
-    await mkdir(root, { recursive: true });
-
-    const sessionState = await reserveHandle("pi-coding-agent:bare-rooted");
-    await piCodingAgentModule.createAgentSession({
-      config: {},
-      common,
-      agentSessionId: "pi-coding-agent:bare-rooted",
-      sessionState,
-      allowedWorkingDirectoryRoots: [root],
-    });
-
-    expect(adapterOptions.at(-1)?.cwd).toBe(process.cwd());
-  });
-
-  it("is permissive with an empty allowlist", async () => {
-    const target = path.join(base, "anywhere");
-    await mkdir(target, { recursive: true });
-
-    const sessionState = await reserveHandle("pi-coding-agent:permissive");
-    await piCodingAgentModule.createAgentSession({
-      config: {},
-      common,
-      agentSessionId: "pi-coding-agent:permissive",
-      sessionState,
-      workingDirectory: target,
-      allowedWorkingDirectoryRoots: [],
-    });
-
-    expect(adapterOptions.at(-1)?.cwd).toBe(await realpath(target));
-  });
-
-  it("recovers a legacy migrated record on resume and upgrades it to the versioned shape", async () => {
-    const expected = await realpath(projectDir);
-    const { store, handle } = await openHandle("pi-coding-agent:legacy", {
-      migratedFromBinding: true,
+  it("passes the state handle and roots to the adapter on resume without reading state", async () => {
+    const { handle } = await openHandle("pi-coding-agent:resumed", {
+      version: 1,
       workingDirectory: projectDir,
+      workingDirectorySource: "user",
     });
 
-    await piCodingAgentModule.resumeAgentSession!({
+    const adapter = await piCodingAgentModule.resumeAgentSession!({
       config: {},
       common,
-      agentSessionId: "pi-coding-agent:legacy",
+      agentSessionId: "pi-coding-agent:resumed",
+      sessionState: handle,
+      allowedWorkingDirectoryRoots: [base],
+    });
+
+    expect(adapter).toBeDefined();
+    expect(adapterOptions.at(-1)).toEqual(
+      expect.objectContaining({
+        agentSessionId: "pi-coding-agent:resumed",
+        mode: "resume",
+        sessionState: handle,
+        allowedWorkingDirectoryRoots: [base],
+      }),
+    );
+    expect(adapterOptions.at(-1)?.workingDirectory).toBeUndefined();
+  });
+
+  it("does not validate or canonicalize paths at the module level", async () => {
+    // The module must pass the raw intent through: validation and
+    // canonicalization are the adapter's job inside start().
+    const missing = path.join(base, "does-not-exist");
+    const { handle } = await reserveHandle("pi-coding-agent:raw");
+
+    const adapter = await piCodingAgentModule.createAgentSession({
+      config: {},
+      common,
+      agentSessionId: "pi-coding-agent:raw",
+      sessionState: handle,
+      workingDirectory: missing,
+    });
+
+    expect(adapter).toBeDefined();
+    expect(adapterOptions.at(-1)?.workingDirectory).toBe(missing);
+  });
+
+  it("forwards channel config defaults into the adapter options", async () => {
+    const { handle } = await reserveHandle("pi-coding-agent:config");
+
+    await piCodingAgentModule.createAgentSession({
+      config: {
+        bin: "/custom/pi",
+        sessionDir: "/custom/sessions",
+        model: "anthropic/claude-sonnet-4-5",
+        extraArgs: ["--thinking", "high"],
+      },
+      common,
+      agentSessionId: "pi-coding-agent:config",
       sessionState: handle,
     });
 
-    expect(adapterOptions.at(-1)?.cwd).toBe(expected);
+    expect(adapterOptions.at(-1)).toEqual(
+      expect.objectContaining({
+        bin: "/custom/pi",
+        sessionDir: "/custom/sessions",
+        model: "anthropic/claude-sonnet-4-5",
+        extraArgs: ["--thinking", "high"],
+      }),
+    );
+  });
+
+  it("applies env fallbacks for bin, sessionDir and extraArgs", async () => {
+    const { handle } = await reserveHandle("pi-coding-agent:env");
+    const previous = {
+      bin: process.env.PI_BIN,
+      sessionDir: process.env.PI_SESSION_DIR,
+      extraArgs: process.env.PI_RPC_EXTRA_ARGS,
+    };
+    process.env.PI_BIN = "/env/pi";
+    process.env.PI_SESSION_DIR = "/env/sessions";
+    process.env.PI_RPC_EXTRA_ARGS = "--foo --bar";
+
+    try {
+      await piCodingAgentModule.createAgentSession({
+        config: {},
+        common,
+        agentSessionId: "pi-coding-agent:env",
+        sessionState: handle,
+      });
+    } finally {
+      if (previous.bin === undefined) delete process.env.PI_BIN;
+      else process.env.PI_BIN = previous.bin;
+      if (previous.sessionDir === undefined) delete process.env.PI_SESSION_DIR;
+      else process.env.PI_SESSION_DIR = previous.sessionDir;
+      if (previous.extraArgs === undefined) delete process.env.PI_RPC_EXTRA_ARGS;
+      else process.env.PI_RPC_EXTRA_ARGS = previous.extraArgs;
+    }
+
+    expect(adapterOptions.at(-1)).toEqual(
+      expect.objectContaining({
+        bin: "/env/pi",
+        sessionDir: "/env/sessions",
+        extraArgs: ["--foo", "--bar"],
+      }),
+    );
+  });
+
+  it("resolves extraArgs from config before falling back to the environment", async () => {
+    const { handle } = await reserveHandle("pi-coding-agent:extra");
+    const previous = process.env.PI_RPC_EXTRA_ARGS;
+    process.env.PI_RPC_EXTRA_ARGS = "--env-only";
+
+    try {
+      await piCodingAgentModule.createAgentSession({
+        config: { extraArgs: ["--config", "with space"] },
+        common,
+        agentSessionId: "pi-coding-agent:extra",
+        sessionState: handle,
+      });
+    } finally {
+      if (previous === undefined) delete process.env.PI_RPC_EXTRA_ARGS;
+      else process.env.PI_RPC_EXTRA_ARGS = previous;
+    }
+
+    expect(adapterOptions.at(-1)?.extraArgs).toEqual(["--config", "with space"]);
+  });
+});
+
+describe("Pi coding agent session state codec", () => {
+  const codec = piCodingAgentModule.sessionStateCodec;
+
+  it("round-trips a canonical V1 state", () => {
+    const state: PiCodingAgentSessionStateV1 = {
+      version: 1,
+      workingDirectory: "/workspace/project",
+      workingDirectorySource: "user",
+    };
+    expect(codec.decode(codec.encode(state), 1, { agentSessionId: "pi-coding-agent:x" })).toEqual(state);
+  });
+
+  it("rejects an invalid state document", () => {
+    expect(() => codec.decode(null, 1, { agentSessionId: "x" })).toThrow(/expected a state document/);
+    expect(() => codec.decode([], 1, { agentSessionId: "x" })).toThrow(/expected a state document/);
+  });
+
+  it("rejects an unsupported state version", () => {
+    expect(() =>
+      codec.decode({ version: 1, workingDirectory: "/a", workingDirectorySource: "user" }, 2, { agentSessionId: "x" }),
+    ).toThrow(/unsupported Pi agent session state version 2/);
+    expect(() =>
+      codec.decode({ migratedFromBinding: true }, 0, { agentSessionId: "x" }),
+    ).toThrow(/unsupported Pi agent session state version 0/);
+  });
+
+  it("rejects missing or malformed workingDirectory and source fields", () => {
+    expect(() =>
+      codec.decode({ version: 1, workingDirectorySource: "user" }, 1, { agentSessionId: "x" }),
+    ).toThrow(/workingDirectory must be a non-empty string/);
+    expect(() =>
+      codec.decode({ version: 1, workingDirectory: "", workingDirectorySource: "user" }, 1, { agentSessionId: "x" }),
+    ).toThrow(/workingDirectory must be a non-empty string/);
+    expect(() =>
+      codec.decode({ version: 1, workingDirectory: "/a", workingDirectorySource: "root" }, 1, { agentSessionId: "x" }),
+    ).toThrow(/workingDirectorySource must be "default" or "user"/);
+    expect(() =>
+      codec.decode({ version: 1, workingDirectory: "/a" }, 1, { agentSessionId: "x" }),
+    ).toThrow(/workingDirectorySource must be "default" or "user"/);
+  });
+
+  it("decodes a legacy migrated record with a working directory as user-sourced and marks it for rewrite", () => {
+    const decoded = codec.decode(
+      { migratedFromBinding: true, workingDirectory: "/workspace/legacy" },
+      1,
+      { agentSessionId: "pi-coding-agent:x" },
+    );
+    expect(decoded).toEqual({
+      version: 1,
+      workingDirectory: "/workspace/legacy",
+      workingDirectorySource: "user",
+      migratedFromBinding: true,
+    });
+  });
+
+  it("decodes a legacy migrated record without a working directory to the current cwd as default", () => {
+    const decoded = codec.decode({ migratedFromBinding: true }, 1, { agentSessionId: "pi-coding-agent:x" });
+    expect(decoded).toEqual({
+      version: 1,
+      workingDirectory: process.cwd(),
+      workingDirectorySource: "default",
+      migratedFromBinding: true,
+    });
+  });
+
+  it("encode never persists the decode-only migration marker", () => {
+    const encoded = codec.encode({
+      version: 1,
+      workingDirectory: "/a",
+      workingDirectorySource: "default",
+      migratedFromBinding: true,
+    });
+    expect(encoded).toEqual({ version: 1, workingDirectory: "/a", workingDirectorySource: "default" });
+  });
+
+  it("encode rejects non-version-1 states before they can be persisted", () => {
+    expect(() =>
+      codec.encode({ version: 2, workingDirectory: "/a", workingDirectorySource: "user" } as never),
+    ).toThrow(/version must be 1/);
+  });
+
+  it("encode rejects missing or empty workingDirectory", () => {
+    expect(() =>
+      codec.encode({ version: 1, workingDirectory: "", workingDirectorySource: "user" } as never),
+    ).toThrow(/workingDirectory must be a non-empty string/);
+    expect(() =>
+      codec.encode({ version: 1, workingDirectory: undefined, workingDirectorySource: "user" } as never),
+    ).toThrow(/workingDirectory must be a non-empty string/);
+  });
+
+  it("encode rejects an invalid workingDirectorySource", () => {
+    expect(() =>
+      codec.encode({ version: 1, workingDirectory: "/a", workingDirectorySource: "root" } as never),
+    ).toThrow(/workingDirectorySource must be "default" or "user"/);
+  });
+});
+
+describe("Pi agent session state handle validation", () => {
+  it("initialize rejects a forged state and leaves the store empty", async () => {
+    const { store, handle } = await reserveHandle("pi-coding-agent:forged-init");
+
+    await expect(
+      handle.initialize({ version: 2, workingDirectory: "/a", workingDirectorySource: "user" } as never),
+    ).rejects.toThrow(/version must be 1/);
 
     const document = await store.load();
-    expect(document.agentSessions["pi-coding-agent:legacy"]!.state).toEqual({
+    expect(document.agentSessions["pi-coding-agent:forged-init"]).toBeUndefined();
+  });
+
+  it("replace rejects a forged state without changing the persisted record", async () => {
+    const { store, handle } = await reserveHandle("pi-coding-agent:forged-replace");
+    await handle.initialize({ version: 1, workingDirectory: "/a", workingDirectorySource: "user" });
+
+    await expect(
+      handle.replace({ version: 1, workingDirectory: "", workingDirectorySource: "user" } as never),
+    ).rejects.toThrow(/workingDirectory must be a non-empty string/);
+
+    const document = await store.load();
+    expect(document.agentSessions["pi-coding-agent:forged-replace"]!.state).toEqual({
       version: 1,
-      workingDirectory: expected,
+      workingDirectory: "/a",
+      workingDirectorySource: "user",
+    });
+  });
+
+  it("update rejects a forged state produced by the updater without persisting it", async () => {
+    const { store, handle } = await reserveHandle("pi-coding-agent:forged-update");
+    await handle.initialize({ version: 1, workingDirectory: "/a", workingDirectorySource: "user" });
+
+    await expect(
+      handle.update(() => ({ version: 1, workingDirectory: "/a", workingDirectorySource: "root" } as never)),
+    ).rejects.toThrow(/workingDirectorySource must be "default" or "user"/);
+
+    const document = await store.load();
+    expect(document.agentSessions["pi-coding-agent:forged-update"]!.state).toEqual({
+      version: 1,
+      workingDirectory: "/a",
+      workingDirectorySource: "user",
     });
   });
 });
