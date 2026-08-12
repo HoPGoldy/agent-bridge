@@ -1,3 +1,4 @@
+import { realpath } from "node:fs/promises";
 import type {
   AgentAdapter,
   AgentAvailableModel,
@@ -5,12 +6,14 @@ import type {
   AgentOutputEvent,
   AgentSessionStatus,
   AgentSessionStateApi,
+  NewAgentSessionStateApi,
   OutboundAttachment,
 } from "../../../../types";
 import { createLogger, type Logger } from "../../../../core/logger";
 import { extractMediaMarkers } from "../../media-convention";
 import { PiRpcClient } from "./pi-rpc-client";
 import { toPiSessionId } from "./pi-session-id";
+import { resolveWorkingDirectory } from "../working-directory";
 import type { PiCodingAgentSessionStateV1 } from "../index";
 
 class PiModelCommandError extends Error {
@@ -22,15 +25,48 @@ class PiModelCommandError extends Error {
   }
 }
 
+export interface PiCodingAgentAdapterOptions {
+  agentSessionId: string;
+  /**
+   * Lifecycle phase. `create` initializes the reserved handle with the
+   * resolved working directory; `resume` reads, re-validates and rewrites the
+   * opened handle. The module passes the phase and the matching handle kind.
+   */
+  mode: "create" | "resume";
+  /** Session-scoped state handle injected by the gateway (reserved in create, opened in resume). */
+  sessionState:
+    | NewAgentSessionStateApi<PiCodingAgentSessionStateV1>
+    | AgentSessionStateApi<PiCodingAgentSessionStateV1>;
+  /**
+   * Raw user-requested working directory for a brand-new session. Absent (or
+   * empty) for a bare `/new`: the adapter persists the default cwd instead.
+   */
+  workingDirectory?: string;
+  /**
+   * Optional allowlist of allowed working-directory roots. Enforced for
+   * user-supplied directories only (`workingDirectorySource === "user"`); a
+   * bare `/new` default is never checked.
+   */
+  allowedWorkingDirectoryRoots?: string[];
+  sessionDir?: string;
+  bin?: string;
+  model?: string;
+  extraArgs?: string[];
+  logger?: Logger;
+}
+
 export class PiCodingAgentAdapter implements AgentAdapter {
   readonly #agentSessionId: string;
   readonly #piSessionId: string;
-  readonly #cwd: string;
+  readonly #handle:
+    | { mode: "create"; sessionState: NewAgentSessionStateApi<PiCodingAgentSessionStateV1> }
+    | { mode: "resume"; sessionState: AgentSessionStateApi<PiCodingAgentSessionStateV1> };
   readonly #sessionDir?: string;
   readonly #bin: string;
   readonly #model?: string;
   readonly #extraArgs: string[];
-  readonly #sessionState?: AgentSessionStateApi<PiCodingAgentSessionStateV1>;
+  readonly #workingDirectory?: string;
+  readonly #allowedWorkingDirectoryRoots?: string[];
   readonly #logger: Logger;
   #client: PiRpcClient | null = null;
   #onOutput: ((event: AgentOutputEvent) => Promise<void> | void) | null = null;
@@ -38,47 +74,43 @@ export class PiCodingAgentAdapter implements AgentAdapter {
   #toolLabelByCallId = new Map<string, string>();
   #toolInputByCallId = new Map<string, unknown>();
 
-  constructor({
-    agentSessionId,
-    cwd,
-    sessionDir,
-    bin,
-    model,
-    extraArgs,
-    sessionState,
-    logger,
-  }: {
-    agentSessionId: string;
-    cwd?: string;
-    sessionDir?: string;
-    bin?: string;
-    model?: string;
-    extraArgs?: string[];
-    sessionState?: AgentSessionStateApi<PiCodingAgentSessionStateV1>;
-    logger?: Logger;
-  }) {
-    this.#agentSessionId = agentSessionId;
-    this.#piSessionId = toPiSessionId(agentSessionId);
-    this.#cwd = cwd ?? process.cwd();
-    this.#sessionDir = sessionDir;
-    this.#bin = bin ?? "pi";
-    this.#model = model;
-    this.#extraArgs = extraArgs ?? [];
-    this.#sessionState = sessionState;
-    this.#logger = logger ?? createLogger("pi-coding-agent");
-  }
-
-  /** The injected session-scoped state handle (owned by the gateway). */
-  get sessionState(): AgentSessionStateApi<PiCodingAgentSessionStateV1> | undefined {
-    return this.#sessionState;
+  constructor(options: PiCodingAgentAdapterOptions) {
+    this.#agentSessionId = options.agentSessionId;
+    this.#piSessionId = toPiSessionId(options.agentSessionId);
+    // The module guarantees the pairing: a reserved handle in create mode, an
+    // opened handle in resume mode. The branch narrows the union for the rest
+    // of the class while keeping the handle truly scoped.
+    this.#handle =
+      options.mode === "create"
+        ? {
+            mode: "create",
+            sessionState: options.sessionState as NewAgentSessionStateApi<PiCodingAgentSessionStateV1>,
+          }
+        : {
+            mode: "resume",
+            sessionState: options.sessionState as AgentSessionStateApi<PiCodingAgentSessionStateV1>,
+          };
+    this.#workingDirectory = options.workingDirectory;
+    this.#allowedWorkingDirectoryRoots = options.allowedWorkingDirectoryRoots;
+    this.#sessionDir = options.sessionDir;
+    this.#bin = options.bin ?? "pi";
+    this.#model = options.model;
+    this.#extraArgs = options.extraArgs ?? [];
+    this.#logger = options.logger ?? createLogger("pi-coding-agent");
   }
 
   async start(onOutput: (event: AgentOutputEvent) => Promise<void> | void): Promise<void> {
     this.#onOutput = onOutput;
+
+    // Resolve and persist the session working directory before anything can
+    // spawn: creation failures (missing/invalid/unallowed path, revoke) must
+    // never reach the process spawn step.
+    const cwd = await this.#prepareWorkingDirectory();
+
     this.#client = new PiRpcClient({
       agentSessionId: this.#agentSessionId,
       piSessionId: this.#piSessionId,
-      cwd: this.#cwd,
+      cwd,
       sessionDir: this.#sessionDir,
       bin: this.#bin,
       model: this.#model,
@@ -91,9 +123,78 @@ export class PiCodingAgentAdapter implements AgentAdapter {
         this.#logger.error(`extension_error for ${this.#agentSessionId}:`, rpcEvent);
       }
     });
-    this.#logger.info(`starting agent instance (bin=${this.#bin} cwd=${this.#cwd})`);
+    this.#logger.info(`starting agent instance (bin=${this.#bin} cwd=${cwd})`);
     await this.#client.start();
     this.#logger.info(`session ${this.#agentSessionId} started (piSessionId=${this.#piSessionId})`);
+  }
+
+  /**
+   * Resolves the canonical working directory and persists the session state
+   * before the Pi process is spawned.
+   *
+   * Create mode: canonicalizes the requested path (or the default cwd for a
+   * bare `/new`), enforces the user-path allowlist, then initializes the
+   * persisted record with the canonical directory and its source.
+   *
+   * Resume mode: reads the persisted directory, re-validates it (the user-path
+   * allowlist is enforced only for user-supplied directories), and rewrites
+   * legacy binding-migrated records or drifted canonical paths into the
+   * canonical V1 shape.
+   */
+  async #prepareWorkingDirectory(): Promise<string> {
+    if (this.#handle.mode === "create") {
+      const { sessionState } = this.#handle;
+      const requested = this.#workingDirectory;
+      const source: "user" | "default" =
+        requested !== undefined && requested.trim() !== "" ? "user" : "default";
+
+      if (source === "user") {
+        // resolveWorkingDirectory already canonicalizes with realpath and
+        // enforces the allowlist on that canonical result. Re-resolving the
+        // returned path would reopen a TOCTOU window: a swapped symlink could
+        // yield a different, un-checked path that gets persisted and spawned.
+        // Persist and spawn the checked result directly.
+        const canonical = await resolveWorkingDirectory(requested, {
+          allowedWorkingDirectoryRoots: this.#allowedWorkingDirectoryRoots,
+        });
+        await sessionState.initialize({
+          version: 1,
+          workingDirectory: canonical,
+          workingDirectorySource: "user",
+        });
+        return canonical;
+      }
+
+      // Bare `/new`: the helper returns the default cwd verbatim, so
+      // canonicalize it here (exactly once) to keep the persisted record
+      // stable across restarts even when the process cwd is a symlinked path.
+      const defaultCwd = await resolveWorkingDirectory(requested, {
+        allowedWorkingDirectoryRoots: this.#allowedWorkingDirectoryRoots,
+      });
+      const canonical = await realpath(defaultCwd);
+      await sessionState.initialize({
+        version: 1,
+        workingDirectory: canonical,
+        workingDirectorySource: "default",
+      });
+      return canonical;
+    }
+
+    const { sessionState } = this.#handle;
+    const state = await sessionState.read();
+    const roots =
+      state.workingDirectorySource === "user" ? this.#allowedWorkingDirectoryRoots : undefined;
+    const canonical = await resolveWorkingDirectory(state.workingDirectory, {
+      allowedWorkingDirectoryRoots: roots,
+    });
+    if (state.migratedFromBinding || state.workingDirectory !== canonical) {
+      await sessionState.update((current) => ({
+        version: 1,
+        workingDirectory: canonical,
+        workingDirectorySource: current.workingDirectorySource,
+      }));
+    }
+    return canonical;
   }
 
   async stop(): Promise<void> {
