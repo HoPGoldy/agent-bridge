@@ -1,12 +1,15 @@
+import { randomUUID } from "node:crypto";
 import type {
   AgentAdapter,
   AgentOutputEvent,
+  AgentSessionStateApi,
   ChannelCommonContext,
   ClientInputEvent,
   ClientOutputEvent,
   GatewayCoreOptions,
-  SessionBinding,
 } from "../types";
+import { createAgentSessionStateRegistry } from "../config/agent-session-state";
+import { createInMemoryChannelStateStore } from "../config/channel-state";
 import { getTranslatorForCommon, type Translator } from "../i18n";
 import { createLogger, type Logger } from "./logger";
 
@@ -24,11 +27,13 @@ export class GatewayCore {
   readonly #agentConfig: GatewayCoreOptions["agentConfig"];
   readonly #agentIdleTimeoutMs: number;
   readonly #allowedWorkingDirectoryRoots?: string[];
-  readonly #bindingStore: GatewayCoreOptions["bindingStore"];
+  readonly #channelStateStore: NonNullable<GatewayCoreOptions["channelStateStore"]>;
+  readonly #agentSessionStateRegistry: NonNullable<GatewayCoreOptions["agentSessionStateRegistry"]>;
   readonly #common?: ChannelCommonContext;
   readonly #t: Translator;
   readonly #logger: Logger = createLogger("core");
-  readonly #clientToAgentSession = new Map<string, SessionBinding>();
+  /** Pure routing map: client session id -> agent session id. */
+  readonly #clientToAgentSession = new Map<string, string>();
   readonly #agentRuntimes = new Map<string, AgentRuntime>();
   /**
    * Client-output handlers that have already entered and are still settling.
@@ -37,17 +42,26 @@ export class GatewayCore {
    * enqueued after the drain. Each tracked promise never rejects.
    */
   readonly #inFlightHandlers = new Set<Promise<void>>();
-  /** Tail of the serialized binding-save queue; never rejects. */
-  #persistTail: Promise<void> = Promise.resolve();
   #started = false;
 
-  constructor({ imAdapter, agentModule, agentConfig, agentIdleTimeoutMs, allowedWorkingDirectoryRoots, bindingStore, common }: GatewayCoreOptions) {
+  constructor({
+    imAdapter,
+    agentModule,
+    agentConfig,
+    agentIdleTimeoutMs,
+    allowedWorkingDirectoryRoots,
+    channelStateStore,
+    agentSessionStateRegistry,
+    common,
+  }: GatewayCoreOptions) {
     this.#imAdapter = imAdapter;
     this.#agentModule = agentModule;
     this.#agentConfig = agentConfig;
     this.#agentIdleTimeoutMs = agentIdleTimeoutMs;
     this.#allowedWorkingDirectoryRoots = allowedWorkingDirectoryRoots;
-    this.#bindingStore = bindingStore;
+    this.#channelStateStore = channelStateStore ?? createInMemoryChannelStateStore();
+    this.#agentSessionStateRegistry =
+      agentSessionStateRegistry ?? createAgentSessionStateRegistry(this.#channelStateStore);
     this.#common = common;
     this.#t = getTranslatorForCommon(common);
   }
@@ -56,11 +70,9 @@ export class GatewayCore {
     if (this.#started) return;
     this.#started = true;
 
-    if (this.#bindingStore) {
-      const bindings = await this.#bindingStore.load();
-      for (const [clientSessionId, binding] of Object.entries(bindings)) {
-        this.#clientToAgentSession.set(clientSessionId, binding);
-      }
+    const document = await this.#channelStateStore.load();
+    for (const [clientSessionId, agentSessionId] of Object.entries(document.bindings)) {
+      this.#clientToAgentSession.set(clientSessionId, agentSessionId);
     }
 
     await this.#imAdapter.start(async (event) => {
@@ -350,8 +362,9 @@ export class GatewayCore {
   }
 
   async #handleSessionNew(clientSessionId: string, workingDirectory?: string): Promise<void> {
-    // Transactional switch: create and start the new runtime first so a failed
-    // creation never tears down the previous session, its binding, or its runtime.
+    // Transactional switch: create and start the new runtime (and its state
+    // record) first so a failed creation never tears down the previous
+    // session, its binding, or its runtime.
     let newRuntime: AgentRuntime;
     try {
       newRuntime = await this.#createRuntimeForClient(clientSessionId, workingDirectory);
@@ -366,9 +379,29 @@ export class GatewayCore {
       return;
     }
 
-    const previousBinding = this.#clientToAgentSession.get(clientSessionId);
-    if (previousBinding) {
-      const previousRuntime = this.#agentRuntimes.get(previousBinding.agentSessionId);
+    const previousAgentSessionId = this.#clientToAgentSession.get(clientSessionId);
+    try {
+      // Commit the durable binding (and drop the old record when it is no
+      // longer referenced) before stopping the previous runtime, so the new
+      // session is authoritative even if the old stop throws.
+      await this.#switchClientToAgent(clientSessionId, newRuntime.agentSessionId, previousAgentSessionId);
+    } catch (error) {
+      // The durable commit failed and the in-memory binding was not updated:
+      // clean up the new runtime and its record and keep the previous session
+      // authoritative, mirroring a failed create.
+      const detail = error instanceof Error ? error.message : String(error);
+      this.#logger.error(`failed to persist the new binding for ${clientSessionId}:`, error);
+      await this.#cleanupNewRuntime(newRuntime);
+      await this.#deliverClientInput({
+        type: "assistant.message",
+        clientSessionId,
+        text: this.#t("gateway.failedToStartNewSession", { detail }),
+      });
+      return;
+    }
+
+    if (previousAgentSessionId) {
+      const previousRuntime = this.#agentRuntimes.get(previousAgentSessionId);
       if (previousRuntime) {
         // #stopRuntime always removes the runtime from the map (finally), so a
         // throwing stop must not abort the switch: log it and continue so the
@@ -384,13 +417,6 @@ export class GatewayCore {
       }
     }
 
-    // Wait for the binding save before confirming success so the new binding is
-    // durable when the user reads the reply. The save never rejects; failures
-    // are logged and the in-memory binding stays authoritative.
-    await this.#bindClientToAgent(clientSessionId, {
-      agentSessionId: newRuntime.agentSessionId,
-      ...(workingDirectory !== undefined ? { workingDirectory } : {}),
-    });
     await this.#deliverClientInput({
       type: "assistant.message",
       clientSessionId,
@@ -407,11 +433,11 @@ export class GatewayCore {
   }
 
   async #getActiveRuntime(clientSessionId: string): Promise<AgentRuntime | null> {
-    const binding = this.#clientToAgentSession.get(clientSessionId);
-    if (!binding) {
+    const agentSessionId = this.#clientToAgentSession.get(clientSessionId);
+    if (!agentSessionId) {
       return null;
     }
-    return this.#getOrRestoreRuntime(clientSessionId, binding);
+    return this.#getOrRestoreRuntime(clientSessionId, agentSessionId);
   }
 
   async #getOrCreateActiveRuntime(clientSessionId: string): Promise<AgentRuntime> {
@@ -421,91 +447,132 @@ export class GatewayCore {
     }
 
     const runtime = await this.#createRuntimeForClient(clientSessionId);
-    void this.#bindClientToAgent(clientSessionId, { agentSessionId: runtime.agentSessionId });
+    try {
+      // The durable first-time binding is committed before the in-memory
+      // binding is updated; a failed commit rolls the new runtime back so no
+      // unbound runtime or orphan record survives (and a restart cannot
+      // resurrect a stale binding over the live in-memory one).
+      await this.#bindClientToAgent(clientSessionId, runtime.agentSessionId);
+    } catch (error) {
+      this.#logger.error(`failed to persist the first binding for ${clientSessionId}:`, error);
+      await this.#cleanupNewRuntime(runtime);
+      throw error;
+    }
     return runtime;
   }
 
-  async #getOrRestoreRuntime(clientSessionId: string, binding: SessionBinding): Promise<AgentRuntime> {
-    const existing = this.#agentRuntimes.get(binding.agentSessionId);
+  async #getOrRestoreRuntime(clientSessionId: string, agentSessionId: string): Promise<AgentRuntime> {
+    const existing = this.#agentRuntimes.get(agentSessionId);
     if (existing) {
       this.#touchRuntime(existing);
       return existing;
     }
 
-    if (this.#agentModule.resumeAgentSession) {
+    // Resume is required on the agent module contract: every persistable
+    // module restores its adapter from the scoped state handle, so the core
+    // never needs to read adapter-owned state (for example the working
+    // directory) to guess how to restore a session.
+    let adapter: AgentAdapter | null = null;
+    try {
+      const sessionState = await this.#agentSessionStateRegistry.open<object>({
+        agentSessionId,
+        agentType: this.#agentModule.type,
+        codec: this.#agentModule.sessionStateCodec,
+      });
+      adapter = await this.#agentModule.resumeAgentSession({
+        config: this.#agentConfig,
+        common: this.#common ?? { channelName: "", language: "en-US" },
+        agentSessionId,
+        sessionState,
+        ...(this.#allowedWorkingDirectoryRoots !== undefined
+          ? { allowedWorkingDirectoryRoots: this.#allowedWorkingDirectoryRoots }
+          : {}),
+      });
       try {
-        const agentAdapter = await this.#agentModule.resumeAgentSession({
-          config: this.#agentConfig,
-          common: this.#common ?? { channelName: "", language: "en-US" },
-          agentSessionId: binding.agentSessionId,
-          ...(binding.workingDirectory !== undefined ? { workingDirectory: binding.workingDirectory } : {}),
-          ...(this.#allowedWorkingDirectoryRoots !== undefined
-            ? { allowedWorkingDirectoryRoots: this.#allowedWorkingDirectoryRoots }
-            : {}),
-        });
-        try {
-          return await this.#startRuntime(clientSessionId, binding.agentSessionId, agentAdapter);
-        } catch (error) {
-          // Mirror #createRuntimeForClient: a partially started resumed adapter
-          // must be cleaned up best-effort and the persisted binding must stay
-          // untouched so a later message can retry the restore.
-          this.#logger.error(`resumed agent session ${binding.agentSessionId} failed to start, cleaning up:`, error);
-          try {
-            await agentAdapter.stop();
-          } catch (stopError) {
-            this.#logger.error(
-              `failed to stop partially resumed agent adapter ${binding.agentSessionId}:`,
-              stopError,
-            );
-          }
-          throw error;
-        }
+        return await this.#startRuntime(clientSessionId, agentSessionId, adapter);
       } catch (error) {
-        // The user asked the agent for work and got silence: surface a
-        // localized failure with the detail and a `/new` hint. The persisted
-        // binding is intentionally kept so the session can be retried once the
-        // configuration is fixed, and exactly one message is delivered for a
-        // single failed resume.
-        const detail = error instanceof Error ? error.message : String(error);
-        this.#logger.error(
-          `failed to resume agent session ${binding.agentSessionId} for client ${clientSessionId}:`,
-          error,
-        );
-        await this.#deliverClientInput({
-          type: "assistant.message",
-          clientSessionId,
-          text: this.#t("gateway.failedToResumeSession", { detail }),
-        });
+        // A partially started resumed adapter must be cleaned up best-effort.
+        this.#logger.error(`resumed agent session ${agentSessionId} failed to start, cleaning up:`, error);
+        await this.#stopAdapterBestEffort(adapter, agentSessionId);
         throw error;
       }
+    } catch (error) {
+      // Resume failed: revoke this handle (the record and binding stay intact
+      // so a later message can retry), then surface exactly one localized
+      // failure with a /new hint. The user asked the agent for work and got
+      // silence otherwise.
+      await this.#revokeSessionStateBestEffort(agentSessionId);
+      const detail = error instanceof Error ? error.message : String(error);
+      this.#logger.error(
+        `failed to resume agent session ${agentSessionId} for client ${clientSessionId}:`,
+        error,
+      );
+      await this.#deliverClientInput({
+        type: "assistant.message",
+        clientSessionId,
+        text: this.#t("gateway.failedToResumeSession", { detail }),
+      });
+      throw error;
     }
-
-    const runtime = await this.#createRuntimeForClient(clientSessionId, binding.workingDirectory);
-    void this.#bindClientToAgent(clientSessionId, {
-      agentSessionId: runtime.agentSessionId,
-      ...(binding.workingDirectory !== undefined ? { workingDirectory: binding.workingDirectory } : {}),
-    });
-    return runtime;
   }
 
+  /**
+   * Creates, starts and persists a brand-new agent session. The agent session
+   * id is core-owned (`<moduleType>:<uuid>`); the module must initialize its
+   * state record through the reserved handle before returning. Any failure
+   * (reserve, create, start, initialize, verify) stops the partial adapter,
+   * revokes the handle and deletes the reserved record, leaving any previous
+   * session, binding and runtime untouched.
+   */
   async #createRuntimeForClient(clientSessionId: string, workingDirectory?: string): Promise<AgentRuntime> {
-    const { agentSessionId, agentAdapter } = await this.#agentModule.createAgentSession({
-      config: this.#agentConfig,
-      common: this.#common ?? { channelName: "", language: "en-US" },
-      ...(workingDirectory !== undefined ? { workingDirectory } : {}),
-      ...(this.#allowedWorkingDirectoryRoots !== undefined
-        ? { allowedWorkingDirectoryRoots: this.#allowedWorkingDirectoryRoots }
-        : {}),
+    const agentSessionId = `${this.#agentModule.type}:${randomUUID()}`;
+    const sessionState = await this.#agentSessionStateRegistry.reserve({
+      agentSessionId,
+      agentType: this.#agentModule.type,
+      codec: this.#agentModule.sessionStateCodec,
     });
+
+    let adapter: AgentAdapter | null = null;
+    let runtime: AgentRuntime | null = null;
     try {
-      return await this.#startRuntime(clientSessionId, agentSessionId, agentAdapter);
-    } catch (error) {
-      this.#logger.error(`agent session ${agentSessionId} failed to start, cleaning up:`, error);
+      adapter = await this.#agentModule.createAgentSession({
+        config: this.#agentConfig,
+        common: this.#common ?? { channelName: "", language: "en-US" },
+        agentSessionId,
+        sessionState,
+        ...(workingDirectory !== undefined ? { workingDirectory } : {}),
+        ...(this.#allowedWorkingDirectoryRoots !== undefined
+          ? { allowedWorkingDirectoryRoots: this.#allowedWorkingDirectoryRoots }
+          : {}),
+      });
       try {
-        await agentAdapter.stop();
-      } catch (stopError) {
-        this.#logger.error(`failed to stop partially created agent adapter ${agentSessionId}:`, stopError);
+        runtime = await this.#startRuntime(clientSessionId, agentSessionId, adapter);
+      } catch (error) {
+        this.#logger.error(`agent session ${agentSessionId} failed to start, cleaning up:`, error);
+        await this.#stopAdapterBestEffort(adapter, agentSessionId);
+        throw error;
       }
+
+      // Verify the module initialized the state record before any binding can
+      // point at this session. An uninitialized record must never be committed.
+      try {
+        await sessionState.flush();
+        await sessionState.read();
+      } catch (error) {
+        this.#logger.error(`agent session ${agentSessionId} was not initialized, cleaning up:`, error);
+        if (runtime) {
+          await this.#stopRuntime(runtime).catch((stopError) => {
+            this.#logger.error(`failed to stop uninitialized agent session ${agentSessionId}:`, stopError);
+          });
+        }
+        throw error;
+      }
+
+      return runtime;
+    } catch (error) {
+      await this.#agentSessionStateRegistry.delete(agentSessionId).catch((cleanupError) => {
+        this.#logger.error(`failed to clean up agent session state ${agentSessionId}:`, cleanupError);
+      });
       throw error;
     }
   }
@@ -531,38 +598,88 @@ export class GatewayCore {
     return runtime;
   }
 
-  /**
-   * Serializes binding-store writes: the snapshot is captured synchronously at
-   * enqueue time and written strictly in order through a promise tail, so an
-   * older snapshot can never overwrite a newer one and at most one save is in
-   * flight at a time. The returned promise never rejects: failures are logged
-   * and the queue stays alive for the next save. Await it when durability
-   * matters (for example before replying success to `/new`).
-   */
-  #enqueuePersist(): Promise<void> {
-    if (!this.#bindingStore) {
-      return Promise.resolve();
-    }
-    const snapshot = Object.fromEntries(this.#clientToAgentSession);
-    const save = this.#persistTail.then(() => this.#bindingStore!.save(snapshot));
-    const handled = save.then(
-      () => undefined,
-      (error: unknown) => {
-        this.#logger.error("failed to persist session bindings:", error);
-      },
-    );
-    this.#persistTail = handled;
-    return handled;
-  }
-
-  /** Resolves once every enqueued binding save has finished (drain on stop). */
+  /** Resolves once every enqueued binding write has finished (drain on stop). */
   #drainPersist(): Promise<void> {
-    return this.#persistTail;
+    return this.#channelStateStore.flush();
   }
 
-  #bindClientToAgent(clientSessionId: string, binding: SessionBinding): Promise<void> {
-    this.#clientToAgentSession.set(clientSessionId, binding);
-    return this.#enqueuePersist();
+  /**
+   * Durably records the first binding of a client to a freshly created agent
+   * session. The durable commit happens before the in-memory binding is
+   * updated, so a failed commit leaves no binding behind and rejects so the
+   * caller can clean up the new runtime.
+   */
+  async #bindClientToAgent(clientSessionId: string, agentSessionId: string): Promise<void> {
+    const proposed = new Map(this.#clientToAgentSession);
+    proposed.set(clientSessionId, agentSessionId);
+    await this.#channelStateStore.transaction((draft) => {
+      draft.bindings = { ...Object.fromEntries(proposed) };
+    });
+    this.#clientToAgentSession.set(clientSessionId, agentSessionId);
+  }
+
+  /**
+   * Rebinds a client to a new agent session and, in the same transaction,
+   * deletes the previous session's record when no other binding references it.
+   * The durable document is committed first; the in-memory binding is only
+   * updated after the commit succeeds. A failed commit therefore keeps the
+   * previous binding and runtime authoritative, and a restart can never
+   * resurrect a stale binding over a live one. Rejects when the durable commit
+   * fails; the caller must clean up the new runtime.
+   */
+  async #switchClientToAgent(
+    clientSessionId: string,
+    newAgentSessionId: string,
+    previousAgentSessionId?: string,
+  ): Promise<void> {
+    const proposed = new Map(this.#clientToAgentSession);
+    proposed.set(clientSessionId, newAgentSessionId);
+    const snapshot = Object.fromEntries(proposed);
+    await this.#channelStateStore.transaction((draft) => {
+      draft.bindings = { ...snapshot };
+      if (previousAgentSessionId && previousAgentSessionId !== newAgentSessionId) {
+        const stillReferenced = Object.values(snapshot).includes(previousAgentSessionId);
+        if (!stillReferenced) {
+          delete draft.agentSessions[previousAgentSessionId];
+        }
+      }
+    });
+    this.#clientToAgentSession.set(clientSessionId, newAgentSessionId);
+  }
+
+  /**
+   * Best-effort cleanup of a runtime that was created but never durably bound
+   * (a failed first binding or binding switch): stop the adapter (removing the
+   * runtime and revoking its live state handle) and delete the reserved
+   * record, so no unbound runtime or orphan record survives.
+   */
+  async #cleanupNewRuntime(runtime: AgentRuntime): Promise<void> {
+    try {
+      await this.#stopRuntime(runtime);
+    } catch (error) {
+      this.#logger.error(`failed to stop agent session ${runtime.agentSessionId} during cleanup:`, error);
+    }
+    try {
+      await this.#agentSessionStateRegistry.delete(runtime.agentSessionId);
+    } catch (error) {
+      this.#logger.error(`failed to delete agent session state ${runtime.agentSessionId} during cleanup:`, error);
+    }
+  }
+
+  async #stopAdapterBestEffort(adapter: AgentAdapter, agentSessionId: string): Promise<void> {
+    try {
+      await adapter.stop();
+    } catch (error) {
+      this.#logger.error(`failed to stop agent adapter ${agentSessionId}:`, error);
+    }
+  }
+
+  async #revokeSessionStateBestEffort(agentSessionId: string): Promise<void> {
+    try {
+      await this.#agentSessionStateRegistry.revoke(agentSessionId);
+    } catch (error) {
+      this.#logger.error(`failed to revoke agent session state ${agentSessionId}:`, error);
+    }
   }
 
   #resolveModelCommandError(error: unknown): { kind: string; detail?: string } {
@@ -587,8 +704,8 @@ export class GatewayCore {
     }
 
     const clientSessionId = runtime.clientSessionId;
-    const activeBinding = this.#clientToAgentSession.get(clientSessionId);
-    if (activeBinding?.agentSessionId !== agentSessionId) {
+    const activeAgentSessionId = this.#clientToAgentSession.get(clientSessionId);
+    if (activeAgentSessionId !== agentSessionId) {
       this.#logger.info(
         `dropping late output from inactive agent session ${agentSessionId} for client ${clientSessionId}`,
       );
@@ -684,10 +801,25 @@ export class GatewayCore {
       return;
     }
 
-    await this.#stopRuntime(runtime);
+    try {
+      await this.#stopRuntime(runtime);
+    } catch (error) {
+      // The runtime was still removed and its state handle revoked; only the
+      // stop error surfaces here and must not become an unhandled rejection.
+      this.#logger.error(`failed to stop idle agent session ${agentSessionId}:`, error);
+    }
     this.#logger.info(`released idle agent session ${agentSessionId}`);
   }
 
+  /**
+   * Stops the adapter, removes the runtime and revokes every live state handle
+   * for the session. The persisted record and binding are left intact, so the
+   * session can be resumed later (idle release, bridge stop). The runtime is
+   * always removed from the map and the state handle always revoked, even when
+   * `isBusy()`, `abort()` or `adapter.stop()` throws, so a stale adapter can
+   * never write its state again; the original error still propagates to the
+   * caller.
+   */
   async #stopRuntime(runtime: AgentRuntime): Promise<void> {
     if (runtime.idleTimer) {
       clearTimeout(runtime.idleTimer);
@@ -705,6 +837,7 @@ export class GatewayCore {
       await runtime.agentAdapter.stop();
     } finally {
       this.#agentRuntimes.delete(runtime.agentSessionId);
+      await this.#revokeSessionStateBestEffort(runtime.agentSessionId);
     }
   }
 }

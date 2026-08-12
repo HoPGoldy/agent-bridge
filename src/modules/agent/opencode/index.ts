@@ -4,6 +4,8 @@ import { createLogger } from "../../../core/logger";
 import type {
   AgentAdapter,
   AgentModule,
+  AgentSessionStateApi,
+  AgentSessionStateCodec,
   ConfigAdapter,
   ConfigCollectContext,
   OpenCodeAgentConfig,
@@ -22,6 +24,73 @@ import { OpenCodeRuntime } from "./adapter/opencode-runtime";
 
 const logger = createLogger("opencode");
 const PERMISSION_CONFIG = `{"permission":{"*":"allow","question":"deny"}}`;
+
+/** Versioned per-session state owned by the OpenCode module. */
+export interface OpenCodeAgentSessionStateV1 {
+  version: 1;
+  /** Provider session id on the OpenCode server. */
+  openCodeSessionId: string;
+  /**
+   * User-supplied working-directory override (trimmed). Absent when the
+   * session uses the channel-configured directory (or the server default).
+   */
+  workingDirectory?: string;
+}
+
+function isRecord(value: unknown): value is Record<string, unknown> {
+  return value !== null && typeof value === "object" && !Array.isArray(value);
+}
+
+function workingDirectoryOf(raw: Record<string, unknown>): string | undefined {
+  return typeof raw.workingDirectory === "string" && raw.workingDirectory.length > 0
+    ? raw.workingDirectory
+    : undefined;
+}
+
+/**
+ * Validates and encodes the OpenCode session state. Legacy binding-migrated
+ * records (`{ migratedFromBinding: true, workingDirectory? }`) predate the
+ * state store: their provider session id was embedded in the old bridge id
+ * (`opencode:<providerId>`), which the codec derives via the decode context
+ * and rewrites with `update` on resume.
+ */
+export const openCodeAgentSessionStateCodec: AgentSessionStateCodec<OpenCodeAgentSessionStateV1> = {
+  currentVersion: 1,
+
+  decode(raw, _stateVersion, context) {
+    if (isRecord(raw) && raw.migratedFromBinding === true) {
+      if (
+        !context.agentSessionId.startsWith("opencode:") ||
+        context.agentSessionId.length === "opencode:".length
+      ) {
+        throw new Error(
+          `cannot derive the OpenCode session id from migrated agent session ${context.agentSessionId}`,
+        );
+      }
+      const openCodeSessionId = context.agentSessionId.slice("opencode:".length);
+      return {
+        version: 1,
+        openCodeSessionId,
+        ...(workingDirectoryOf(raw) !== undefined ? { workingDirectory: workingDirectoryOf(raw) } : {}),
+      };
+    }
+    if (!isRecord(raw) || raw.version !== 1) {
+      throw new Error("invalid OpenCode agent session state: expected a versioned state document");
+    }
+    if (typeof raw.openCodeSessionId !== "string" || raw.openCodeSessionId.length === 0) {
+      throw new Error("invalid OpenCode agent session state: openCodeSessionId must be a non-empty string");
+    }
+    return {
+      version: 1,
+      openCodeSessionId: raw.openCodeSessionId,
+      ...(workingDirectoryOf(raw) !== undefined ? { workingDirectory: workingDirectoryOf(raw) } : {}),
+    };
+  },
+
+  encode(state) {
+    return { ...state };
+  },
+};
 
 export interface OpenCodeModuleDependencies {
   apiFactory?: (config: OpenCodeAgentConfig) => OpenCodeApi;
@@ -174,17 +243,6 @@ function runtimeKey(channelName: string, config: OpenCodeAgentConfig): string {
   ].join("\0");
 }
 
-function bridgeSessionId(openCodeSessionId: string): string {
-  return `opencode:${openCodeSessionId}`;
-}
-
-function openCodeSessionId(agentSessionId: string): string {
-  if (!agentSessionId.startsWith("opencode:") || agentSessionId.length === "opencode:".length) {
-    throw new Error(`Invalid OpenCode agent session ID: ${agentSessionId}`);
-  }
-  return agentSessionId.slice("opencode:".length);
-}
-
 async function verifyServer(api: OpenCodeApi, config: OpenCodeAgentConfig): Promise<void> {
   const health = await api.health();
   if (!health.healthy || !health.version) throw new Error("OpenCode Server returned an invalid health response");
@@ -282,7 +340,9 @@ function createOpenCodeConfigCollector(
   };
 }
 
-export function createOpenCodeAgentModule(dependencies: OpenCodeModuleDependencies = {}): AgentModule<OpenCodeAgentConfig> {
+export function createOpenCodeAgentModule(
+  dependencies: OpenCodeModuleDependencies = {},
+): AgentModule<OpenCodeAgentConfig, OpenCodeAgentSessionStateV1> {
   const apiFactory = dependencies.apiFactory ?? createOpenCodeApi;
   const writeLine = dependencies.writeLine ?? ((line: string) => console.error(line));
   const runtimes = new Map<string, OpenCodeRuntime>();
@@ -306,22 +366,26 @@ export function createOpenCodeAgentModule(dependencies: OpenCodeModuleDependenci
   const buildAdapter = (
     config: OpenCodeAgentConfig,
     channelName: string,
+    agentSessionId: string,
     sessionID: string,
-    initialModel?: { providerID: string; modelID: string },
+    initialModel: { providerID: string; modelID: string } | undefined,
+    sessionState: AgentSessionStateApi<OpenCodeAgentSessionStateV1>,
   ): AgentAdapter =>
     new OpenCodeAgentAdapter({
-      agentSessionId: bridgeSessionId(sessionID),
+      agentSessionId,
       openCodeSessionId: sessionID,
       config,
       runtime: getRuntime(channelName, config),
       initialModel,
+      sessionState,
     });
 
   return {
     type: "opencode",
+    sessionStateCodec: openCodeAgentSessionStateCodec,
     createConfigCollector: () => createOpenCodeConfigCollector(apiFactory, writeLine),
 
-    async createAgentSession({ config, common, workingDirectory, allowedWorkingDirectoryRoots }) {
+    async createAgentSession({ config, common, agentSessionId, sessionState, workingDirectory, allowedWorkingDirectoryRoots }) {
       const effective = withWorkingDirectory(config, workingDirectory, allowedWorkingDirectoryRoots);
       const runtime = getRuntime(common.channelName, effective);
       const configuredModel = parseConfiguredModel(effective.model);
@@ -330,29 +394,47 @@ export function createOpenCodeAgentModule(dependencies: OpenCodeModuleDependenci
         agent: effective.agent,
         model: configuredModel,
       });
-      const agentSessionId = bridgeSessionId(session.id);
       logger.info(`created OpenCode session ${agentSessionId} for channel ${common.channelName}`);
-      return {
-        agentSessionId,
-        agentAdapter: buildAdapter(effective, common.channelName, session.id, currentModelFromSessionData(session, [], effective.model)),
-      };
-    },
-
-    async resumeAgentSession({ config, common, agentSessionId, workingDirectory, allowedWorkingDirectoryRoots }) {
-      const sessionID = openCodeSessionId(agentSessionId);
-      const effective = withWorkingDirectory(config, workingDirectory, allowedWorkingDirectoryRoots);
-      const runtime = getRuntime(common.channelName, effective);
-      const [session, messages] = await Promise.all([
-        runtime.api.getSession(sessionID),
-        runtime.api.getMessages(sessionID, 50),
-      ]);
-      logger.info(`resumed OpenCode session ${agentSessionId} for channel ${common.channelName}`);
-      return buildAdapter(
+      const adapter = buildAdapter(
         effective,
         common.channelName,
-        sessionID,
-        currentModelFromSessionData(session, messages, effective.model),
+        agentSessionId,
+        session.id,
+        currentModelFromSessionData(session, [], effective.model),
+        sessionState,
       );
+      // Persist only the user-supplied override; a bare /new keeps the
+      // channel-configured directory (or the server default) without storing it.
+      const trimmedOverride = workingDirectory?.trim();
+      await sessionState.initialize({
+        version: 1,
+        openCodeSessionId: session.id,
+        ...(trimmedOverride ? { workingDirectory: trimmedOverride } : {}),
+      });
+      return adapter;
+    },
+
+    async resumeAgentSession({ config, common, agentSessionId, sessionState, allowedWorkingDirectoryRoots }) {
+      const state = await sessionState.read();
+      const effective = withWorkingDirectory(config, state.workingDirectory, allowedWorkingDirectoryRoots);
+      const runtime = getRuntime(common.channelName, effective);
+      const [session, messages] = await Promise.all([
+        runtime.api.getSession(state.openCodeSessionId),
+        runtime.api.getMessages(state.openCodeSessionId, 50),
+      ]);
+      logger.info(`resumed OpenCode session ${agentSessionId} for channel ${common.channelName}`);
+      const adapter = buildAdapter(
+        effective,
+        common.channelName,
+        agentSessionId,
+        state.openCodeSessionId,
+        currentModelFromSessionData(session, messages, effective.model),
+        sessionState,
+      );
+      // Normalize legacy binding-migrated records into the canonical versioned
+      // shape (a no-op rewrite for already-versioned records).
+      await sessionState.update((current) => current);
+      return adapter;
     },
   };
 }
