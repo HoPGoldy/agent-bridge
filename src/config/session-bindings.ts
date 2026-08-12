@@ -1,7 +1,6 @@
 import { unlink } from "node:fs/promises";
 import type {
   AgentSessionRecord,
-  ChannelPersistentState,
   ChannelStateStore,
   SessionBinding,
   SessionBindingStore,
@@ -9,7 +8,6 @@ import type {
 import {
   backfillWorkingDirectory,
   buildMigratedAgentRecord,
-  CHANNEL_STATE_VERSION,
   createFileChannelStateStore,
   extractWorkingDirectory,
   getChannelStateStorePath,
@@ -73,18 +71,18 @@ export function createFileSessionBindingStore(filePath: string): SessionBindingS
   return createSessionBindingStoreFacade(createFileChannelStateStore(filePath));
 }
 
-/** Adapts any {@link ChannelStateStore} to the legacy `SessionBindingStore` surface. */
+/**
+ * Adapts any {@link ChannelStateStore} to the legacy `SessionBindingStore` surface.
+ *
+ * The facade keeps no local cache: reads come from the store's committed
+ * state and saves go through the store's serialized transaction, so a facade
+ * save can never overwrite a concurrent agent-session-state write and vice
+ * versa.
+ */
 export function createSessionBindingStoreFacade(channelStateStore: ChannelStateStore): SessionBindingStore {
-  let state: ChannelPersistentState | null = null;
-
-  async function currentState(): Promise<ChannelPersistentState> {
-    state ??= await channelStateStore.load();
-    return state;
-  }
-
   return {
     async load() {
-      const document = await currentState();
+      const document = await channelStateStore.load();
       const bindings: Record<string, SessionBinding> = {};
       for (const [clientSessionId, agentSessionId] of Object.entries(document.bindings)) {
         const workingDirectory = extractWorkingDirectory(document.agentSessions[agentSessionId]);
@@ -97,38 +95,34 @@ export function createSessionBindingStoreFacade(channelStateStore: ChannelStateS
     },
 
     async save(bindings) {
-      const document = await currentState();
-      const nextBindings: Record<string, string> = {};
-      const nextAgentSessions: Record<string, AgentSessionRecord> = { ...document.agentSessions };
+      await channelStateStore.transaction((draft) => {
+        const nextBindings: Record<string, string> = {};
+        const nextAgentSessions: Record<string, AgentSessionRecord> = { ...draft.agentSessions };
 
-      for (const [clientSessionId, binding] of Object.entries(bindings)) {
-        nextBindings[clientSessionId] = binding.agentSessionId;
-        const existing = nextAgentSessions[binding.agentSessionId];
-        if (!existing) {
-          // Mirror the migration policy: keep the binding, but never create an
-          // `agentType: "unknown"` record for an uninferable agent id.
-          const created = buildMigratedAgentRecord(binding.agentSessionId, binding.workingDirectory);
-          if (created) {
-            nextAgentSessions[binding.agentSessionId] = created;
-          }
-        } else if (
-          binding.workingDirectory !== undefined &&
-          extractWorkingDirectory(existing) === undefined
-        ) {
-          const backfilled = backfillWorkingDirectory(existing, binding.workingDirectory);
-          if (backfilled !== existing) {
-            nextAgentSessions[binding.agentSessionId] = backfilled;
+        for (const [clientSessionId, binding] of Object.entries(bindings)) {
+          nextBindings[clientSessionId] = binding.agentSessionId;
+          const existing = nextAgentSessions[binding.agentSessionId];
+          if (!existing) {
+            // Mirror the migration policy: keep the binding, but never create an
+            // `agentType: "unknown"` record for an uninferable agent id.
+            const created = buildMigratedAgentRecord(binding.agentSessionId, binding.workingDirectory);
+            if (created) {
+              nextAgentSessions[binding.agentSessionId] = created;
+            }
+          } else if (
+            binding.workingDirectory !== undefined &&
+            extractWorkingDirectory(existing) === undefined
+          ) {
+            const backfilled = backfillWorkingDirectory(existing, binding.workingDirectory);
+            if (backfilled !== existing) {
+              nextAgentSessions[binding.agentSessionId] = backfilled;
+            }
           }
         }
-      }
 
-      const next: ChannelPersistentState = {
-        version: CHANNEL_STATE_VERSION,
-        bindings: nextBindings,
-        agentSessions: nextAgentSessions,
-      };
-      await channelStateStore.save(next);
-      state = next;
+        draft.bindings = nextBindings;
+        draft.agentSessions = nextAgentSessions;
+      });
     },
   };
 }

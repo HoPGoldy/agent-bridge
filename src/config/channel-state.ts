@@ -3,6 +3,7 @@ import { mkdir, readFile, rename, unlink, writeFile } from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 import type { AgentSessionRecord, ChannelPersistentState, ChannelStateStore } from "../types";
+import { assertJsonCompatible } from "./json-compat";
 
 export const CHANNEL_STATE_VERSION = 2 as const;
 export const AGENT_SESSION_RECORD_VERSION = 1 as const;
@@ -368,42 +369,173 @@ export function backfillWorkingDirectory(
 }
 
 /**
+ * Raised when a transaction updater violates the synchronous contract or a
+ * document fails write validation before being persisted.
+ */
+export class ChannelStateTransactionError extends Error {
+  override readonly name = "ChannelStateTransactionError";
+}
+
+function isChannelPersistentState(value: unknown): value is ChannelPersistentState {
+  return (
+    isRecord(value) &&
+    value.version === CHANNEL_STATE_VERSION &&
+    isRecord(value.bindings) &&
+    isRecord(value.agentSessions)
+  );
+}
+
+/** Rejects any document that would be unsafe to persist. */
+function assertWritableChannelState(state: ChannelPersistentState): void {
+  if (!isChannelPersistentState(state)) {
+    throw new ChannelStateTransactionError(
+      "refusing to persist an invalid channel state document",
+    );
+  }
+  for (const [clientSessionId, agentSessionId] of Object.entries(state.bindings)) {
+    if (typeof agentSessionId !== "string" || agentSessionId.length === 0) {
+      throw new ChannelStateTransactionError(
+        `binding ${clientSessionId} is not a non-empty agent session id`,
+      );
+    }
+  }
+  for (const [agentSessionId, record] of Object.entries(state.agentSessions)) {
+    if (!normalizeAgentSessionRecord(record)) {
+      throw new ChannelStateTransactionError(
+        `agent session record ${agentSessionId} failed envelope validation`,
+      );
+    }
+  }
+  assertJsonCompatible(state);
+}
+
+/**
+ * Deep-clones a committed document for transactional drafts. Committed
+ * documents are always JSON-safe (validated on load and before every write),
+ * so a JSON round-trip is a faithful clone.
+ */
+function cloneCommittedState(state: ChannelPersistentState): ChannelPersistentState {
+  return JSON.parse(JSON.stringify(state)) as ChannelPersistentState;
+}
+
+function isThenable(value: unknown): value is PromiseLike<unknown> {
+  return (
+    value !== null &&
+    (typeof value === "object" || typeof value === "function") &&
+    typeof (value as { then?: unknown }).then === "function"
+  );
+}
+
+/**
  * File-backed {@link ChannelStateStore}. Loads normalize legacy documents in
- * memory (no write-through); saves are atomic (same-directory temp file +
- * rename) so a crash or truncation can never corrupt the persisted document.
+ * memory (no write-through); every commit is atomic (same-directory temp file
+ * + rename) and serialized through a single FIFO queue shared by `save` and
+ * `transaction`, so a crash or a failed write can never corrupt the persisted
+ * document and concurrent writers can never overwrite each other. A failed
+ * write rejects its own caller while the queue keeps running for later
+ * writes.
  */
 export function createFileChannelStateStore(filePath: string): ChannelStateStore {
+  let cache: ChannelPersistentState | null = null;
+  let loading: Promise<ChannelPersistentState> | null = null;
+  let tail: Promise<void> = Promise.resolve();
+
+  async function readStateFile(): Promise<ChannelPersistentState> {
+    let raw: string;
+    try {
+      raw = await readFile(filePath, "utf8");
+    } catch (error: unknown) {
+      if ((error as NodeJS.ErrnoException)?.code === "ENOENT") {
+        return emptyChannelState();
+      }
+      throw error;
+    }
+
+    const parsed: unknown = JSON.parse(raw);
+    const { state, report } = normalizeChannelState(parsed);
+    if (report.warnings.length > 0) {
+      console.warn(`[channel-state] ${filePath}: ${report.warnings.join("; ")}`);
+    }
+    return state;
+  }
+
+  async function ensureLoaded(): Promise<ChannelPersistentState> {
+    if (cache) {
+      return cache;
+    }
+    loading ??= readStateFile().then((state) => {
+      cache = state;
+      return state;
+    });
+    try {
+      return await loading;
+    } finally {
+      loading = null;
+    }
+  }
+
+  async function commit(state: ChannelPersistentState): Promise<void> {
+    assertWritableChannelState(state);
+    const dir = path.dirname(filePath);
+    await mkdir(dir, { recursive: true });
+    const tempPath = path.join(
+      dir,
+      `.${path.basename(filePath)}.${process.pid}.${randomUUID()}.tmp`,
+    );
+    try {
+      await writeFile(tempPath, `${JSON.stringify(state, null, 2)}\n`, "utf8");
+      await rename(tempPath, filePath);
+      cache = state;
+    } catch (error) {
+      await unlink(tempPath).catch(() => undefined);
+      throw error;
+    }
+  }
+
+  /** Runs `fn` strictly in order behind every earlier write and returns its result. */
+  function enqueue<T>(fn: () => Promise<T>): Promise<T> {
+    return new Promise<T>((resolve, reject) => {
+      const run = tail.then(fn);
+      const handled = run.then(
+        () => undefined,
+        () => undefined,
+      );
+      tail = handled;
+      run.then(resolve, reject);
+    });
+  }
+
   return {
     async load() {
-      let raw: string;
-      try {
-        raw = await readFile(filePath, "utf8");
-      } catch (error: unknown) {
-        if ((error as NodeJS.ErrnoException)?.code === "ENOENT") {
-          return emptyChannelState();
-        }
-        throw error;
-      }
-
-      const parsed: unknown = JSON.parse(raw);
-      const { state, report } = normalizeChannelState(parsed);
-      if (report.warnings.length > 0) {
-        console.warn(`[channel-state] ${filePath}: ${report.warnings.join("; ")}`);
-      }
-      return state;
+      return ensureLoaded();
     },
 
-    async save(state) {
-      const dir = path.dirname(filePath);
-      await mkdir(dir, { recursive: true });
-      const tempPath = path.join(dir, `.${path.basename(filePath)}.${process.pid}.${randomUUID()}.tmp`);
-      try {
-        await writeFile(tempPath, `${JSON.stringify(state, null, 2)}\n`, "utf8");
-        await rename(tempPath, filePath);
-      } catch (error) {
-        await unlink(tempPath).catch(() => undefined);
-        throw error;
-      }
+    save(state: ChannelPersistentState): Promise<void> {
+      return enqueue(async () => {
+        await commit(state);
+      });
+    },
+
+    transaction<T>(
+      updater: (draft: ChannelPersistentState) => T | ChannelPersistentState,
+    ): Promise<T> {
+      return enqueue(async () => {
+        const current = await ensureLoaded();
+        const draft = cloneCommittedState(current);
+        const result = updater(draft);
+        if (isThenable(result)) {
+          throw new ChannelStateTransactionError(
+            "transaction updater must be synchronous; do not await inside the updater",
+          );
+        }
+        const next: ChannelPersistentState = isChannelPersistentState(result) ? result : draft;
+        await commit(next);
+        return result as T;
+      });
+    },
+
+    async flush() {
+      await tail;
     },
   };
 }
