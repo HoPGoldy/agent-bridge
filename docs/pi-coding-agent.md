@@ -129,7 +129,7 @@ Prefer absolute paths for predictable behavior:
 /new /Users/wesley/project-learn/demo
 ```
 
-The working directory is persisted with the session binding, so it is restored when the session is resumed after the idle timeout or a bridge restart.
+The working directory is persisted in the agent session state, so it is restored when the session is resumed after the idle timeout or a bridge restart.
 
 If `defaults.allowedWorkingDirectoryRoots` is configured (see [`docs/command-system.md`](./command-system.md)), a user-supplied working directory must resolve inside one of the allowed roots. The allowlist check applies only to user-supplied paths: a bare `/new` and the channel configuration are trusted and never checked.
 
@@ -145,7 +145,7 @@ Open PI directly, run `/login` and `/model`, and verify the provider credentials
 
 ### The agent is using the wrong workspace
 
-Use `/new /path/to/workspace` in the chat to start the next session in a different directory, without restarting the channel. The working directory is persisted with the session binding and restored on resume. If the bridge process cwd itself should change for all sessions, stop the channel, change to the intended directory, and start it again.
+Use `/new /path/to/workspace` in the chat to start the next session in a different directory, without restarting the channel. The working directory is persisted in the agent session state and restored on resume. If the bridge process cwd itself should change for all sessions, stop the channel, change to the intended directory, and start it again.
 
 ### Project extensions or skills are not loaded
 
