@@ -2,6 +2,25 @@
 
 All notable changes to this project will be documented in this file. See [commit-and-tag-version](https://github.com/absolute-version/commit-and-tag-version) for commit guidelines.
 
+## [0.7.0](https://github.com/HoPGoldy/agent-bridge/compare/v0.6.0...v0.7.0) (2026-08-13)
+
+
+### Features
+
+* add scoped agent session state API ([021664f](https://github.com/HoPGoldy/agent-bridge/commit/021664fcb825e7dd419fe690ccb916c0a04dbf34))
+* parse working directory for new sessions ([00ff022](https://github.com/HoPGoldy/agent-bridge/commit/00ff0229b9bca6dee55f788f772e7eae94211c09))
+* persist session working directories ([5ee3851](https://github.com/HoPGoldy/agent-bridge/commit/5ee3851b6dfbd2380e642186cc3a9992a1a73a86))
+* restrict session working directories ([2f2c105](https://github.com/HoPGoldy/agent-bridge/commit/2f2c1051ea92f7dac6e930cfc03877169e6391d4))
+* scope opencode sessions to requested directories ([5068c87](https://github.com/HoPGoldy/agent-bridge/commit/5068c87ccc75029fa0928c05aa1989189b36f362))
+* share media delivery with OpenCode ([847333c](https://github.com/HoPGoldy/agent-bridge/commit/847333c652dedb327c7b94c89a2aecd4eea67619))
+* start pi sessions in requested directories ([d2ad829](https://github.com/HoPGoldy/agent-bridge/commit/d2ad829f884b75bb8fbfb6754a18e7a495a0fa82))
+
+
+### Bug Fixes
+
+* harden session shutdown and restore errors ([c523ef4](https://github.com/HoPGoldy/agent-bridge/commit/c523ef4b0a786422adfa5fbcbec988861b164f7f))
+* restore clean TypeScript checks ([a45546c](https://github.com/HoPGoldy/agent-bridge/commit/a45546c29b34c63447f9ae11b18ead1abefd8739))
+
 ## [0.6.0](https://github.com/HoPGoldy/agent-bridge/compare/v0.4.2...v0.6.0) (2026-08-02)
 
 
