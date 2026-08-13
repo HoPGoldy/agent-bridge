@@ -27,7 +27,7 @@ flowchart LR
     CFG --> G
     CFG --> A
 
-    BIND[Session Binding Store\nclient session -> agent session] --> G
+    BIND[Channel State Store\nbindings 路由 + agent session 状态] --> G
     I18N[I18n / Locale] --> C
     I18N --> G
 ```
@@ -98,6 +98,7 @@ Client Adapter 负责面向 IM 平台，处理所有“渠道侧”的问题。
 - 什么时候释放空闲 session
 - 什么命令应当路由到 agent runtime
 - agent 输出回来后，应该投递给哪个 client session
+- 生成 bridge agent session id（`<moduleType>:<uuid>`），并负责 agent session 记录的生命周期：创建 / 恢复 / 切换 / 空闲释放 / 停止，创建失败时回滚删除新记录而不影响既有会话
 
 可以把它理解为：
 
@@ -212,6 +213,76 @@ Agent Adapter 负责把“某种本地 Agent”包装成统一接口。
 
 这个绑定关系还会持久化保存，因此 bridge 重启后仍有机会恢复原先的会话映射。
 
+#### 绑定是纯路由
+
+绑定只是 `clientSessionId -> agentSessionId` 的**纯路由映射**，不携带任何 Agent 侧元数据：
+
+- 工作目录、provider session id 等 Agent 侧信息**不在**绑定里
+- 它们存放在同一个 channel 状态文件的 `agentSessions` 记录中，由对应的 Agent 模块（adapter）自己读写
+
+#### Bridge Agent Session ID 与 provider id 解耦
+
+新会话使用 Core 生成的 **bridge agent session id**（`<moduleType>:<uuid>` 形式）：
+
+- Core 不关心 provider 侧的会话 id 长什么样
+- provider id（例如 OpenCode Server 的 session id）只存在于 adapter 自己的状态里；adapter 在 `resume` 时从状态读回，而不是从 bridge id 里推断
+- 唯一的例外是 legacy 迁移路径：旧的 `opencode:<providerId>` 前缀 id 在自动迁移时，其 provider id 会被推导出来放进迁移后的状态记录
+
+#### 持久化：每个 channel 一个状态文件
+
+每个 channel 的持久化状态保存在**同一个 JSON 文件**里：
+
+```text
+~/.config/agent-bridge/session-bindings/<encoded-channel-name>.json
+```
+
+注意：目录名仍叫 `session-bindings`（历史遗留命名），但文件内容已经是 v2 channel 状态文档，而不是旧的绑定表。
+
+文档结构（`ChannelPersistentState` v2）：
+
+- `bindings`：纯路由映射 `clientSessionId -> agentSessionId`
+- `agentSessions`：以 agent session id 为 key 的 `AgentSessionRecord` 信封，包含 `agentType`、`stateVersion`、`createdAt`/`updatedAt` 与 opaque 的 `state` 载荷
+
+写入是原子的（同目录临时文件 + rename），并且 bindings 与 agent 状态的所有写入共享同一条 FIFO 事务队列，任何两个写入者都不会互相覆盖。
+
+旧的 `SessionBindingStore` 门面仍然保留为兼容层：读取时从 `agentSessions` 记录重建 `{ agentSessionId, workingDirectory }` 视图，保存时把 workingDirectory 回填进迁移记录。
+
+#### 自动迁移
+
+加载时（`load`）自动识别并迁移三种 legacy schema：
+
+1. 旧字符串绑定：`Record<clientId, agentSessionId>`（纯字符串值）
+2. 旧对象绑定：`Record<clientId, { agentSessionId, workingDirectory? }>`
+3. 未知 agent id 前缀的绑定：路由绑定**保留**，但不会为无法推断模块类型的 id 伪造记录
+
+迁移在内存中完成（加载时不做写回，下一次写入会持久化规范化后的文档）；被丢弃的损坏条目、被跳过的记录、共享 agent 的 workingDirectory 冲突都会记录在迁移报告中。带顶层 `version` 键但不是受支持版本号的文档会被直接拒绝（fail-safe），不会被误当成 legacy 绑定表。
+
+#### 状态所有权模型
+
+Agent session 状态的所有权是分离的：
+
+- **Core / Registry**（`AgentSessionStateRegistry`）负责记录生命周期：
+  - `reserve`：为新 session 预留创建句柄（失败会清理）
+  - `open`：打开已有 session 的读写句柄（校验 agentType 与状态可解码性）
+  - `revoke`：失效所有活句柄，但保留持久化记录，之后可再次 `open`
+  - `delete`：失效句柄并删除持久化记录（幂等）
+  - 附带的 generation 计数器保证在途的 `reserve`/`open` 不会拿到已被失效的句柄
+- **Agent Module / Adapter** 拿到的是 scoped 句柄（`AgentSessionStateApi` / `NewAgentSessionStateApi`），只能访问自己的那一个 agent session：
+  - `initialize`：创建阶段一次性写入记录（只能调用一次）
+  - `read` / `replace` / `update`：读取、整体替换、原子读改写
+  - `flush`：等待 pending 写入落盘
+  - adapter **看不到**其它 agent session，也**不能**删除记录
+- 每个模块提供一个 `AgentSessionStateCodec<T>`：`encode` 与 `decode` 都做严格运行时校验，持久化载荷必须是 JSON 兼容的，并带 `stateVersion`
+
+adapter 在 `start()` 内完成状态的所有权动作：
+
+- **create**：解析 / 校验工作目录（Pi 做 `realpath` 规范化，OpenCode 只做词法校验），随后 `initialize` 写入状态记录
+- **resume**：从打开的句柄 `read` 回状态，重新校验并（必要时）改写成规范形态（例如把 legacy 迁移标记改写成正式 V1 记录）
+
+`AgentModule.resumeAgentSession` 是**必需**能力：Core 从不读取 adapter 拥有的状态（例如工作目录）来猜测如何恢复会话，模块必须自己从 `sessionState` 里读。
+
+> 尚未实现：独立的 **Client Session Store**。目前 client session 身份由各 client adapter 自己维护，channel 状态文件只保存路由绑定与 agent session 状态。
+
 ---
 
 ## 4. 一条消息是怎么流动的
@@ -303,9 +374,9 @@ Agent Adapter 负责把“某种本地 Agent”包装成统一接口。
 
 ## 5.3 重启恢复
 
-系统会保存 client 与 agent 的绑定关系。
+系统把每个 channel 的绑定关系与 agent session 状态保存在同一个 channel 状态文件里（详见 3.3）。
 
-因此在 bridge 重启后，Core 可以优先尝试恢复既有 agent session，而不是总是从空白上下文重新开始。
+因此在 bridge 重启后，Core 可以优先尝试恢复既有 agent session，而不是总是从空白上下文重新开始：先从 `bindings` 还原路由，再从 `agentSessions` 找到记录并打开 scoped 状态句柄交给 adapter 恢复。旧版本文档（纯字符串绑定、带 `workingDirectory` 的对象绑定）在加载时自动迁移。
 
 这使 bridge 更像一个“稳定的会话入口”，而不是一次性的消息转发器。
 
@@ -493,7 +564,7 @@ Agent 进程或 SDK 的具体行为停留在 Agent Adapter，不泄露到 Core�
 
 ### 边界三：状态边界
 
-会话绑定、生命周期、空闲释放由 Core 统一维护，不分散到 adapter。
+路由绑定、记录生命周期与空闲释放由 Core 统一维护；Agent 侧会话状态（工作目录、provider session id 等）封装在 `agentSessions` 记录里，由 adapter 通过 scoped 句柄自己读写，双方用版本化、JSON 兼容的 codec 交接，互不越界。
 
 ### 边界四：文案边界
 
@@ -510,7 +581,7 @@ Agent 进程或 SDK 的具体行为停留在 Agent Adapter，不泄露到 Core�
 1. `agent-bridge` 是 **Client Adapter -> Gateway Core -> Agent Adapter** 的三层桥接结构。
 2. **Client Adapter** 负责平台接入与本地展示，**Agent Adapter** 负责本地 Agent 封装。
 3. **Gateway Core** 是中枢，负责会话绑定、命令路由、生命周期与输出回投。
-4. 系统的关键抽象不是“消息”，而是 **client session 与 agent session 的绑定关系**。
+4. 系统的关键抽象不是“消息”，而是 **client session 与 agent session 的绑定关系**——绑定只是纯路由，Agent 侧状态由 adapter 通过 scoped 句柄自持。
 5. 命令分两类：**本地帮助留在 client**，**会话控制进入 core**。
 6. 语言是 **channel 级公共上下文**，不是某一侧的私有配置。
 7. 扩展新模块时，优先遵守统一事件契约和分层边界，而不是把逻辑塞进 Core。

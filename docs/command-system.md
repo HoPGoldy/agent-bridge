@@ -130,7 +130,7 @@ For predictable behavior across both backends, **prefer absolute paths**:
 /new /Users/wesley/project-learn/demo
 ```
 
-The working directory is persisted with the session binding. When a session is released after the idle timeout or the bridge restarts, the saved working directory is restored along with the agent session, so the agent keeps operating on the same directory.
+The working directory is persisted in the agent session's own state record (the routing binding itself only stores `clientSessionId -> agentSessionId`). When a session is released after the idle timeout or the bridge restarts, the saved working directory is restored along with the agent session, so the agent keeps operating on the same directory.
 
 #### Creation failure keeps the previous session
 

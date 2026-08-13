@@ -145,7 +145,7 @@ Stopping `agent-bridge` closes its SSE subscription and local runtime state. It 
 - dispose the OpenCode Server
 - terminate the external `opencode serve` process
 
-Saved bridge bindings allow a later bridge process to restore the same OpenCode session, provided that the server still has it.
+Saved bridge channel state (the routing bindings plus the per-session OpenCode state) allows a later bridge process to restore the same OpenCode session, provided that the server still has it.
 
 ## Troubleshooting
 
