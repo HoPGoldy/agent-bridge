@@ -1,18 +1,15 @@
 import { createHash } from "node:crypto";
-import path from "node:path";
 import { createLogger } from "../../../core/logger";
 import type {
-  AgentAdapter,
   AgentModule,
-  AgentSessionStateApi,
   AgentSessionStateCodec,
   ConfigAdapter,
   ConfigCollectContext,
   OpenCodeAgentConfig,
 } from "../../../types";
 import {
-  currentModelFromSessionData,
   OpenCodeAgentAdapter,
+  parseConfiguredModel,
 } from "./adapter/opencode-agent-adapter";
 import {
   createOpenCodeApi,
@@ -25,16 +22,34 @@ import { OpenCodeRuntime } from "./adapter/opencode-runtime";
 const logger = createLogger("opencode");
 const PERMISSION_CONFIG = `{"permission":{"*":"allow","question":"deny"}}`;
 
-/** Versioned per-session state owned by the OpenCode module. */
+/** Where the persisted working directory came from. */
+export type OpenCodeWorkingDirectorySource = "user" | "configured" | "bridge-default";
+
+/**
+ * Versioned per-session state owned by the OpenCode module. The adapter
+ * resolves the working-directory policy and persists it (including the
+ * bridge-default cwd for a bare `/new`), so a resumed session always restarts
+ * in the same directory even when the bridge process cwd changed.
+ */
 export interface OpenCodeAgentSessionStateV1 {
   version: 1;
-  /** Provider session id on the OpenCode server. */
+  /** Provider session id on the OpenCode Server. */
   openCodeSessionId: string;
   /**
-   * User-supplied working-directory override (trimmed). Absent when the
-   * session uses the channel-configured directory (or the server default).
+   * Directory sent to the OpenCode Server (trimmed; never locally resolved or
+   * realpath-ed, never shell/env/`~` expanded). The server may be remote or
+   * inside a container, so agent-bridge only trims and validates lexically.
    */
-  workingDirectory?: string;
+  workingDirectory: string;
+  /** Where the directory came from. */
+  workingDirectorySource: OpenCodeWorkingDirectorySource;
+  /**
+   * Decode-only marker set while the persisted record is still the legacy
+   * binding-migrated form (`{ migratedFromBinding: true }`). The adapter
+   * rewrites the record to the canonical V1 shape on the first resume; encode
+   * never persists it.
+   */
+  migratedFromBinding?: true;
 }
 
 function isRecord(value: unknown): value is Record<string, unknown> {
@@ -47,18 +62,40 @@ function workingDirectoryOf(raw: Record<string, unknown>): string | undefined {
     : undefined;
 }
 
+function isWorkingDirectorySource(value: unknown): value is OpenCodeWorkingDirectorySource {
+  return value === "user" || value === "configured" || value === "bridge-default";
+}
+
 /**
- * Validates and encodes the OpenCode session state. Legacy binding-migrated
- * records (`{ migratedFromBinding: true, workingDirectory? }`) predate the
- * state store: their provider session id was embedded in the old bridge id
- * (`opencode:<providerId>`), which the codec derives via the decode context
- * and rewrites with `update` on resume.
+ * Validates and encodes the OpenCode session state.
+ *
+ * Legacy binding-migrated records (`{ migratedFromBinding: true }`) decode to
+ * the versioned shape: the provider session id is derived from the old bridge
+ * id (`opencode:<providerId>`) via the decode context, a migrated working
+ * directory is treated as user supplied, and a record without one is migrated
+ * to the current process cwd as a provisional bridge-default (the adapter
+ * prefers the channel-configured directory on the first resume). Both are
+ * marked `migratedFromBinding: true` so the adapter rewrites them into the
+ * canonical persisted form on the first resume.
+ *
+ * New core-owned bridge ids (`opencode:<uuid>`) belong to versioned records
+ * and never take the migrated branch, so a provider id is never sliced out of
+ * a new bridge id: the codec strictly validates `stateVersion`, every field
+ * and the source, and `encode` produces only the canonical plain object
+ * (stripping the decode-only marker) so forged state fails at the writer.
  */
 export const openCodeAgentSessionStateCodec: AgentSessionStateCodec<OpenCodeAgentSessionStateV1> = {
   currentVersion: 1,
 
-  decode(raw, _stateVersion, context) {
-    if (isRecord(raw) && raw.migratedFromBinding === true) {
+  decode(raw, stateVersion, context) {
+    if (!isRecord(raw)) {
+      throw new Error("invalid OpenCode agent session state: expected a state document");
+    }
+
+    if (raw.migratedFromBinding === true) {
+      if (stateVersion !== 1) {
+        throw new Error(`unsupported OpenCode agent session state version ${stateVersion}`);
+      }
       if (
         !context.agentSessionId.startsWith("opencode:") ||
         context.agentSessionId.length === "opencode:".length
@@ -67,28 +104,75 @@ export const openCodeAgentSessionStateCodec: AgentSessionStateCodec<OpenCodeAgen
           `cannot derive the OpenCode session id from migrated agent session ${context.agentSessionId}`,
         );
       }
-      const openCodeSessionId = context.agentSessionId.slice("opencode:".length);
+      const workingDirectory = workingDirectoryOf(raw);
       return {
         version: 1,
-        openCodeSessionId,
-        ...(workingDirectoryOf(raw) !== undefined ? { workingDirectory: workingDirectoryOf(raw) } : {}),
+        openCodeSessionId: context.agentSessionId.slice("opencode:".length),
+        workingDirectory: workingDirectory ?? process.cwd(),
+        workingDirectorySource: workingDirectory !== undefined ? "user" : "bridge-default",
+        migratedFromBinding: true,
       };
     }
-    if (!isRecord(raw) || raw.version !== 1) {
+
+    if (raw.version !== 1) {
       throw new Error("invalid OpenCode agent session state: expected a versioned state document");
     }
+    if (stateVersion !== 1) {
+      throw new Error(`unsupported OpenCode agent session state version ${stateVersion}`);
+    }
     if (typeof raw.openCodeSessionId !== "string" || raw.openCodeSessionId.length === 0) {
-      throw new Error("invalid OpenCode agent session state: openCodeSessionId must be a non-empty string");
+      throw new Error(
+        "invalid OpenCode agent session state: openCodeSessionId must be a non-empty string",
+      );
+    }
+    const workingDirectory = workingDirectoryOf(raw);
+    if (workingDirectory === undefined) {
+      throw new Error(
+        "invalid OpenCode agent session state: workingDirectory must be a non-empty string",
+      );
+    }
+    if (!isWorkingDirectorySource(raw.workingDirectorySource)) {
+      throw new Error(
+        'invalid OpenCode agent session state: workingDirectorySource must be "user", "configured" or "bridge-default"',
+      );
     }
     return {
       version: 1,
       openCodeSessionId: raw.openCodeSessionId,
-      ...(workingDirectoryOf(raw) !== undefined ? { workingDirectory: workingDirectoryOf(raw) } : {}),
+      workingDirectory,
+      workingDirectorySource: raw.workingDirectorySource,
     };
   },
 
   encode(state) {
-    return { ...state };
+    // Validate before persisting: a forged or partially-migrated state must
+    // fail here, while the writer still owns the failure, never on the next
+    // decode. The canonical persisted form never includes the decode-only
+    // migration marker.
+    if (state.version !== 1) {
+      throw new Error("invalid OpenCode agent session state: version must be 1");
+    }
+    if (typeof state.openCodeSessionId !== "string" || state.openCodeSessionId.length === 0) {
+      throw new Error(
+        "invalid OpenCode agent session state: openCodeSessionId must be a non-empty string",
+      );
+    }
+    if (typeof state.workingDirectory !== "string" || state.workingDirectory.length === 0) {
+      throw new Error(
+        "invalid OpenCode agent session state: workingDirectory must be a non-empty string",
+      );
+    }
+    if (!isWorkingDirectorySource(state.workingDirectorySource)) {
+      throw new Error(
+        'invalid OpenCode agent session state: workingDirectorySource must be "user", "configured" or "bridge-default"',
+      );
+    }
+    return {
+      version: 1,
+      openCodeSessionId: state.openCodeSessionId,
+      workingDirectory: state.workingDirectory,
+      workingDirectorySource: state.workingDirectorySource,
+    };
   },
 };
 
@@ -116,15 +200,6 @@ function normalizeBaseUrl(raw: string): string {
 function isLoopbackUrl(baseUrl: string): boolean {
   const hostname = new URL(baseUrl).hostname.replace(/^\[|\]$/g, "").toLowerCase();
   return hostname === "localhost" || hostname === "127.0.0.1" || hostname === "::1";
-}
-
-function parseConfiguredModel(model: string | undefined): { providerID: string; modelID: string } | undefined {
-  if (!model) return undefined;
-  const slash = model.indexOf("/");
-  if (slash <= 0 || slash === model.length - 1) {
-    throw new Error("OpenCode model must use provider/modelID format");
-  }
-  return { providerID: model.slice(0, slash), modelID: model.slice(slash + 1) };
 }
 
 function assertModelAvailable(model: string | undefined, providers: OpenCodeProviderList): void {
@@ -155,78 +230,6 @@ function startupCommand(config: OpenCodeAgentConfig): string {
     ? `OPENCODE_SERVER_USERNAME=${shellQuote(config.username || "opencode")} \\\nOPENCODE_SERVER_PASSWORD='<password>' \\\n`
     : "";
   return `${auth}OPENCODE_CONFIG_CONTENT='${PERMISSION_CONFIG}' \\\nopencode serve --hostname ${hostname} --port ${port}`;
-}
-
-/**
- * Lexical-only boundary check for a remote/container path override against the
- * configured allowed roots. The OpenCode Server may run on a different host or
- * inside a container, so no local filesystem access happens here: both sides
- * are normalized purely lexically with `path.resolve` and `path.relative`, and
- * final validation plus symlink resolution is the remote service's
- * responsibility (documented, not enforced locally).
- *
- * Equal paths and strict descendants of any root are allowed; sibling prefixes
- * (`/srv/work` vs `/srv/work2`) and any `..` escape are rejected, while literal
- * child names that merely start with two dots (`..foo`, `...`) stay allowed.
- *
- * When an allowlist is configured the override must be an absolute path: the
- * server may be remote, so a relative directory would be resolved against the
- * server's cwd rather than the bridge's, and the bridge cannot verify it. With
- * no allowlist configured, relative overrides are allowed and forwarded to the
- * server unchanged. The returned value is never used to rewrite the directory
- * sent to the server.
- */
-function assertAllowedWorkingDirectory(
-  workingDirectory: string,
-  allowedWorkingDirectoryRoots: string[] | undefined,
-): void {
-  const roots = (allowedWorkingDirectoryRoots ?? [])
-    .map((root) => root.trim())
-    .filter((root) => root.length > 0);
-  if (roots.length === 0) return;
-
-  const trimmed = workingDirectory.trim();
-  if (!path.isAbsolute(trimmed)) {
-    throw new Error(
-      `working directory "${trimmed}" must be an absolute path when allowed working directory roots are configured`,
-    );
-  }
-
-  const target = path.resolve(trimmed);
-  for (const rawRoot of roots) {
-    const root = path.resolve(rawRoot);
-    const rel = path.relative(root, target);
-    if (rel === "" || (rel !== ".." && !rel.startsWith(`..${path.sep}`) && !path.isAbsolute(rel))) {
-      return;
-    }
-  }
-  throw new Error(`working directory "${trimmed}" is not inside an allowed root`);
-}
-
-/**
- * Returns a config whose `directory` reflects the per-session working directory
- * override for this lifecycle call, without mutating the shared channel config.
- *
- * The OpenCode Server may run remotely or inside a container, so the override is
- * only trimmed here: no local filesystem checks and no shell/env/`~` expansion
- * happen in agent-bridge. The OpenCode Server itself validates the directory
- * when the session is created or resumed, and errors propagate back through the
- * Gateway's session-new transaction.
- *
- * An empty/whitespace override is treated as "no override", falling back to the
- * channel-level `directory` (or the agent-bridge process cwd). The allowlist is
- * enforced only for user-supplied overrides; the channel-level configured
- * directory and a bare `/new` are never checked.
- */
-function withWorkingDirectory(
-  config: OpenCodeAgentConfig,
-  workingDirectory: string | undefined,
-  allowedWorkingDirectoryRoots: string[] | undefined,
-): OpenCodeAgentConfig {
-  const trimmed = workingDirectory?.trim();
-  if (!trimmed) return config;
-  assertAllowedWorkingDirectory(trimmed, allowedWorkingDirectoryRoots);
-  return { ...config, directory: trimmed };
 }
 
 function runtimeKey(channelName: string, config: OpenCodeAgentConfig): string {
@@ -363,78 +366,41 @@ export function createOpenCodeAgentModule(
     return runtime;
   };
 
-  const buildAdapter = (
-    config: OpenCodeAgentConfig,
-    channelName: string,
-    agentSessionId: string,
-    sessionID: string,
-    initialModel: { providerID: string; modelID: string } | undefined,
-    sessionState: AgentSessionStateApi<OpenCodeAgentSessionStateV1>,
-  ): AgentAdapter =>
-    new OpenCodeAgentAdapter({
-      agentSessionId,
-      openCodeSessionId: sessionID,
-      config,
-      runtime: getRuntime(channelName, config),
-      initialModel,
-      sessionState,
-    });
-
   return {
     type: "opencode",
     sessionStateCodec: openCodeAgentSessionStateCodec,
     createConfigCollector: () => createOpenCodeConfigCollector(apiFactory, writeLine),
 
+    /**
+     * The module only assembles adapter dependencies. The adapter owns the
+     * working-directory policy, provider session creation, state
+     * initialization and runtime registration inside `start()`.
+     */
     async createAgentSession({ config, common, agentSessionId, sessionState, workingDirectory, allowedWorkingDirectoryRoots }) {
-      const effective = withWorkingDirectory(config, workingDirectory, allowedWorkingDirectoryRoots);
-      const runtime = getRuntime(common.channelName, effective);
-      const configuredModel = parseConfiguredModel(effective.model);
-      const session = await runtime.api.createSession({
-        title: `agent-bridge:${common.channelName}`,
-        agent: effective.agent,
-        model: configuredModel,
-      });
-      logger.info(`created OpenCode session ${agentSessionId} for channel ${common.channelName}`);
-      const adapter = buildAdapter(
-        effective,
-        common.channelName,
+      logger.info(`creating agent session ${agentSessionId} for channel ${common.channelName}`);
+      return new OpenCodeAgentAdapter({
         agentSessionId,
-        session.id,
-        currentModelFromSessionData(session, [], effective.model),
+        mode: "create",
         sessionState,
-      );
-      // Persist only the user-supplied override; a bare /new keeps the
-      // channel-configured directory (or the server default) without storing it.
-      const trimmedOverride = workingDirectory?.trim();
-      await sessionState.initialize({
-        version: 1,
-        openCodeSessionId: session.id,
-        ...(trimmedOverride ? { workingDirectory: trimmedOverride } : {}),
+        config,
+        channelName: common.channelName,
+        ...(workingDirectory !== undefined ? { workingDirectory } : {}),
+        ...(allowedWorkingDirectoryRoots !== undefined ? { allowedWorkingDirectoryRoots } : {}),
+        getRuntime,
       });
-      return adapter;
     },
 
     async resumeAgentSession({ config, common, agentSessionId, sessionState, allowedWorkingDirectoryRoots }) {
-      const state = await sessionState.read();
-      const effective = withWorkingDirectory(config, state.workingDirectory, allowedWorkingDirectoryRoots);
-      const runtime = getRuntime(common.channelName, effective);
-      const [session, messages] = await Promise.all([
-        runtime.api.getSession(state.openCodeSessionId),
-        runtime.api.getMessages(state.openCodeSessionId, 50),
-      ]);
-      logger.info(`resumed OpenCode session ${agentSessionId} for channel ${common.channelName}`);
-      const adapter = buildAdapter(
-        effective,
-        common.channelName,
+      logger.info(`resuming agent session ${agentSessionId} for channel ${common.channelName}`);
+      return new OpenCodeAgentAdapter({
         agentSessionId,
-        state.openCodeSessionId,
-        currentModelFromSessionData(session, messages, effective.model),
+        mode: "resume",
         sessionState,
-      );
-      // Normalize legacy binding-migrated records into the canonical versioned
-      // shape (a no-op rewrite for already-versioned records).
-      await sessionState.update((current) => current);
-      return adapter;
+        config,
+        channelName: common.channelName,
+        ...(allowedWorkingDirectoryRoots !== undefined ? { allowedWorkingDirectoryRoots } : {}),
+        getRuntime,
+      });
     },
   };
 }
