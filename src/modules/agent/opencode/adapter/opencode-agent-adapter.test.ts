@@ -7,6 +7,8 @@ import { MEDIA_CONVENTION_PROMPT } from "../../media-convention";
 import { OpenCodeAgentAdapter } from "./opencode-agent-adapter";
 import type { OpenCodeApi } from "./opencode-api";
 import { OpenCodeRuntime } from "./opencode-runtime";
+import type { OpenCodeAgentConfig } from "../../../../types";
+import type { OpenCodeAgentSessionStateV1 } from "../index";
 
 const mediaDir = realpathSync(mkdtempSync(join(tmpdir(), "opencode-media-test-")));
 const mediaPath = join(mediaDir, "chart.png");
@@ -55,7 +57,7 @@ function createApi(overrides: Partial<OpenCodeApi> = {}): OpenCodeApi {
   return {
     health: vi.fn(async () => ({ healthy: true as const, version: "1.18.10" })),
     createSession: vi.fn(async () => ({ id: "ses-1" }) as Session),
-    getSession: vi.fn(async () => ({ id: "ses-1" }) as Session),
+    getSession: vi.fn(async () => ({ id: "ses-1", model: { providerID: "anthropic", id: "claude-sonnet" } }) as Session),
     getSessionStatuses: vi.fn(async () => ({})),
     getMessages: vi.fn(async () => []),
     promptAsync: vi.fn(async () => undefined),
@@ -78,16 +80,47 @@ function createApi(overrides: Partial<OpenCodeApi> = {}): OpenCodeApi {
   };
 }
 
-function createAdapter(api = createApi()) {
+/**
+ * Fake session-scoped state handle. The adapter owns the state lifecycle, so
+ * the routing tests only need a handle that serves the provider session id
+ * (and its working directory) on resume.
+ */
+function createSessionState(
+  state: OpenCodeAgentSessionStateV1 = {
+    version: 1,
+    openCodeSessionId: "ses-1",
+    workingDirectory: process.cwd(),
+    workingDirectorySource: "user",
+  },
+) {
+  return {
+    agentSessionId: "opencode:ses-1",
+    read: vi.fn(async () => state),
+    replace: vi.fn(async () => undefined),
+    update: vi.fn(
+      async (updater: (current: Readonly<OpenCodeAgentSessionStateV1>) => OpenCodeAgentSessionStateV1) =>
+        updater(state),
+    ),
+    flush: vi.fn(async () => undefined),
+    initialize: vi.fn(async () => undefined),
+  };
+}
+
+function createAdapter(
+  api = createApi(),
+  options: { sessionState?: ReturnType<typeof createSessionState>; config?: OpenCodeAgentConfig } = {},
+) {
   const runtime = new OpenCodeRuntime({ api });
+  const sessionState = options.sessionState ?? createSessionState();
   const adapter = new OpenCodeAgentAdapter({
     agentSessionId: "opencode:ses-1",
-    openCodeSessionId: "ses-1",
-    config: { baseUrl: "http://127.0.0.1:4096", agent: "build" },
-    runtime,
-    initialModel: { providerID: "anthropic", modelID: "claude-sonnet" },
+    mode: "resume",
+    sessionState,
+    config: options.config ?? { baseUrl: "http://127.0.0.1:4096", agent: "build" },
+    channelName: "test-channel",
+    getRuntime: () => runtime,
   });
-  return { adapter, api };
+  return { adapter, api, runtime, sessionState };
 }
 
 function event(value: unknown): Event {
