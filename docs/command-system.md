@@ -12,8 +12,8 @@ All client adapters use the same command parser, so the command behavior is cons
 
 | User input | Meaning | Internal event |
 | --- | --- | --- |
-| `/new` | Start a fresh agent session for the current chat | `command.session.new` |
-| `/new <path>` | Start a fresh agent session whose working directory is `<path>` | `command.session.new` with `workingDirectory` |
+| `/new` | Start a fresh agent session for the current chat (reusing the chat's remembered directory, if any) | `command.session.new` |
+| `/new <path>` | Start a fresh agent session whose working directory is `<path>`, and remember `<path>` as this chat's default | `command.session.new` with `workingDirectory` |
 | `/n` | Alias of `/new` | `command.session.new` |
 | `/n <path>` | Alias of `/new <path>` | `command.session.new` with `workingDirectory` |
 | `/compact` | Ask the current agent session to compact its context | `command.session.compact` |
@@ -103,10 +103,32 @@ Only `/new`/`/n` and `/model`/`/m` accept an argument tail. All other commands m
 
 `/new <path>` and `/n <path>` do the same, but the new session is started with `<path>` as its working directory instead of the agent-bridge process's current directory.
 
-The user will receive a confirmation reply:
+#### Working directory resolution (client side)
+
+The client adapter — not the agent backend — always resolves a concrete working directory before emitting the command. The resolution order is:
+
+1. **Explicit argument**: `/new <path>` validates `<path>` locally (see below), uses the canonical directory, and remembers it in the chat's client session state (per-channel store, keyed by chat).
+2. **Remembered default**: a bare `/new` reuses the last directory explicitly given in this chat, including after a bridge restart. The remembered directory is re-validated before use; if it went stale (deleted or unmounted), the command is rejected with an explanatory reply instead of silently falling back.
+3. **Fallback**: when nothing is remembered, the agent-bridge process's current working directory is used.
+
+#### Client-side validation
+
+`/new <path>` is validated by the client adapter **before** any event is emitted: `~` is expanded, relative paths resolve against the bridge process cwd, and the target is canonicalized with `realpath` and must exist, be a directory, and be readable/enterable by the bridge process.
+
+- **Valid** → the `command.session.new` event is emitted with the canonical directory, and that directory is remembered as the chat's default.
+- **Invalid** → the user gets a localized error reply, no event is emitted, the previous session stays untouched, and **nothing is remembered**.
+
+This local check is a UX pre-check, not the security boundary: the agent-side allowlist (`defaults.allowedWorkingDirectoryRoots`) is still enforced by the agent backend. It assumes the agent runtime shares the bridge's filesystem — see the deployment note in [`docs/opencode.md`](./opencode.md).
+
+The emitted `command.session.new` event therefore always carries a `workingDirectory`, plus a `workingDirectorySource` trust classification:
+
+- `user` — an explicit argument or a remembered default (which was originally user-supplied). User-sourced paths stay subject to the agent-side allowlist (`defaults.allowedWorkingDirectoryRoots`), on create and on resume.
+- `default` — the client-side cwd fallback. It is trusted, never allowlist-checked, and the agent backend may still prefer its own configured directory (OpenCode's channel-level `directory` takes precedence over the fallback).
+
+The user will receive a confirmation reply that names the resolved directory:
 
 ```text
-Started a new session.
+Started a new session (working directory: /Users/wesley/project-a).
 ```
 
 #### Working directory semantics
@@ -116,13 +138,13 @@ Path interpretation differs per agent backend:
 | Concern | PI Coding Agent | OpenCode |
 | --- | --- | --- |
 | Absolute paths | Supported | Supported |
-| Relative paths | Resolved against the agent-bridge process cwd | Forwarded to the server as typed (see below) |
-| `~` / `~/...` | Expanded against the bridge user's home directory | Not expanded; forwarded literally |
+| Relative paths | Resolved against the agent-bridge process cwd | Resolved against the agent-bridge process cwd (client-side validation; see the deployment note in [`docs/opencode.md`](./opencode.md)) |
+| `~` / `~/...` | Expanded against the bridge user's home directory | Expanded against the bridge user's home directory (client-side validation) |
 | Spaces / Unicode | Supported | Supported |
 | Shell-style env vars (`$HOME`) | Not expanded | Not expanded |
-| Local validation | `realpath` canonicalization; target must exist, be a directory, and be readable/enterable | None in the bridge; the OpenCode Server validates the directory |
+| Validation | Client-side pre-check, then `realpath` canonicalization again agent-side; target must exist, be a directory, and be readable/enterable | Client-side pre-check in the bridge; the directory is then forwarded to the server |
 
-Because the OpenCode Server may run on a remote host or inside a container, `agent-bridge` does **not** touch the filesystem for OpenCode working directories. The path is trimmed and forwarded to the server, and the server is responsible for validating it (including symlink resolution). This means `~` and environment variables are never expanded for OpenCode, and a relative path is resolved by the server relative to the server's own working directory — not the bridge's.
+Because `/new <path>` is validated against the bridge's local filesystem, running the OpenCode Server on a different host or inside a container is **not recommended**: the local check can reject paths that only exist on the server (or vice versa).
 
 For predictable behavior across both backends, **prefer absolute paths**:
 
@@ -130,7 +152,7 @@ For predictable behavior across both backends, **prefer absolute paths**:
 /new /Users/wesley/project-learn/demo
 ```
 
-The working directory is persisted in the agent session's own state record (the routing binding itself only stores `clientSessionId -> agentSessionId`). When a session is released after the idle timeout or the bridge restarts, the saved working directory is restored along with the agent session, so the agent keeps operating on the same directory.
+The working directory is persisted in the agent session's own state record (the routing binding itself only stores `clientSessionId -> agentSessionId`). When a session is released after the idle timeout or the bridge restarts, the saved working directory is restored along with the agent session, so the agent keeps operating on the same directory. Independently, the chat's remembered `/new` default lives in the client session's own state record (`clientSessions`), so a bare `/new` after a restart still targets the directory the user last chose.
 
 #### Creation failure keeps the previous session
 
@@ -159,7 +181,7 @@ A user-supplied working directory can point anywhere the agent-bridge process ca
 - When configured, a user-supplied working directory must resolve to the root itself or a strict subdirectory of one of the roots.
 - The check is enforced by each provider: PI canonicalizes with `realpath` before the boundary check, so symlinks cannot escape an allowed root; OpenCode performs a lexical-only check in the bridge (an absolute path must be inside a root), and the remote server remains responsible for filesystem-level safety.
 - When roots are configured, OpenCode overrides must be absolute paths (a relative path would be resolved by the server, which the bridge cannot verify).
-- A bare `/new` (no path) and the channel-level configured `directory` are trusted configuration and are **never** checked against the user-path allowlist.
+- `default`-sourced directories (the client-side cwd fallback for a bare `/new`) and the channel-level configured `directory` are trusted configuration and are **never** checked against the user-path allowlist. A remembered `/new` default keeps its original `user` classification and stays checked.
 
 See [`docs/pi-coding-agent.md`](./pi-coding-agent.md) and [`docs/opencode.md`](./opencode.md) for backend-specific details.
 

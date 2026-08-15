@@ -334,9 +334,10 @@ class DeferredStateStore implements ChannelStateStore {
 function makeStore(initial: { bindings?: Record<string, string>; records?: Record<string, AgentSessionRecord> } = {}): InMemoryStateStore {
   const store = new InMemoryStateStore();
   store.state = {
-    version: 2,
+    version: 3,
     bindings: { ...(initial.bindings ?? {}) },
     agentSessions: { ...(initial.records ?? {}) },
+    clientSessions: {},
   };
   return store;
 }
@@ -543,12 +544,14 @@ describe("GatewayCore", () => {
     await imAdapter.emit({
       type: "command.session.new",
       clientSessionId: "client-1",
+      workingDirectory: "/default/dir",
+      workingDirectorySource: "default",
     });
 
     await waitFor(() => {
       expect(createdAdapters).toHaveLength(2);
       expect(first.stopCount).toBe(1);
-      expect(imAdapter.outputs.some((event) => event.text === "Started a new session.")).toBe(true);
+      expect(imAdapter.outputs.some((event) => event.text === "Started a new session (working directory: /default/dir).")).toBe(true);
     });
 
     await first.emitAssistant("late old reply");
@@ -714,6 +717,7 @@ describe("GatewayCore", () => {
       type: "command.session.new",
       clientSessionId: "client-1",
       workingDirectory: "/tmp/project-a",
+      workingDirectorySource: "user",
     });
 
     await waitFor(() => {
@@ -727,18 +731,21 @@ describe("GatewayCore", () => {
       });
       // The previous record is dropped once nothing references it.
       expect(store.state.agentSessions[createdAdapters[0]!.agentSessionId]).toBeUndefined();
-      expect(imAdapter.outputs.some((event) => event.text === "Started a new session.")).toBe(true);
+      expect(imAdapter.outputs.some((event) => event.text === "Started a new session (working directory: /tmp/project-a).")).toBe(true);
     });
   });
 
-  it("keeps the no-argument /new behavior and omits workingDirectory", async () => {
+  it("passes a default-source /new working directory through to createAgentSession", async () => {
     const imAdapter = new FakeIMAdapter();
     const store = makeStore();
-    const createdDirs: Array<string | undefined> = [];
+    const createdCalls: Array<{ workingDirectory?: string; workingDirectorySource?: string }> = [];
 
     const agentModule = makeFakeModule({
       create: async (args) => {
-        createdDirs.push(args.workingDirectory);
+        createdCalls.push({
+          workingDirectory: args.workingDirectory,
+          workingDirectorySource: args.workingDirectorySource,
+        });
         return new FakeAgentAdapter(args.agentSessionId);
       },
     });
@@ -753,17 +760,30 @@ describe("GatewayCore", () => {
     running.push(core);
     await core.start();
 
+    // The client adapter always resolves a concrete directory for `/new`; a
+    // `default` source marks the trusted client-side cwd fallback.
     await imAdapter.emit({
       type: "command.session.new",
       clientSessionId: "client-1",
+      workingDirectory: "/default/dir",
+      workingDirectorySource: "default",
     });
 
     await waitFor(() => {
-      expect(createdDirs).toEqual([undefined]);
+      expect(createdCalls).toEqual([
+        { workingDirectory: "/default/dir", workingDirectorySource: "default" },
+      ]);
       const boundId = store.state.bindings["client-1"];
       expect(boundId).toMatch(/^fake:/);
-      expect(store.state.agentSessions[boundId!]!.state).toEqual({ version: 1 });
-      expect(imAdapter.outputs.some((event) => event.text === "Started a new session.")).toBe(true);
+      expect(store.state.agentSessions[boundId!]!.state).toEqual({
+        version: 1,
+        workingDirectory: "/default/dir",
+      });
+      expect(
+        imAdapter.outputs.some(
+          (event) => event.text === "Started a new session (working directory: /default/dir).",
+        ),
+      ).toBe(true);
     });
   });
 
@@ -895,6 +915,7 @@ describe("GatewayCore", () => {
       type: "command.session.new",
       clientSessionId: "client-1",
       workingDirectory: "/tmp/missing",
+      workingDirectorySource: "user",
     });
 
     await waitFor(() => {
@@ -955,6 +976,7 @@ describe("GatewayCore", () => {
       type: "command.session.new",
       clientSessionId: "client-1",
       workingDirectory: "/tmp/project-b",
+      workingDirectorySource: "user",
     });
 
     await waitFor(() => {
@@ -1004,6 +1026,8 @@ describe("GatewayCore", () => {
     await imAdapter.emit({
       type: "command.session.new",
       clientSessionId: "client-1",
+      workingDirectory: "/default/dir",
+      workingDirectorySource: "default",
     });
 
     await waitFor(() => {
@@ -1024,20 +1048,26 @@ describe("GatewayCore", () => {
     const imAdapter = new FakeIMAdapter();
     const store = makeStore();
     const createdAdapters: FakeAgentAdapter[] = [];
-    const createCalls: Array<{ workingDirectory?: string; allowedWorkingDirectoryRoots?: string[] }> = [];
+    const createCalls: Array<{
+      workingDirectory?: string;
+      workingDirectorySource?: string;
+      allowedWorkingDirectoryRoots?: string[];
+    }> = [];
 
     // Fake module enforcing the same contract the real providers implement:
-    // a user-supplied workingDirectory must resolve inside an allowed root.
+    // a user-sourced workingDirectory must resolve inside an allowed root,
+    // while default-sourced fallbacks are trusted and never checked.
     const agentModule = makeFakeModule({
       createdAdapters,
       create: async (args) => {
         createCalls.push({
           workingDirectory: args.workingDirectory,
+          workingDirectorySource: args.workingDirectorySource,
           allowedWorkingDirectoryRoots: args.allowedWorkingDirectoryRoots,
         });
         const roots = args.allowedWorkingDirectoryRoots ?? [];
         const wd = args.workingDirectory;
-        if (wd !== undefined && roots.length > 0) {
+        if (wd !== undefined && args.workingDirectorySource !== "default" && roots.length > 0) {
           const allowed = roots.some(
             (root) => wd === root || wd.startsWith(`${root.replace(/\/+$/, "")}/`),
           );
@@ -1062,15 +1092,19 @@ describe("GatewayCore", () => {
     running.push(core);
     await core.start();
 
-    // Bare /new (no workingDirectory) is not allowlist-checked and succeeds.
+    // A default-sourced /new (the client-side cwd fallback) is not
+    // allowlist-checked and succeeds.
     await imAdapter.emit({
       type: "command.session.new",
       clientSessionId: "client-1",
+      workingDirectory: "/default/dir",
+      workingDirectorySource: "default",
     });
     await waitFor(() => {
       expect(createdAdapters).toHaveLength(1);
     });
-    expect(createCalls[0]!.workingDirectory).toBeUndefined();
+    expect(createCalls[0]!.workingDirectory).toBe("/default/dir");
+    expect(createCalls[0]!.workingDirectorySource).toBe("default");
     expect(createCalls[0]!.allowedWorkingDirectoryRoots).toEqual(["/tmp/allowed"]);
 
     // The out-of-root override is rejected before any teardown of the old session.
@@ -1078,6 +1112,7 @@ describe("GatewayCore", () => {
       type: "command.session.new",
       clientSessionId: "client-1",
       workingDirectory: "/tmp/outside",
+      workingDirectorySource: "user",
     });
 
     await waitFor(() => {
@@ -1185,6 +1220,8 @@ describe("GatewayCore", () => {
     await imAdapter.emit({
       type: "command.session.new",
       clientSessionId: "client-1",
+      workingDirectory: "/default/dir",
+      workingDirectorySource: "default",
     });
 
     await waitFor(() => {
@@ -1236,6 +1273,7 @@ describe("GatewayCore", () => {
       type: "command.session.new",
       clientSessionId: "client-1",
       workingDirectory: "/tmp/project-a",
+      workingDirectorySource: "user",
     });
 
     expect(createdAdapters).toHaveLength(2);
@@ -1243,7 +1281,7 @@ describe("GatewayCore", () => {
     expect(createdAdapters[1]!.stopCount).toBe(0);
     expect(store.state.bindings["client-1"]).toBe(createdAdapters[1]!.agentSessionId);
     expect(store.state.agentSessions[createdAdapters[0]!.agentSessionId]).toBeUndefined();
-    expect(imAdapter.outputs.some((event) => event.text === "Started a new session.")).toBe(true);
+    expect(imAdapter.outputs.some((event) => event.text === "Started a new session (working directory: /tmp/project-a).")).toBe(true);
 
     // The new runtime is bound and reachable: a follow-up message goes to the
     // new adapter and is never routed to the stale (failed-stop) runtime.
@@ -1301,6 +1339,8 @@ describe("GatewayCore", () => {
     await imAdapter.emit({
       type: "command.session.new",
       clientSessionId: "client-1",
+      workingDirectory: "/default/dir",
+      workingDirectorySource: "default",
     });
     await waitFor(() => {
       expect(createdAdapters).toHaveLength(2);
@@ -1333,6 +1373,7 @@ describe("GatewayCore", () => {
       type: "command.session.new",
       clientSessionId: "client-1",
       workingDirectory: "/tmp/project-a",
+      workingDirectorySource: "user",
     });
     // The first /new parks on its create's initialize transaction first.
     await waitFor(() => {
@@ -1351,6 +1392,7 @@ describe("GatewayCore", () => {
       type: "command.session.new",
       clientSessionId: "client-1",
       workingDirectory: "/tmp/project-b",
+      workingDirectorySource: "user",
     });
     // The second /new is parked on the store flush (blocked by the first
     // binding save): nothing new is in flight yet.
@@ -1383,7 +1425,7 @@ describe("GatewayCore", () => {
     expect(store.state.agentSessions[createdAdapters[0]!.agentSessionId]).toBeUndefined();
     expect(
       imAdapter.outputs.filter(
-        (event) => event.type === "assistant.message" && event.text === "Started a new session.",
+        (event) => event.type === "assistant.message" && event.text.startsWith("Started a new session"),
       ),
     ).toHaveLength(2);
   });
@@ -1410,6 +1452,7 @@ describe("GatewayCore", () => {
       type: "command.session.new",
       clientSessionId: "client-1",
       workingDirectory: "/tmp/project-a",
+      workingDirectorySource: "user",
     });
     await waitFor(() => {
       expect(store.deferreds).toHaveLength(1);
@@ -1442,6 +1485,7 @@ describe("GatewayCore", () => {
       type: "command.session.new",
       clientSessionId: "client-1",
       workingDirectory: "/tmp/project-b",
+      workingDirectorySource: "user",
     });
     await waitFor(() => {
       expect(store.deferreds).toHaveLength(3);
@@ -1497,6 +1541,7 @@ describe("GatewayCore", () => {
       type: "command.session.new",
       clientSessionId: "client-1",
       workingDirectory: "/tmp/project-b",
+      workingDirectorySource: "user",
     });
     await waitFor(() => {
       expect(store.deferreds).toHaveLength(3);
@@ -1661,6 +1706,7 @@ describe("GatewayCore", () => {
         type: "command.session.new",
         clientSessionId: "client-1",
         workingDirectory: "/tmp/project-a",
+        workingDirectorySource: "user",
       });
       await waitFor(() => {
         expect(createEntered).toBe(true);
@@ -1694,7 +1740,7 @@ describe("GatewayCore", () => {
       expect(store.state.bindings).toEqual({
         "client-1": createdAdapters[0]!.agentSessionId,
       });
-      expect(imAdapter.outputs.some((event) => event.text === "Started a new session.")).toBe(true);
+      expect(imAdapter.outputs.some((event) => event.text === "Started a new session (working directory: /tmp/project-a).")).toBe(true);
       expect(createdAdapters).toHaveLength(1);
       expect(createdAdapters[0]!.inputs).toEqual([]);
     } finally {

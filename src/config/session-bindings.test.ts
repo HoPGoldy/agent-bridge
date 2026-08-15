@@ -76,7 +76,7 @@ describe("session bindings facade", () => {
     });
 
     const raw = JSON.parse(await readFile(file, "utf8")) as Record<string, unknown>;
-    expect(raw.version).toBe(2);
+    expect(raw.version).toBe(3);
     expect(raw.bindings).toEqual({
       "client-1": "pi-coding-agent:abc",
       "client-2": "opencode:def",
@@ -131,7 +131,7 @@ describe("session bindings facade", () => {
     const createdAt = "2026-08-10T00:00:00.000Z";
     const channelStateStore = createFileChannelStateStore(file);
     await channelStateStore.save({
-      version: 2,
+      version: 3,
       bindings: {},
       agentSessions: {
         "pi-coding-agent:abc": {
@@ -143,6 +143,7 @@ describe("session bindings facade", () => {
           state: { model: "gpt-5.6" },
         },
       },
+      clientSessions: {},
     });
 
     const store = createSessionBindingStoreFacade(channelStateStore);
@@ -183,7 +184,7 @@ describe("session bindings facade", () => {
     const createdAt = "2026-08-10T00:00:00.000Z";
     const channelStateStore = createFileChannelStateStore(file);
     await channelStateStore.save({
-      version: 2,
+      version: 3,
       bindings: { "client-1": "agent-1" },
       agentSessions: {
         "agent-1": {
@@ -195,6 +196,7 @@ describe("session bindings facade", () => {
           state: { migratedFromBinding: true, workingDirectory: "/tmp/legacy" },
         },
       },
+      clientSessions: {},
     });
 
     const store = createSessionBindingStoreFacade(channelStateStore);

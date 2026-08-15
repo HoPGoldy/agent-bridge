@@ -21,7 +21,11 @@ export interface PiCodingAgentSessionStateV1 {
   version: 1;
   /** Canonical (realpath-resolved) directory the Pi process is spawned in. */
   workingDirectory: string;
-  /** Where the directory came from: `user` for `/new <path>`, `default` for a bare `/new`. */
+  /**
+   * Where the directory came from: `user` for user-originated `/new` paths
+   * (an explicit argument or a remembered chat default), `default` for the
+   * client-side cwd fallback or implicitly created sessions.
+   */
   workingDirectorySource: "default" | "user";
   /**
    * Decode-only marker set while the persisted record is still the legacy
@@ -130,13 +134,21 @@ function buildAdapterOptions(
   config: PiCodingAgentConfig,
   agentSessionId: string,
   sessionState: PiCodingAgentAdapterOptions["sessionState"],
-  options: { mode: "create" | "resume"; workingDirectory?: string; allowedWorkingDirectoryRoots?: string[] },
+  options: {
+    mode: "create" | "resume";
+    workingDirectory?: string;
+    workingDirectorySource?: "user" | "default";
+    allowedWorkingDirectoryRoots?: string[];
+  },
 ): PiCodingAgentAdapterOptions {
   return {
     agentSessionId,
     mode: options.mode,
     sessionState,
     ...(options.workingDirectory !== undefined ? { workingDirectory: options.workingDirectory } : {}),
+    ...(options.workingDirectorySource !== undefined
+      ? { workingDirectorySource: options.workingDirectorySource }
+      : {}),
     ...(options.allowedWorkingDirectoryRoots !== undefined
       ? { allowedWorkingDirectoryRoots: options.allowedWorkingDirectoryRoots }
       : {}),
@@ -182,12 +194,13 @@ export const piCodingAgentModule: AgentModule<PiCodingAgentConfig, PiCodingAgent
   sessionStateCodec: piCodingAgentSessionStateCodec,
   createConfigCollector: createPiCodingAgentConfigCollector,
 
-  async createAgentSession({ config, common, agentSessionId, sessionState, workingDirectory, allowedWorkingDirectoryRoots }) {
+  async createAgentSession({ config, common, agentSessionId, sessionState, workingDirectory, workingDirectorySource, allowedWorkingDirectoryRoots }) {
     logger.info(`creating agent session ${agentSessionId} for channel ${common.channelName}`);
     return new PiCodingAgentAdapter(
       buildAdapterOptions(config, agentSessionId, sessionState, {
         mode: "create",
         workingDirectory,
+        workingDirectorySource,
         allowedWorkingDirectoryRoots,
       }),
     );

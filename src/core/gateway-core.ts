@@ -6,6 +6,7 @@ import type {
   ChannelCommonContext,
   ClientInputEvent,
   ClientOutputEvent,
+  ClientWorkingDirectorySource,
   GatewayCoreOptions,
 } from "../types";
 import { createAgentSessionStateRegistry } from "../config/agent-session-state";
@@ -148,7 +149,7 @@ export class GatewayCore {
 
   async #handleClientOutput(event: ClientOutputEvent): Promise<void> {
     if (event.type === "command.session.new") {
-      await this.#handleSessionNew(event.clientSessionId, event.workingDirectory);
+      await this.#handleSessionNew(event.clientSessionId, event.workingDirectory, event.workingDirectorySource);
       return;
     }
 
@@ -361,13 +362,20 @@ export class GatewayCore {
     }
   }
 
-  async #handleSessionNew(clientSessionId: string, workingDirectory?: string): Promise<void> {
+  async #handleSessionNew(
+    clientSessionId: string,
+    workingDirectory: string,
+    workingDirectorySource: ClientWorkingDirectorySource,
+  ): Promise<void> {
     // Transactional switch: create and start the new runtime (and its state
     // record) first so a failed creation never tears down the previous
     // session, its binding, or its runtime.
     let newRuntime: AgentRuntime;
     try {
-      newRuntime = await this.#createRuntimeForClient(clientSessionId, workingDirectory);
+      newRuntime = await this.#createRuntimeForClient(clientSessionId, {
+        workingDirectory,
+        workingDirectorySource,
+      });
     } catch (error) {
       const detail = error instanceof Error ? error.message : String(error);
       this.#logger.error(`failed to create new agent session for ${clientSessionId}:`, error);
@@ -420,7 +428,7 @@ export class GatewayCore {
     await this.#deliverClientInput({
       type: "assistant.message",
       clientSessionId,
-      text: this.#t("gateway.startedNewSession"),
+      text: this.#t("gateway.startedNewSession", { workingDirectory }),
     });
   }
 
@@ -524,7 +532,10 @@ export class GatewayCore {
    * revokes the handle and deletes the reserved record, leaving any previous
    * session, binding and runtime untouched.
    */
-  async #createRuntimeForClient(clientSessionId: string, workingDirectory?: string): Promise<AgentRuntime> {
+  async #createRuntimeForClient(
+    clientSessionId: string,
+    options?: { workingDirectory?: string; workingDirectorySource?: ClientWorkingDirectorySource },
+  ): Promise<AgentRuntime> {
     const agentSessionId = `${this.#agentModule.type}:${randomUUID()}`;
     const sessionState = await this.#agentSessionStateRegistry.reserve({
       agentSessionId,
@@ -540,7 +551,12 @@ export class GatewayCore {
         common: this.#common ?? { channelName: "", language: "en-US" },
         agentSessionId,
         sessionState,
-        ...(workingDirectory !== undefined ? { workingDirectory } : {}),
+        ...(options?.workingDirectory !== undefined
+          ? { workingDirectory: options.workingDirectory }
+          : {}),
+        ...(options?.workingDirectorySource !== undefined
+          ? { workingDirectorySource: options.workingDirectorySource }
+          : {}),
         ...(this.#allowedWorkingDirectoryRoots !== undefined
           ? { allowedWorkingDirectoryRoots: this.#allowedWorkingDirectoryRoots }
           : {}),

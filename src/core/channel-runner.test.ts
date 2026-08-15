@@ -11,6 +11,11 @@ const gatewayCoreCtor = vi.fn().mockImplementation(() => ({
 
 const clientModule = {
   type: "fake-client",
+  sessionStateCodec: {
+    currentVersion: 1,
+    decode: (raw: unknown) => raw as object,
+    encode: (state: object) => state,
+  },
   createClientAdapter,
 };
 
@@ -22,11 +27,20 @@ const agentModule = {
 };
 
 const fakeChannelStateStore = {
-  load: vi.fn(async () => ({ version: 2, bindings: {}, agentSessions: {} })),
+  load: vi.fn(async () => ({ version: 3, bindings: {}, agentSessions: {}, clientSessions: {} })),
   save: vi.fn(async () => {}),
-  transaction: vi.fn(async (updater: (draft: { version: 2; bindings: object; agentSessions: object }) => unknown) => {
-    return updater({ version: 2, bindings: {}, agentSessions: {} });
-  }),
+  transaction: vi.fn(
+    async (
+      updater: (draft: {
+        version: 3;
+        bindings: object;
+        agentSessions: object;
+        clientSessions: Record<string, unknown>;
+      }) => unknown,
+    ) => {
+      return updater({ version: 3, bindings: {}, agentSessions: {}, clientSessions: {} });
+    },
+  ),
   flush: vi.fn(async () => {}),
 };
 
@@ -102,6 +116,7 @@ describe("runChannel", () => {
     expect(createClientAdapter).toHaveBeenCalledWith({
       config: channelConfig.client.config,
       common,
+      sessionState: expect.any(Object),
     });
     expect(gatewayCoreCtor).toHaveBeenCalledWith(
       expect.objectContaining({
@@ -138,6 +153,31 @@ describe("runChannel", () => {
       }),
     );
     expect(createAgentSessionStateRegistry).toHaveBeenCalledWith(fakeChannelStateStore);
+  });
+
+  it("builds the client session state store on the same per-channel state store", async () => {
+    const { runChannel } = await import("./channel-runner");
+    const channelConfig: ChannelConfig = {
+      common: { language: "en-US" },
+      client: {
+        type: "wecom",
+        config: { botId: "bot-id", secret: "secret" },
+      },
+      agent: {
+        type: "pi-coding-agent",
+        config: {},
+      },
+    };
+
+    await runChannel({
+      channelName: "demo-channel",
+      channelConfig,
+      defaults: { agentIdleTimeoutMs: 60_000 },
+    });
+
+    const sessionState = createClientAdapter.mock.calls[0]![0].sessionState;
+    await sessionState.session("client-1").update(() => ({ version: 1 }));
+    expect(fakeChannelStateStore.transaction).toHaveBeenCalled();
   });
 
   it("passes defaults.allowedWorkingDirectoryRoots into the gateway core", async () => {

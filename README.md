@@ -93,7 +93,7 @@ From any IM chat, `/new <path>` starts the next agent session in that directory 
 /new ~/project-learn/demo
 ```
 
-A bare `/new` keeps the default working directory. Path semantics differ per agent backend (PI resolves paths locally; OpenCode forwards them to its server) — see [`docs/command-system.md`](./docs/command-system.md) for details.
+A directory given once is remembered per chat (persisted in the channel's client session store): a later bare `/new` reuses it, and only falls back to the bridge's working directory when nothing was ever chosen. Paths are validated locally before a session is created — invalid ones are rejected immediately and never remembered — see [`docs/command-system.md`](./docs/command-system.md) for details.
 
 If the bot is not strictly private, restrict the directories users may start sessions in via `defaults.allowedWorkingDirectoryRoots` in `~/.config/agent-bridge/config.json`:
 
@@ -105,7 +105,7 @@ If the bot is not strictly private, restrict the directories users may start ses
 }
 ```
 
-When configured, `/new <path>` targets must resolve inside one of the roots. Bare `/new` and the channel-level agent configuration are trusted and never checked.
+When configured, user-originated `/new <path>` targets (including remembered defaults) must resolve inside one of the roots. The client-side cwd fallback for a bare `/new` and the channel-level agent configuration are trusted and never checked.
 
 ## Development
 

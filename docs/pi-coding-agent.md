@@ -112,7 +112,7 @@ PI configuration remains owned by PI. Files such as `~/.pi/agent/settings.json`,
 
 ## Working directories
 
-Sending `/new <path>` (or `/n <path>`) starts the next session with `<path>` as the PI working directory instead of the bridge process cwd. A bare `/new` keeps the bridge process cwd.
+Sending `/new <path>` (or `/n <path>`) starts the next session with `<path>` as the PI working directory and remembers it as the chat's default; a later bare `/new` reuses the remembered directory, falling back to the bridge process cwd only when nothing was ever chosen.
 
 Path handling is performed by the bridge before PI starts:
 
@@ -131,7 +131,7 @@ Prefer absolute paths for predictable behavior:
 
 The working directory is persisted in the agent session state, so it is restored when the session is resumed after the idle timeout or a bridge restart.
 
-If `defaults.allowedWorkingDirectoryRoots` is configured (see [`docs/command-system.md`](./command-system.md)), a user-supplied working directory must resolve inside one of the allowed roots. The allowlist check applies only to user-supplied paths: a bare `/new` and the channel configuration are trusted and never checked.
+If `defaults.allowedWorkingDirectoryRoots` is configured (see [`docs/command-system.md`](./command-system.md)), a user-originated working directory (an explicit `/new <path>` or a remembered chat default) must resolve inside one of the allowed roots. The allowlist check applies only to user-originated paths: the client-side cwd fallback and the channel configuration are trusted and never checked.
 
 ## Troubleshooting
 

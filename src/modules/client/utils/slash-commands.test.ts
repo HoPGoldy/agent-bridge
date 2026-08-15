@@ -1,6 +1,14 @@
-import { describe, expect, it } from "vitest";
+import { mkdtemp, realpath, rm } from "node:fs/promises";
+import os from "node:os";
+import path from "node:path";
+import { afterEach, beforeEach, describe, expect, it } from "vitest";
 import { getTranslator } from "../../../i18n";
-import { parseSlashCommand, resolveHelpMarkdown } from "./slash-commands";
+import {
+  createInMemoryImClientSessionStateStore,
+  type ImClientSessionStateV1,
+} from "./client-session-state";
+import { parseSlashCommand, resolveHelpMarkdown, resolveSlashCommandEvent } from "./slash-commands";
+import type { ClientSessionStateApi } from "../../../types";
 
 describe("resolveHelpMarkdown", () => {
   it("returns localized help markdown for /help and /h", () => {
@@ -213,5 +221,199 @@ describe("parseSlashCommand", () => {
 
   it("returns null for empty text", () => {
     expect(parseSlashCommand("", "session-1")).toBeNull();
+  });
+});
+
+describe("resolveSlashCommandEvent", () => {
+  let base: string;
+
+  beforeEach(async () => {
+    // Canonicalize once: on macOS the tmp dir is behind a /var -> /private/var
+    // symlink, and validation returns the realpath-resolved path.
+    base = await realpath(await mkdtemp(path.join(os.tmpdir(), "agent-bridge-slash-")));
+  });
+
+  afterEach(async () => {
+    await rm(base, { recursive: true, force: true });
+  });
+
+  function parseNew(text: string, clientSessionId = "session-1") {
+    const parsed = parseSlashCommand(text, clientSessionId);
+    if (!parsed) {
+      throw new Error(`expected ${text} to parse as a command`);
+    }
+    return parsed;
+  }
+
+  it("passes non-new commands through unchanged", async () => {
+    const store = createInMemoryImClientSessionStateStore("feishu");
+    await expect(
+      resolveSlashCommandEvent(parseNew("/compact"), {
+        sessionState: store.session("session-1"),
+        cwd: "/fallback",
+      }),
+    ).resolves.toEqual({ type: "command.session.compact", clientSessionId: "session-1" });
+  });
+
+  it("uses the explicit /new path, marks it as user-sourced and remembers the canonical path", async () => {
+    const store = createInMemoryImClientSessionStateStore("feishu");
+    const sessionState = store.session("session-1");
+
+    await expect(
+      resolveSlashCommandEvent(parseNew(`/new ${base}`), { sessionState }),
+    ).resolves.toEqual({
+      type: "command.session.new",
+      clientSessionId: "session-1",
+      workingDirectory: base,
+      workingDirectorySource: "user",
+    });
+
+    await expect(sessionState.read()).resolves.toEqual({
+      version: 1,
+      defaultWorkingDirectory: base,
+    });
+  });
+
+  it("rejects an invalid explicit path locally: no event, nothing remembered", async () => {
+    const store = createInMemoryImClientSessionStateStore("feishu");
+    const sessionState = store.session("session-1");
+    const missing = path.join(base, "does-not-exist");
+
+    await expect(
+      resolveSlashCommandEvent(parseNew(`/new ${missing}`), { sessionState }),
+    ).resolves.toEqual({
+      type: "invalid-working-directory",
+      workingDirectory: missing,
+      detail: "no such file or directory",
+      remembered: false,
+    });
+
+    await expect(sessionState.read()).resolves.toBeUndefined();
+  });
+
+  it("reuses the remembered default for a bare /new and keeps it user-sourced", async () => {
+    const store = createInMemoryImClientSessionStateStore("feishu");
+    const sessionState = store.session("session-1");
+
+    await resolveSlashCommandEvent(parseNew(`/new ${base}`), { sessionState });
+    await expect(
+      resolveSlashCommandEvent(parseNew("/new"), { sessionState, cwd: "/fallback" }),
+    ).resolves.toEqual({
+      type: "command.session.new",
+      clientSessionId: "session-1",
+      workingDirectory: base,
+      workingDirectorySource: "user",
+    });
+  });
+
+  it("reports a stale remembered default instead of silently falling back", async () => {
+    const store = createInMemoryImClientSessionStateStore("feishu");
+    const sessionState = store.session("session-1");
+
+    await resolveSlashCommandEvent(parseNew(`/new ${base}`), { sessionState });
+    await rm(base, { recursive: true, force: true });
+
+    await expect(
+      resolveSlashCommandEvent(parseNew("/new"), { sessionState, cwd: "/fallback" }),
+    ).resolves.toEqual({
+      type: "invalid-working-directory",
+      workingDirectory: base,
+      detail: "no such file or directory",
+      remembered: true,
+    });
+  });
+
+  it("falls back to the provided cwd for a bare /new without a remembered default", async () => {
+    const store = createInMemoryImClientSessionStateStore("feishu");
+
+    await expect(
+      resolveSlashCommandEvent(parseNew("/new"), {
+        sessionState: store.session("session-1"),
+        cwd: "/fallback",
+      }),
+    ).resolves.toEqual({
+      type: "command.session.new",
+      clientSessionId: "session-1",
+      workingDirectory: "/fallback",
+      workingDirectorySource: "default",
+    });
+  });
+
+  it("falls back to the process cwd when no cwd override is provided", async () => {
+    const store = createInMemoryImClientSessionStateStore("feishu");
+
+    await expect(
+      resolveSlashCommandEvent(parseNew("/new"), { sessionState: store.session("session-1") }),
+    ).resolves.toEqual({
+      type: "command.session.new",
+      clientSessionId: "session-1",
+      workingDirectory: process.cwd(),
+      workingDirectorySource: "default",
+    });
+  });
+
+  it("keeps remembered defaults isolated per chat", async () => {
+    const store = createInMemoryImClientSessionStateStore("feishu");
+
+    await resolveSlashCommandEvent(parseNew(`/new ${base}`, "chat-1"), {
+      sessionState: store.session("chat-1"),
+    });
+    await expect(
+      resolveSlashCommandEvent(parseNew("/new", "chat-2"), {
+        sessionState: store.session("chat-2"),
+        cwd: "/fallback",
+      }),
+    ).resolves.toMatchObject({ workingDirectory: "/fallback", workingDirectorySource: "default" });
+  });
+
+  it("still emits the command when remembering the explicit path fails", async () => {
+    const errors: unknown[] = [];
+    const failingSessionState: ClientSessionStateApi<ImClientSessionStateV1> = {
+      clientSessionId: "session-1",
+      read: async () => undefined,
+      update: async () => {
+        throw new Error("store boom");
+      },
+      flush: async () => {},
+    };
+
+    await expect(
+      resolveSlashCommandEvent(parseNew(`/new ${base}`), {
+        sessionState: failingSessionState,
+        onError: (error) => errors.push(error),
+      }),
+    ).resolves.toEqual({
+      type: "command.session.new",
+      clientSessionId: "session-1",
+      workingDirectory: base,
+      workingDirectorySource: "user",
+    });
+    expect(errors).toHaveLength(1);
+  });
+
+  it("falls back to the cwd when reading the remembered default fails", async () => {
+    const errors: unknown[] = [];
+    const failingSessionState: ClientSessionStateApi<ImClientSessionStateV1> = {
+      clientSessionId: "session-1",
+      read: async () => {
+        throw new Error("store boom");
+      },
+      update: async (updater) => updater(undefined),
+      flush: async () => {},
+    };
+
+    await expect(
+      resolveSlashCommandEvent(parseNew("/new"), {
+        sessionState: failingSessionState,
+        cwd: "/fallback",
+        onError: (error) => errors.push(error),
+      }),
+    ).resolves.toEqual({
+      type: "command.session.new",
+      clientSessionId: "session-1",
+      workingDirectory: "/fallback",
+      workingDirectorySource: "default",
+    });
+    expect(errors).toHaveLength(1);
   });
 });

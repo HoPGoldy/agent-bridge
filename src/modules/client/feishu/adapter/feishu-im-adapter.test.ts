@@ -1,6 +1,10 @@
+import { mkdtemp, realpath, rm } from "node:fs/promises";
+import os from "node:os";
+import path from "node:path";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import type { ClientOutputEvent, FeishuInboundMessage } from "../../../../types";
 import { createLogger } from "../../../../core/logger";
+import { createInMemoryImClientSessionStateStore } from "../../utils/client-session-state";
 import { FeishuIMAdapter } from "./feishu-im-adapter";
 
 type FakeClientInstance = {
@@ -283,6 +287,125 @@ describe("FeishuIMAdapter", () => {
       type: "command.session.stop",
       clientSessionId: "feishu:dm:oc_dm",
     });
+  });
+
+  it("resolves /new through the client session store and remembers explicit paths", async () => {
+    const dir = await realpath(await mkdtemp(path.join(os.tmpdir(), "feishu-adapter-new-")));
+    try {
+      const sessionState = createInMemoryImClientSessionStateStore("feishu");
+      const adapter = new FeishuIMAdapter(
+        {
+          appId: "cli_xxx",
+          appSecret: "secret",
+          requireMentionInGroup: true,
+        },
+        createLogger("test"),
+        undefined,
+        sessionState,
+      );
+      const onOutput = vi.fn(async (_event: ClientOutputEvent) => {});
+
+      await adapter.start(onOutput);
+
+      // A bare /new without a remembered default falls back to the process cwd.
+      await fakeClientState.onMessage?.({
+        chatId: "oc_dm",
+        chatType: "p2p",
+        messageId: "msg-new-1",
+        text: "/new",
+        mentionedBot: false,
+      });
+      expect(onOutput).toHaveBeenLastCalledWith({
+        type: "command.session.new",
+        clientSessionId: "feishu:dm:oc_dm",
+        workingDirectory: process.cwd(),
+        workingDirectorySource: "default",
+      });
+
+      // An explicit valid path is forwarded as user-sourced and remembered.
+      await fakeClientState.onMessage?.({
+        chatId: "oc_dm",
+        chatType: "p2p",
+        messageId: "msg-new-2",
+        text: `/new ${dir}`,
+        mentionedBot: false,
+      });
+      expect(onOutput).toHaveBeenLastCalledWith({
+        type: "command.session.new",
+        clientSessionId: "feishu:dm:oc_dm",
+        workingDirectory: dir,
+        workingDirectorySource: "user",
+      });
+
+      // A later bare /new reuses the remembered path.
+      await fakeClientState.onMessage?.({
+        chatId: "oc_dm",
+        chatType: "p2p",
+        messageId: "msg-new-3",
+        text: "/new",
+        mentionedBot: false,
+      });
+      expect(onOutput).toHaveBeenLastCalledWith({
+        type: "command.session.new",
+        clientSessionId: "feishu:dm:oc_dm",
+        workingDirectory: dir,
+        workingDirectorySource: "user",
+      });
+
+      // The remembered default is scoped per chat.
+      await fakeClientState.onMessage?.({
+        chatId: "oc_other",
+        chatType: "p2p",
+        messageId: "msg-new-4",
+        text: "/new",
+        mentionedBot: false,
+      });
+      expect(onOutput).toHaveBeenLastCalledWith({
+        type: "command.session.new",
+        clientSessionId: "feishu:dm:oc_other",
+        workingDirectory: process.cwd(),
+        workingDirectorySource: "default",
+      });
+    } finally {
+      await rm(dir, { recursive: true, force: true });
+    }
+  });
+
+  it("rejects an invalid /new path locally without emitting an event or remembering it", async () => {
+    const sessionState = createInMemoryImClientSessionStateStore("feishu");
+    const adapter = new FeishuIMAdapter(
+      {
+        appId: "cli_xxx",
+        appSecret: "secret",
+        requireMentionInGroup: true,
+      },
+      createLogger("test"),
+      undefined,
+      sessionState,
+    );
+    const onOutput = vi.fn(async (_event: ClientOutputEvent) => {});
+
+    await adapter.start(onOutput);
+    await fakeClientState.onMessage?.({
+      chatId: "oc_dm",
+      chatType: "p2p",
+      messageId: "msg-new-bad",
+      text: "/new /definitely/not/a/real/path",
+      mentionedBot: false,
+    });
+
+    // Nothing reaches the core; the user gets a local error reply instead.
+    expect(onOutput).not.toHaveBeenCalled();
+    expect(fakeClientState.sendText).toHaveBeenCalledWith(
+      "oc_dm",
+      expect.stringContaining("/definitely/not/a/real/path"),
+      "msg-new-bad",
+    );
+    expect(fakeClientState.sendText.mock.calls[0]![1]).toContain("no such file or directory");
+    expect(fakeClientState.stopTyping).toHaveBeenCalledWith("oc_dm");
+    await expect(
+      sessionState.session("feishu:dm:oc_dm").read(),
+    ).resolves.toBeUndefined();
   });
 
   it("sends chunked replies sequentially and replies only on the first chunk", async () => {

@@ -625,6 +625,57 @@ describe("PiCodingAgentAdapter session working directory state", () => {
     }
   });
 
+  it("persists a default-sourced client fallback path without allowlist checks", async () => {
+    const dir = await mkdtemp(path.join(os.tmpdir(), "pi-adapter-fallback-"));
+    const canonical = await realpath(dir);
+    const { store, handle } = await makeCreateHandle("pi-coding-agent:fallback");
+
+    try {
+      const adapter = new PiCodingAgentAdapter({
+        agentSessionId: "pi-coding-agent:fallback",
+        mode: "create",
+        sessionState: handle,
+        workingDirectory: dir,
+        workingDirectorySource: "default",
+        // A default-sourced fallback is trusted: even roots that exclude the
+        // path must not reject it.
+        allowedWorkingDirectoryRoots: [path.join(base, "elsewhere")],
+      });
+      await adapter.start(() => {});
+
+      expect(rpcClients[0]?.options.cwd).toBe(canonical);
+      const document = await store.load();
+      expect(document.agentSessions["pi-coding-agent:fallback"]!.state).toEqual({
+        version: 1,
+        workingDirectory: canonical,
+        workingDirectorySource: "default",
+      });
+    } finally {
+      await rm(dir, { recursive: true, force: true });
+    }
+  });
+
+  it("enforces the allowlist for explicitly user-sourced paths on create", async () => {
+    const dir = await mkdtemp(path.join(os.tmpdir(), "pi-adapter-user-"));
+    const allowedRoot = path.join(base, "elsewhere");
+    await mkdir(allowedRoot, { recursive: true });
+    const { handle } = await makeCreateHandle("pi-coding-agent:user-source");
+
+    try {
+      const adapter = new PiCodingAgentAdapter({
+        agentSessionId: "pi-coding-agent:user-source",
+        mode: "create",
+        sessionState: handle,
+        workingDirectory: dir,
+        workingDirectorySource: "user",
+        allowedWorkingDirectoryRoots: [allowedRoot],
+      });
+      await expect(adapter.start(() => {})).rejects.toThrow(/not inside an allowed root/);
+    } finally {
+      await rm(dir, { recursive: true, force: true });
+    }
+  });
+
   it("resumes in the persisted directory even when process.cwd changed", async () => {
     const dir = await mkdtemp(path.join(os.tmpdir(), "pi-adapter-resume-"));
     const canonical = await realpath(dir);

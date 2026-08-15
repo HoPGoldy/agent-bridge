@@ -2,11 +2,22 @@ import { randomUUID } from "node:crypto";
 import { mkdir, readFile, rename, unlink, writeFile } from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
-import type { AgentSessionRecord, ChannelPersistentState, ChannelStateStore } from "../types";
+import type {
+  AgentSessionRecord,
+  ChannelPersistentState,
+  ChannelStateStore,
+  ClientSessionRecord,
+} from "../types";
 import { assertJsonCompatible } from "./json-compat";
 
-export const CHANNEL_STATE_VERSION = 2 as const;
+export const CHANNEL_STATE_VERSION = 3 as const;
+/**
+ * Channel state documents at this version predate the client session store
+ * and are upgraded in memory by adding an empty `clientSessions` map.
+ */
+export const LEGACY_CHANNEL_STATE_VERSION = 2 as const;
 export const AGENT_SESSION_RECORD_VERSION = 1 as const;
+export const CLIENT_SESSION_RECORD_VERSION = 1 as const;
 export const MIGRATED_AGENT_STATE_VERSION = 1 as const;
 
 const STATE_DIR = path.join(os.homedir(), ".config", "agent-bridge", "session-bindings");
@@ -36,6 +47,7 @@ export function emptyChannelState(): ChannelPersistentState {
     version: CHANNEL_STATE_VERSION,
     bindings: {},
     agentSessions: {},
+    clientSessions: {},
   };
 }
 
@@ -50,6 +62,11 @@ export interface DroppedBindingEntry {
 
 export interface DroppedAgentRecordEntry {
   agentSessionId: string;
+  reason: string;
+}
+
+export interface DroppedClientRecordEntry {
+  clientSessionId: string;
   reason: string;
 }
 
@@ -73,6 +90,7 @@ export interface ChannelStateMigrationReport {
   createdAgentRecords: number;
   droppedBindings: DroppedBindingEntry[];
   droppedAgentRecords: DroppedAgentRecordEntry[];
+  droppedClientRecords: DroppedClientRecordEntry[];
   skippedAgentRecords: SkippedAgentRecordEntry[];
   metadataConflicts: MetadataConflictEntry[];
   warnings: string[];
@@ -95,6 +113,7 @@ function emptyReport(migrated: boolean): ChannelStateMigrationReport {
     createdAgentRecords: 0,
     droppedBindings: [],
     droppedAgentRecords: [],
+    droppedClientRecords: [],
     skippedAgentRecords: [],
     metadataConflicts: [],
     warnings: [],
@@ -105,16 +124,18 @@ function emptyReport(migrated: boolean): ChannelStateMigrationReport {
  * Normalizes a raw persisted document into a {@link ChannelPersistentState}.
  *
  * Accepts, in order:
- * 1. the current versioned document (`version: 2` with `bindings` and
- *    `agentSessions`);
- * 2. legacy object bindings `Record<clientId, { agentSessionId, workingDirectory? }>`;
- * 3. legacy string bindings `Record<clientId, agentSessionId>`.
+ * 1. the current versioned document (`version: 3` with `bindings`,
+ *    `agentSessions` and `clientSessions`);
+ * 2. the previous versioned document (`version: 2` without `clientSessions`),
+ *    upgraded in memory with an empty `clientSessions` map;
+ * 3. legacy object bindings `Record<clientId, { agentSessionId, workingDirectory? }>`;
+ * 4. legacy string bindings `Record<clientId, agentSessionId>`.
  *
  * The returned report makes every migration decision explicit: dropped corrupt
  * entries, records skipped because the agent type cannot be inferred, and
  * conflicting shared-agent metadata (resolved deterministically, first wins).
  *
- * A top-level `version` key whose value is not the supported numeric version
+ * A top-level `version` key whose value is not a supported numeric version
  * is rejected with {@link ChannelStateFormatError} (fail-safe) instead of
  * being treated as a legacy binding map.
  */
@@ -146,7 +167,11 @@ function normalizeVersionedDocument(raw: Record<string, unknown>): {
 } {
   const report = emptyReport(false);
 
-  if (raw.version !== CHANNEL_STATE_VERSION) {
+  // Version 2 documents predate the client session store: upgrade them in
+  // memory with an empty `clientSessions` map (no write-through; the upgrade
+  // is persisted on the next commit).
+  const isLegacyV2 = raw.version === LEGACY_CHANNEL_STATE_VERSION;
+  if (raw.version !== CHANNEL_STATE_VERSION && !isLegacyV2) {
     throw new ChannelStateFormatError(
       `unsupported channel state version ${String(raw.version)} (expected ${CHANNEL_STATE_VERSION})`,
     );
@@ -157,6 +182,9 @@ function normalizeVersionedDocument(raw: Record<string, unknown>): {
   }
   if (!isRecord(raw.agentSessions)) {
     throw new ChannelStateFormatError("channel state document is missing a valid 'agentSessions' object");
+  }
+  if (!isLegacyV2 && !isRecord(raw.clientSessions)) {
+    throw new ChannelStateFormatError("channel state document is missing a valid 'clientSessions' object");
   }
 
   const bindings: Record<string, string> = {};
@@ -185,8 +213,23 @@ function normalizeVersionedDocument(raw: Record<string, unknown>): {
     }
   }
 
+  const clientSessions: Record<string, ClientSessionRecord> = {};
+  if (!isLegacyV2) {
+    for (const [clientSessionId, value] of Object.entries(raw.clientSessions as Record<string, unknown>)) {
+      const record = normalizeClientSessionRecord(value);
+      if (record) {
+        clientSessions[clientSessionId] = record;
+      } else {
+        report.droppedClientRecords.push({
+          clientSessionId,
+          reason: "client session record failed envelope validation",
+        });
+      }
+    }
+  }
+
   return {
-    state: { version: CHANNEL_STATE_VERSION, bindings, agentSessions },
+    state: { version: CHANNEL_STATE_VERSION, bindings, agentSessions, clientSessions },
     report,
   };
 }
@@ -205,6 +248,27 @@ function normalizeAgentSessionRecord(value: unknown): AgentSessionRecord | null 
   return {
     recordVersion: AGENT_SESSION_RECORD_VERSION,
     agentType: value.agentType,
+    stateVersion: value.stateVersion,
+    createdAt: value.createdAt,
+    updatedAt: value.updatedAt,
+    state: value.state,
+  };
+}
+
+function normalizeClientSessionRecord(value: unknown): ClientSessionRecord | null {
+  if (!isRecord(value)) return null;
+  if (value.recordVersion !== CLIENT_SESSION_RECORD_VERSION) return null;
+  if (typeof value.clientType !== "string" || value.clientType.length === 0) return null;
+  if (typeof value.stateVersion !== "number" || !Number.isInteger(value.stateVersion) || value.stateVersion < 0) {
+    return null;
+  }
+  if (typeof value.createdAt !== "string" || value.createdAt.length === 0) return null;
+  if (typeof value.updatedAt !== "string" || value.updatedAt.length === 0) return null;
+  if (!("state" in value)) return null;
+
+  return {
+    recordVersion: CLIENT_SESSION_RECORD_VERSION,
+    clientType: value.clientType,
     stateVersion: value.stateVersion,
     createdAt: value.createdAt,
     updatedAt: value.updatedAt,
@@ -280,7 +344,7 @@ function migrateLegacyBindings(raw: Record<string, unknown>): {
   }
 
   return {
-    state: { version: CHANNEL_STATE_VERSION, bindings, agentSessions },
+    state: { version: CHANNEL_STATE_VERSION, bindings, agentSessions, clientSessions: {} },
     report,
   };
 }
@@ -381,7 +445,8 @@ function isChannelPersistentState(value: unknown): value is ChannelPersistentSta
     isRecord(value) &&
     value.version === CHANNEL_STATE_VERSION &&
     isRecord(value.bindings) &&
-    isRecord(value.agentSessions)
+    isRecord(value.agentSessions) &&
+    isRecord(value.clientSessions)
   );
 }
 
@@ -403,6 +468,13 @@ function assertWritableChannelState(state: ChannelPersistentState): void {
     if (!normalizeAgentSessionRecord(record)) {
       throw new ChannelStateTransactionError(
         `agent session record ${agentSessionId} failed envelope validation`,
+      );
+    }
+  }
+  for (const [clientSessionId, record] of Object.entries(state.clientSessions)) {
+    if (!normalizeClientSessionRecord(record)) {
+      throw new ChannelStateTransactionError(
+        `client session record ${clientSessionId} failed envelope validation`,
       );
     }
   }

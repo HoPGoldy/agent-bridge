@@ -39,9 +39,16 @@ export interface PiCodingAgentAdapterOptions {
     | AgentSessionStateApi<PiCodingAgentSessionStateV1>;
   /**
    * Raw user-requested working directory for a brand-new session. Absent (or
-   * empty) for a bare `/new`: the adapter persists the default cwd instead.
+   * empty) only for implicitly created sessions (first user message): a `/new`
+   * command always carries a concrete directory resolved by the client side.
    */
   workingDirectory?: string;
+  /**
+   * Trust classification of `workingDirectory` as decided by the client
+   * adapter. When absent it is derived from whether a directory was supplied
+   * (legacy behavior for direct constructor callers).
+   */
+  workingDirectorySource?: "user" | "default";
   /**
    * Optional allowlist of allowed working-directory roots. Enforced for
    * user-supplied directories only (`workingDirectorySource === "user"`); a
@@ -66,6 +73,7 @@ export class PiCodingAgentAdapter implements AgentAdapter {
   readonly #model?: string;
   readonly #extraArgs: string[];
   readonly #workingDirectory?: string;
+  readonly #workingDirectorySource?: "user" | "default";
   readonly #allowedWorkingDirectoryRoots?: string[];
   readonly #logger: Logger;
   #client: PiRpcClient | null = null;
@@ -91,6 +99,7 @@ export class PiCodingAgentAdapter implements AgentAdapter {
             sessionState: options.sessionState as AgentSessionStateApi<PiCodingAgentSessionStateV1>,
           };
     this.#workingDirectory = options.workingDirectory;
+    this.#workingDirectorySource = options.workingDirectorySource;
     this.#allowedWorkingDirectoryRoots = options.allowedWorkingDirectoryRoots;
     this.#sessionDir = options.sessionDir;
     this.#bin = options.bin ?? "pi";
@@ -146,9 +155,13 @@ export class PiCodingAgentAdapter implements AgentAdapter {
       const { sessionState } = this.#handle;
       const requested = this.#workingDirectory;
       const source: "user" | "default" =
-        requested !== undefined && requested.trim() !== "" ? "user" : "default";
+        this.#workingDirectorySource ??
+        (requested !== undefined && requested.trim() !== "" ? "user" : "default");
 
       if (source === "user") {
+        if (requested === undefined || requested.trim() === "") {
+          throw new Error('working directory source "user" requires a non-empty workingDirectory');
+        }
         // resolveWorkingDirectory already canonicalizes with realpath and
         // enforces the allowlist on that canonical result. Re-resolving the
         // returned path would reopen a TOCTOU window: a swapped symlink could
@@ -165,13 +178,13 @@ export class PiCodingAgentAdapter implements AgentAdapter {
         return canonical;
       }
 
-      // Bare `/new`: the helper returns the default cwd verbatim, so
-      // canonicalize it here (exactly once) to keep the persisted record
-      // stable across restarts even when the process cwd is a symlinked path.
-      const defaultCwd = await resolveWorkingDirectory(requested, {
-        allowedWorkingDirectoryRoots: this.#allowedWorkingDirectoryRoots,
-      });
-      const canonical = await realpath(defaultCwd);
+      // Default directory: either the client-side fallback path (trusted, so
+      // never allowlist-checked) or the process cwd for implicitly created
+      // sessions. The helper already canonicalizes a supplied path with
+      // realpath; the extra realpath keeps the bare-cwd result stable across
+      // restarts even when the process cwd is a symlinked path.
+      const resolved = await resolveWorkingDirectory(requested, {});
+      const canonical = await realpath(resolved);
       await sessionState.initialize({
         version: 1,
         workingDirectory: canonical,

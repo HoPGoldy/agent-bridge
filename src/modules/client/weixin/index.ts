@@ -1,6 +1,10 @@
 import { WeixinIMAdapter } from "./adapter/weixin-im-adapter";
 import { loginWithWeixinQr } from "./adapter/weixin-qr-login";
 import type { ClientModule, ConfigAdapter, WeixinClientConfig } from "../../../types";
+import {
+  imClientSessionStateCodec,
+  type ImClientSessionStateV1,
+} from "../utils/client-session-state";
 
 const DEFAULT_BASE_URL = "https://ilinkai.weixin.qq.com";
 const DEFAULT_CDN_BASE_URL = "https://novac2c.cdn.weixin.qq.com/c2c";
@@ -43,10 +47,11 @@ function createWeixinConfigCollector(): ConfigAdapter<WeixinClientConfig> {
   };
 }
 
-export const weixinClientModule: ClientModule<WeixinClientConfig> = {
+export const weixinClientModule: ClientModule<WeixinClientConfig, ImClientSessionStateV1> = {
   type: "weixin",
+  sessionStateCodec: imClientSessionStateCodec,
   createConfigCollector: createWeixinConfigCollector,
-  createClientAdapter({ config, common }) {
-    return new WeixinIMAdapter(config, undefined, common);
+  createClientAdapter({ config, common, sessionState }) {
+    return new WeixinIMAdapter(config, undefined, common, sessionState);
   },
 };

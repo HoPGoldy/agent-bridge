@@ -3,21 +3,21 @@ import { feishuClientModule } from "./feishu";
 import { wecomClientModule } from "./wecom";
 import { weixinClientModule } from "./weixin";
 
-const registry = new Map<string, ClientModule<any>>([
+const registry = new Map<string, ClientModule<any, any>>([
   [feishuClientModule.type, feishuClientModule],
   [wecomClientModule.type, wecomClientModule],
   [weixinClientModule.type, weixinClientModule],
 ]);
 
-export function listClientModules(): ClientModule<any>[] {
+export function listClientModules(): ClientModule<any, any>[] {
   return [...registry.values()];
 }
 
-export function getClientModule(type: string): ClientModule<any> | undefined {
+export function getClientModule(type: string): ClientModule<any, any> | undefined {
   return registry.get(type);
 }
 
-export function getTypedClientModule(config: ClientConfig): ClientModule<any> {
+export function getTypedClientModule(config: ClientConfig): ClientModule<any, any> {
   const module = registry.get(config.type);
   if (!module) {
     throw new Error(`Unsupported client module type: ${config.type}`);

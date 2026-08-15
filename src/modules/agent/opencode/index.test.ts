@@ -610,6 +610,58 @@ describe("OpenCode agent module", () => {
       });
     });
 
+    it("lets the configured directory take precedence over a default-sourced client fallback", async () => {
+      const { module, apiConfigs } = recordingModule();
+      const config = { baseUrl: "http://127.0.0.1:4096", directory: "/srv/configured" };
+
+      const { handle } = await reserveHandle(module, "opencode:root-default-fallback");
+      const adapter = await module.createAgentSession({
+        config,
+        common,
+        agentSessionId: "opencode:root-default-fallback",
+        sessionState: handle,
+        workingDirectory: "/outside/of/roots",
+        workingDirectorySource: "default",
+        allowedWorkingDirectoryRoots: ["/srv/projects"],
+      });
+      await adapter.start(vi.fn());
+      await adapter.stop();
+
+      expect(apiConfigs[0]?.directory).toBe("/srv/configured");
+      await expect(handle.read()).resolves.toEqual({
+        version: 1,
+        openCodeSessionId: "session-1",
+        workingDirectory: "/srv/configured",
+        workingDirectorySource: "configured",
+      });
+    });
+
+    it("uses a default-sourced client fallback as bridge-default without allowlist checks", async () => {
+      const { module, apiConfigs } = recordingModule();
+      const config = { baseUrl: "http://127.0.0.1:4096" };
+
+      const { handle } = await reserveHandle(module, "opencode:root-default-bridge");
+      const adapter = await module.createAgentSession({
+        config,
+        common,
+        agentSessionId: "opencode:root-default-bridge",
+        sessionState: handle,
+        workingDirectory: "/outside/of/roots",
+        workingDirectorySource: "default",
+        allowedWorkingDirectoryRoots: ["/srv/projects"],
+      });
+      await adapter.start(vi.fn());
+      await adapter.stop();
+
+      expect(apiConfigs[0]?.directory).toBe("/outside/of/roots");
+      await expect(handle.read()).resolves.toEqual({
+        version: 1,
+        openCodeSessionId: "session-1",
+        workingDirectory: "/outside/of/roots",
+        workingDirectorySource: "bridge-default",
+      });
+    });
+
     it("enforces consistently on create and resume", async () => {
       const { module, apiConfigs } = recordingModule();
       const config = { baseUrl: "http://127.0.0.1:4096" };

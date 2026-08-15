@@ -1,5 +1,9 @@
 import { WecomIMAdapter } from "./adapter/wecom-im-adapter";
 import type { ClientModule, ConfigAdapter, WecomClientConfig } from "../../../types";
+import {
+  imClientSessionStateCodec,
+  type ImClientSessionStateV1,
+} from "../utils/client-session-state";
 
 const DEFAULT_WEBSOCKET_URL = "wss://openws.work.weixin.qq.com";
 
@@ -47,10 +51,11 @@ function createWecomConfigCollector(): ConfigAdapter<WecomClientConfig> {
   };
 }
 
-export const wecomClientModule: ClientModule<WecomClientConfig> = {
+export const wecomClientModule: ClientModule<WecomClientConfig, ImClientSessionStateV1> = {
   type: "wecom",
+  sessionStateCodec: imClientSessionStateCodec,
   createConfigCollector: createWecomConfigCollector,
-  createClientAdapter({ config, common }) {
-    return new WecomIMAdapter(config, undefined, common);
+  createClientAdapter({ config, common, sessionState }) {
+    return new WecomIMAdapter(config, undefined, common, sessionState);
   },
 };

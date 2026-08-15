@@ -376,7 +376,7 @@ export function createOpenCodeAgentModule(
      * working-directory policy, provider session creation, state
      * initialization and runtime registration inside `start()`.
      */
-    async createAgentSession({ config, common, agentSessionId, sessionState, workingDirectory, allowedWorkingDirectoryRoots }) {
+    async createAgentSession({ config, common, agentSessionId, sessionState, workingDirectory, workingDirectorySource, allowedWorkingDirectoryRoots }) {
       logger.info(`creating agent session ${agentSessionId} for channel ${common.channelName}`);
       return new OpenCodeAgentAdapter({
         agentSessionId,
@@ -385,6 +385,7 @@ export function createOpenCodeAgentModule(
         config,
         channelName: common.channelName,
         ...(workingDirectory !== undefined ? { workingDirectory } : {}),
+        ...(workingDirectorySource !== undefined ? { workingDirectorySource } : {}),
         ...(allowedWorkingDirectoryRoots !== undefined ? { allowedWorkingDirectoryRoots } : {}),
         getRuntime,
       });

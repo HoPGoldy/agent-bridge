@@ -19,8 +19,12 @@ const resources = {
       client: {
         processing: "Processing...",
         helpMessage:
-          "Available commands:\n\n- `/new [path]` (`/n [path]`) - Start a new agent session; optionally start it in a specific directory, e.g. `/new /path/to/project`\n- `/compact` (`/c`) - Compact the current session context\n- `/stop` (`/s`) - Stop the active agent run\n- `/status` (`/st`) - Show the current agent session status\n- `/model` (`/m`) - List available models, or switch with `/model provider/modelId`\n- `/help` (`/h`) - Show this help message",
+          "Available commands:\n\n- `/new [path]` (`/n [path]`) - Start a new agent session; optionally start it in a specific directory, e.g. `/new /path/to/project`. A directory given once is remembered and reused by later `/new` without a path\n- `/compact` (`/c`) - Compact the current session context\n- `/stop` (`/s`) - Stop the active agent run\n- `/status` (`/st`) - Show the current agent session status\n- `/model` (`/m`) - List available models, or switch with `/model provider/modelId`\n- `/help` (`/h`) - Show this help message",
         messageDeliveryFailedTitle: "[agent-bridge error] Message delivery failed",
+        invalidNewWorkingDirectory:
+          "Cannot start a new session: the working directory `{{workingDirectory}}` is invalid ({{detail}}).",
+        invalidRememberedWorkingDirectory:
+          "Cannot start a new session: the remembered default working directory `{{workingDirectory}}` is no longer valid ({{detail}}). Use `/new <path>` to choose a new one.",
         weixinCooldown: "Weixin send is cooling down after rate limiting. Please try again shortly.",
         statusTitle: "Current session status",
         statusSessionId: "Session ID",
@@ -44,7 +48,7 @@ const resources = {
         noActiveSessionToStop: "No active agent session to stop.",
         sessionCannotBeStopped: "This agent session cannot be stopped right now.",
         noActiveRunToStop: "No active agent run to stop.",
-        startedNewSession: "Started a new session.",
+        startedNewSession: "Started a new session (working directory: {{workingDirectory}}).",
         failedToStartNewSession: "Failed to start a new session: {{detail}}",
         failedToResumeSession:
           "Failed to resume the agent session: {{detail}}\nStart a new session with `/new`.",
@@ -66,8 +70,12 @@ const resources = {
       client: {
         processing: "正在处理中...",
         helpMessage:
-          "可用命令：\n\n- `/new [path]` (`/n [path]`) - 开始一个新会话；可选指定工作目录，例如 `/new /path/to/project`\n- `/compact` (`/c`) - 压缩当前会话上下文\n- `/stop` (`/s`) - 停止当前正在运行的任务\n- `/status` (`/st`) - 查看当前智能体会话状态\n- `/model` (`/m`) - 查看可用模型，或使用 `/model provider/modelId` 切换模型\n- `/help` (`/h`) - 查看这条帮助信息",
+          "可用命令：\n\n- `/new [path]` (`/n [path]`) - 开始一个新会话；可选指定工作目录，例如 `/new /path/to/project`。指定过的目录会被记住，之后不带路径的 `/new` 会继续使用它\n- `/compact` (`/c`) - 压缩当前会话上下文\n- `/stop` (`/s`) - 停止当前正在运行的任务\n- `/status` (`/st`) - 查看当前智能体会话状态\n- `/model` (`/m`) - 查看可用模型，或使用 `/model provider/modelId` 切换模型\n- `/help` (`/h`) - 查看这条帮助信息",
         messageDeliveryFailedTitle: "[agent-bridge 错误] 消息发送失败",
+        invalidNewWorkingDirectory:
+          "无法开始新会话：工作目录 `{{workingDirectory}}` 无效（{{detail}}）。",
+        invalidRememberedWorkingDirectory:
+          "无法开始新会话：记住的默认工作目录 `{{workingDirectory}}` 已失效（{{detail}}）。请使用 `/new <路径>` 指定新目录。",
         weixinCooldown: "微信发送因限流已进入冷却，请稍后再试。",
         statusTitle: "当前会话状态",
         statusSessionId: "Session ID",
@@ -91,7 +99,7 @@ const resources = {
         noActiveSessionToStop: "当前没有可停止的智能体会话。",
         sessionCannotBeStopped: "当前无法停止这个智能体会话。",
         noActiveRunToStop: "当前没有正在运行的智能体任务可停止。",
-        startedNewSession: "已开始新会话。",
+        startedNewSession: "已开始新会话（工作目录：{{workingDirectory}}）。",
         failedToStartNewSession: "无法开启新会话：{{detail}}",
         failedToResumeSession: "恢复智能体会话失败：{{detail}}\n请使用 `/new` 开始新会话。",
       },

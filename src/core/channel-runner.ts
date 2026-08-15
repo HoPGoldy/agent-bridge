@@ -3,6 +3,7 @@ import { GatewayCore } from "./gateway-core";
 import { createLogger } from "./logger";
 import { createFileChannelStateStore, getChannelStateStorePath } from "../config/channel-state";
 import { createAgentSessionStateRegistry } from "../config/agent-session-state";
+import { createClientSessionStateStore } from "../config/client-session-state";
 import { getTypedAgentModule } from "../modules/agent";
 import { getTypedClientModule } from "../modules/client";
 
@@ -16,9 +17,19 @@ export async function runChannel({ channelName, channelConfig, defaults }: RunCh
     language: channelConfig.common.language,
   };
 
-  const imAdapter = clientModule.createClientAdapter({ config: channelConfig.client.config, common });
   const channelStateStore = createFileChannelStateStore(getChannelStateStorePath(channelName));
   const agentSessionStateRegistry = createAgentSessionStateRegistry(channelStateStore);
+  const clientSessionStateStore = createClientSessionStateStore({
+    channelStateStore,
+    clientType: clientModule.type,
+    codec: clientModule.sessionStateCodec,
+  });
+
+  const imAdapter = clientModule.createClientAdapter({
+    config: channelConfig.client.config,
+    common,
+    sessionState: clientSessionStateStore,
+  });
 
   const core = new GatewayCore({
     imAdapter,

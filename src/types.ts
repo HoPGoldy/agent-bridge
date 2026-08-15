@@ -7,7 +7,20 @@ export type ClientOutputEvent =
   | {
       type: "command.session.new";
       clientSessionId: string;
-      workingDirectory?: string;
+      /**
+       * Always a concrete directory: the client adapter resolves the path
+       * itself (explicit argument, remembered client-session default, or the
+       * bridge process cwd fallback) before emitting the command.
+       */
+      workingDirectory: string;
+      /**
+       * Trust classification decided by the client adapter. `user` marks
+       * user-originated paths (an explicit `/new <path>` argument or a
+       * remembered default), which stay subject to the agent-side working
+       * directory allowlist; `default` marks the client-side fallback (the
+       * bridge process cwd), which is trusted and never allowlist-checked.
+       */
+      workingDirectorySource: ClientWorkingDirectorySource;
     }
   | {
       type: "command.session.compact";
@@ -131,6 +144,14 @@ export type ClientInputEvent = AgentOutputPayload & {
 
 export type LegacyAgentInputEvent = AgentInputEvent;
 
+/**
+ * Trust classification for a working directory handed from a client adapter
+ * to the gateway/agent side. `user` paths are user-originated and enforced
+ * against the configured allowlist; `default` paths are trusted client-side
+ * fallbacks and are never allowlist-checked.
+ */
+export type ClientWorkingDirectorySource = "user" | "default";
+
 export interface IMAdapter {
   start(onOutput: (event: ClientOutputEvent) => Promise<void> | void): Promise<void>;
   stop(): Promise<void>;
@@ -185,10 +206,22 @@ export interface ChannelCommonContext extends ChannelCommonConfig {
   channelName: string;
 }
 
-export interface ClientModule<TConfig = unknown> {
+export interface ClientModule<TConfig = unknown, TState extends object = Record<string, never>> {
   readonly type: string;
+  /**
+   * Codec that validates and encodes this module's persisted client session
+   * state (for example the remembered `/new` working directory). The runner
+   * uses it to build the per-channel store handed to the adapter; the module
+   * must keep its state JSON-compatible and versioned.
+   */
+  readonly sessionStateCodec: ClientSessionStateCodec<TState>;
   createConfigCollector?: () => ConfigAdapter<TConfig>;
-  createClientAdapter(args: { config: TConfig; common: ChannelCommonContext }): IMAdapter;
+  createClientAdapter(args: {
+    config: TConfig;
+    common: ChannelCommonContext;
+    /** Per-channel client session state store scoped to this module's codec. */
+    sessionState: ClientSessionStateStore<TState>;
+  }): IMAdapter;
 }
 
 export interface AgentModule<TConfig = unknown, TState extends object = Record<string, never>> {
@@ -211,6 +244,14 @@ export interface AgentModule<TConfig = unknown, TState extends object = Record<s
     agentSessionId: string;
     sessionState: NewAgentSessionStateApi<TState>;
     workingDirectory?: string;
+    /**
+     * Trust classification of `workingDirectory` as decided by the client
+     * adapter: `user` paths are allowlist-checked, `default` paths (the
+     * client-side cwd fallback) are trusted. Absent for implicitly created
+     * sessions (first user message), where the module applies its own
+     * default-directory policy.
+     */
+    workingDirectorySource?: ClientWorkingDirectorySource;
     /**
      * Optional list of allowed working-directory roots. When present and
      * non-empty, `workingDirectory` overrides must resolve inside one of the
@@ -370,12 +411,31 @@ export interface AgentSessionRecord {
 /**
  * Versioned per-channel persistent document. `bindings` is a pure routing map
  * (client session id -> agent session id); agent-side metadata lives in
- * `agentSessions`, keyed by agent session id.
+ * `agentSessions`, keyed by agent session id; client-side per-chat state
+ * (owned by the client module) lives in `clientSessions`, keyed by client
+ * session id.
  */
 export interface ChannelPersistentState {
-  version: 2;
+  version: 3;
   bindings: Record<string, string>;
   agentSessions: Record<string, AgentSessionRecord>;
+  clientSessions: Record<string, ClientSessionRecord>;
+}
+
+/**
+ * Core-owned envelope for a persisted client session. The `state` payload is
+ * opaque to the core: it is owned by the client module and must be
+ * JSON-compatible. Client session records are created lazily on the first
+ * write (a chat exists as soon as it messages the bot; there is no explicit
+ * session lifecycle like on the agent side).
+ */
+export interface ClientSessionRecord {
+  recordVersion: 1;
+  clientType: string;
+  stateVersion: number;
+  createdAt: string;
+  updatedAt: string;
+  state: unknown;
 }
 
 /**
@@ -477,6 +537,46 @@ export interface AgentSessionStateRegistry {
    * resurrect the record.
    */
   delete(agentSessionId: string): Promise<void>;
+}
+
+/**
+ * Runtime codec owned by a client module. `encode` produces a
+ * JSON-compatible payload; `decode` validates (and optionally migrates) a
+ * persisted payload using the stored `stateVersion`.
+ */
+export interface ClientSessionStateCodec<TState extends object> {
+  readonly currentVersion: number;
+  decode(raw: unknown, stateVersion: number, context: { clientSessionId: string }): TState;
+  encode(state: TState): unknown;
+}
+
+/**
+ * Adapter-visible, session-scoped client state handle. Client sessions are
+ * created lazily: a chat needs no explicit lifecycle, so `read` returns
+ * `undefined` until the first `update` persists a record. Every operation is
+ * confined to the single client session the handle was created for.
+ */
+export interface ClientSessionStateApi<TState extends object> {
+  readonly clientSessionId: string;
+  /** Returns the current persisted state, or `undefined` when nothing was stored yet. */
+  read(): Promise<Readonly<TState> | undefined>;
+  /**
+   * Atomic read-modify-write behind the channel store's write queue. Creates
+   * the persisted record on the first write. `updater` must be synchronous
+   * and receives `undefined` when no state exists yet.
+   */
+  update(updater: (current: Readonly<TState> | undefined) => TState): Promise<Readonly<TState>>;
+  /** Waits until every pending write for the channel has been persisted. */
+  flush(): Promise<void>;
+}
+
+/**
+ * Per-channel store of client session state, scoped to one client module
+ * (type + codec). Handles are cheap and can be requested at any time; records
+ * live in the channel state document under `clientSessions`.
+ */
+export interface ClientSessionStateStore<TState extends object> {
+  session(clientSessionId: string): ClientSessionStateApi<TState>;
 }
 
 export interface RunChannelOptions {

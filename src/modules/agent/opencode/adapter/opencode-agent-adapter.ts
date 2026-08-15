@@ -112,11 +112,22 @@ export interface OpenCodeAgentAdapterOptions {
   /** Channel name; part of the directory-scoped runtime cache key. */
   channelName: string;
   /**
-   * Raw user-requested working directory for a brand-new session. Absent (or
-   * empty) for a bare `/new`: the adapter falls back to the channel-configured
-   * directory, then the actual process cwd.
+   * Raw working directory requested for a brand-new session. A `/new` command
+   * always carries a concrete directory resolved by the client side; absent
+   * (or empty) only for implicitly created sessions (first user message),
+   * where the adapter falls back to the channel-configured directory, then
+   * the actual process cwd.
    */
   workingDirectory?: string;
+  /**
+   * Trust classification of `workingDirectory` as decided by the client
+   * adapter: `user` paths are allowlist-checked; `default` marks the
+   * client-side cwd fallback, which is trusted — and the channel-configured
+   * directory still takes precedence over it. When absent it is derived from
+   * whether a directory was supplied (legacy behavior for direct constructor
+   * callers).
+   */
+  workingDirectorySource?: "user" | "default";
   /**
    * Optional allowlist of allowed working-directory roots. Enforced for
    * user-supplied directories only (`user` source); a configured directory and
@@ -139,6 +150,7 @@ export class OpenCodeAgentAdapter implements AgentAdapter, OpenCodeRuntimeAdapte
   readonly #config: OpenCodeAgentConfig;
   readonly #channelName: string;
   readonly #workingDirectory?: string;
+  readonly #workingDirectorySource?: "user" | "default";
   readonly #allowedWorkingDirectoryRoots?: string[];
   readonly #getRuntime: (channelName: string, config: OpenCodeAgentConfig) => OpenCodeRuntime;
   readonly #logger: Logger;
@@ -182,6 +194,7 @@ export class OpenCodeAgentAdapter implements AgentAdapter, OpenCodeRuntimeAdapte
     this.#config = options.config;
     this.#channelName = options.channelName;
     this.#workingDirectory = options.workingDirectory;
+    this.#workingDirectorySource = options.workingDirectorySource;
     this.#allowedWorkingDirectoryRoots = options.allowedWorkingDirectoryRoots;
     this.#getRuntime = options.getRuntime;
     this.#logger = options.logger ?? createLogger("opencode-agent");
@@ -316,12 +329,22 @@ export class OpenCodeAgentAdapter implements AgentAdapter, OpenCodeRuntimeAdapte
    *   path + lexical boundary check) when one is configured.
    * - configured: the trimmed channel `config.directory` value, never checked
    *   against the user allowlist.
-   * - bridge-default: the actual process cwd, persisted so a restart from a
-   *   different cwd still restores the same value.
+   * - bridge-default: the client-side cwd fallback (or the actual process cwd
+   *   when the session was created implicitly), persisted so a restart from a
+   *   different cwd still restores the same value. A `default`-sourced
+   *   override lands here and is never allowlist-checked, and the configured
+   *   directory still takes precedence over it.
    */
   #resolveCreateDirectory(): { directory: string; source: OpenCodeWorkingDirectorySource } {
     const trimmedOverride = this.#workingDirectory?.trim();
-    if (trimmedOverride) {
+    const source = this.#workingDirectorySource ?? (trimmedOverride ? "user" : "default");
+    if (source === "user" && !trimmedOverride) {
+      // Matches the Pi adapter: a user-sourced directory must be explicit.
+      // Unreachable through the client command flow (the client trims before
+      // classifying); only direct constructor callers can hit this.
+      throw new Error('working directory source "user" requires a non-empty workingDirectory');
+    }
+    if (trimmedOverride && source === "user") {
       assertAllowedWorkingDirectory(trimmedOverride, this.#allowedWorkingDirectoryRoots);
       return { directory: trimmedOverride, source: "user" };
     }
@@ -329,7 +352,7 @@ export class OpenCodeAgentAdapter implements AgentAdapter, OpenCodeRuntimeAdapte
     if (configured) {
       return { directory: configured, source: "configured" };
     }
-    return { directory: process.cwd(), source: "bridge-default" };
+    return { directory: trimmedOverride ? trimmedOverride : process.cwd(), source: "bridge-default" };
   }
 
   /**

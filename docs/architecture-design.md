@@ -27,7 +27,7 @@ flowchart LR
     CFG --> G
     CFG --> A
 
-    BIND[Channel State Store\nbindings 路由 + agent session 状态] --> G
+    BIND[Channel State Store\nbindings 路由 + agent/client session 状态] --> G
     I18N[I18n / Locale] --> C
     I18N --> G
 ```
@@ -236,24 +236,26 @@ Agent Adapter 负责把“某种本地 Agent”包装成统一接口。
 ~/.config/agent-bridge/session-bindings/<encoded-channel-name>.json
 ```
 
-注意：目录名仍叫 `session-bindings`（历史遗留命名），但文件内容已经是 v2 channel 状态文档，而不是旧的绑定表。
+注意：目录名仍叫 `session-bindings`（历史遗留命名），但文件内容已经是 v3 channel 状态文档，而不是旧的绑定表。
 
-文档结构（`ChannelPersistentState` v2）：
+文档结构（`ChannelPersistentState` v3）：
 
 - `bindings`：纯路由映射 `clientSessionId -> agentSessionId`
 - `agentSessions`：以 agent session id 为 key 的 `AgentSessionRecord` 信封，包含 `agentType`、`stateVersion`、`createdAt`/`updatedAt` 与 opaque 的 `state` 载荷
+- `clientSessions`：以 client session id 为 key 的 `ClientSessionRecord` 信封，包含 `clientType`、`stateVersion`、`createdAt`/`updatedAt` 与 opaque 的 `state` 载荷（例如该聊天记住的 `/new` 默认工作目录）
 
-写入是原子的（同目录临时文件 + rename），并且 bindings 与 agent 状态的所有写入共享同一条 FIFO 事务队列，任何两个写入者都不会互相覆盖。
+写入是原子的（同目录临时文件 + rename），并且 bindings、agent 状态与 client 状态的所有写入共享同一条 FIFO 事务队列，任何两个写入者都不会互相覆盖。
 
 旧的 `SessionBindingStore` 门面仍然保留为兼容层：读取时从 `agentSessions` 记录重建 `{ agentSessionId, workingDirectory }` 视图，保存时把 workingDirectory 回填进迁移记录。
 
 #### 自动迁移
 
-加载时（`load`）自动识别并迁移三种 legacy schema：
+加载时（`load`）自动识别并迁移这些 legacy schema：
 
-1. 旧字符串绑定：`Record<clientId, agentSessionId>`（纯字符串值）
-2. 旧对象绑定：`Record<clientId, { agentSessionId, workingDirectory? }>`
-3. 未知 agent id 前缀的绑定：路由绑定**保留**，但不会为无法推断模块类型的 id 伪造记录
+1. v2 版本化文档（没有 `clientSessions`）：在内存中补上空的 `clientSessions` 映射
+2. 旧字符串绑定：`Record<clientId, agentSessionId>`（纯字符串值）
+3. 旧对象绑定：`Record<clientId, { agentSessionId, workingDirectory? }>`
+4. 未知 agent id 前缀的绑定：路由绑定**保留**，但不会为无法推断模块类型的 id 伪造记录
 
 迁移在内存中完成（加载时不做写回，下一次写入会持久化规范化后的文档）；被丢弃的损坏条目、被跳过的记录、共享 agent 的 workingDirectory 冲突都会记录在迁移报告中。带顶层 `version` 键但不是受支持版本号的文档会被直接拒绝（fail-safe），不会被误当成 legacy 绑定表。
 
@@ -281,7 +283,15 @@ adapter 在 `start()` 内完成状态的所有权动作：
 
 `AgentModule.resumeAgentSession` 是**必需**能力：Core 从不读取 adapter 拥有的状态（例如工作目录）来猜测如何恢复会话，模块必须自己从 `sessionState` 里读。
 
-> 尚未实现：独立的 **Client Session Store**。目前 client session 身份由各 client adapter 自己维护，channel 状态文件只保存路由绑定与 agent session 状态。
+#### Client Session Store
+
+Client 侧有一个与 Agent 侧镜像、但更简单的状态存储（`ClientSessionStateStore`）：
+
+- **每个 channel 一个 store**，由 `channel-runner` 用同一个 channel 状态文件构建，记录落在文档的 `clientSessions` 段里
+- **Client Module** 提供一个 `ClientSessionStateCodec<T>`（与 agent codec 同样的版本化、JSON 兼容、严格校验约定），store 在创建时就绑定模块的 `clientType` 与 codec
+- **Client Adapter** 在 `createClientAdapter` 里拿到 store，按需取出 scoped 句柄 `ClientSessionStateApi`（`read` / `update` / `flush`），只能访问自己那一个 client session
+- 与 agent session 不同，client session **没有显式生命周期**（一个聊天第一次发消息就存在），所以没有 reserve/revoke/delete：`read` 在无记录时返回 `undefined`，首次 `update` 懒创建记录；类型不匹配（例如 channel 换了 client 类型）会拒绝读写而不是误用
+- 典型用途：`/new <path>` 把用户显式传入且通过本地校验的目录记为该聊天的 `defaultWorkingDirectory`（canonical 形态），之后不带参数的 `/new` 复用它；store 故障只会降级为回退路径，不会阻断命令本身
 
 ---
 

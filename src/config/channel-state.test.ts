@@ -16,9 +16,10 @@ import {
 describe("channel state helpers", () => {
   it("produces an empty versioned state", () => {
     expect(emptyChannelState()).toEqual({
-      version: 2,
+      version: 3,
       bindings: {},
       agentSessions: {},
+      clientSessions: {},
     });
   });
 
@@ -98,7 +99,7 @@ describe("normalizeChannelState", () => {
   it("passes a versioned document through with validated entries", () => {
     const createdAt = "2026-08-10T00:00:00.000Z";
     const { state, report } = normalizeChannelState({
-      version: 2,
+      version: 3,
       bindings: { "client-1": "pi-coding-agent:abc" },
       agentSessions: {
         "pi-coding-agent:abc": {
@@ -108,6 +109,16 @@ describe("normalizeChannelState", () => {
           createdAt,
           updatedAt: createdAt,
           state: { model: "gpt-5.6", workingDirectory: "/tmp/a" },
+        },
+      },
+      clientSessions: {
+        "client-1": {
+          recordVersion: 1,
+          clientType: "feishu",
+          stateVersion: 1,
+          createdAt,
+          updatedAt: createdAt,
+          state: { version: 1, defaultWorkingDirectory: "/tmp/a" },
         },
       },
     });
@@ -115,8 +126,9 @@ describe("normalizeChannelState", () => {
     expect(report.migrated).toBe(false);
     expect(report.droppedBindings).toEqual([]);
     expect(report.droppedAgentRecords).toEqual([]);
+    expect(report.droppedClientRecords).toEqual([]);
     expect(state).toEqual({
-      version: 2,
+      version: 3,
       bindings: { "client-1": "pi-coding-agent:abc" },
       agentSessions: {
         "pi-coding-agent:abc": {
@@ -128,7 +140,41 @@ describe("normalizeChannelState", () => {
           state: { model: "gpt-5.6", workingDirectory: "/tmp/a" },
         },
       },
+      clientSessions: {
+        "client-1": {
+          recordVersion: 1,
+          clientType: "feishu",
+          stateVersion: 1,
+          createdAt,
+          updatedAt: createdAt,
+          state: { version: 1, defaultWorkingDirectory: "/tmp/a" },
+        },
+      },
     });
+  });
+
+  it("upgrades a version 2 document in memory with an empty clientSessions map", () => {
+    const createdAt = "2026-08-10T00:00:00.000Z";
+    const { state, report } = normalizeChannelState({
+      version: 2,
+      bindings: { "client-1": "pi-coding-agent:abc" },
+      agentSessions: {
+        "pi-coding-agent:abc": {
+          recordVersion: 1,
+          agentType: "pi-coding-agent",
+          stateVersion: 1,
+          createdAt,
+          updatedAt: createdAt,
+          state: { migratedFromBinding: true },
+        },
+      },
+    });
+
+    expect(report.migrated).toBe(false);
+    expect(state.version).toBe(3);
+    expect(state.clientSessions).toEqual({});
+    expect(state.bindings).toEqual({ "client-1": "pi-coding-agent:abc" });
+    expect(state.agentSessions["pi-coding-agent:abc"]).toMatchObject({ agentType: "pi-coding-agent" });
   });
 
   it("creates one record for an agent id shared by multiple clients", () => {
@@ -235,13 +281,13 @@ describe("normalizeChannelState", () => {
 
   it("rejects any non-supported top-level version value instead of guessing", () => {
     expect(() =>
-      normalizeChannelState({ version: 3, bindings: {}, agentSessions: {} }),
-    ).toThrow(/unsupported channel state version 3/);
+      normalizeChannelState({ version: 4, bindings: {}, agentSessions: {}, clientSessions: {} }),
+    ).toThrow(/unsupported channel state version 4/);
     expect(() =>
-      normalizeChannelState({ version: "2", bindings: {}, agentSessions: {} }),
+      normalizeChannelState({ version: "3", bindings: {}, agentSessions: {}, clientSessions: {} }),
     ).toThrow(ChannelStateFormatError);
     expect(() =>
-      normalizeChannelState({ version: null, bindings: {}, agentSessions: {} }),
+      normalizeChannelState({ version: null, bindings: {}, agentSessions: {}, clientSessions: {} }),
     ).toThrow(ChannelStateFormatError);
   });
 
@@ -257,7 +303,7 @@ describe("normalizeChannelState", () => {
   it("preserves existing records with unknown agent types in versioned documents", () => {
     const createdAt = "2026-08-10T00:00:00.000Z";
     const { state, report } = normalizeChannelState({
-      version: 2,
+      version: 3,
       bindings: { "client-1": "agent-1" },
       agentSessions: {
         "agent-1": {
@@ -269,6 +315,7 @@ describe("normalizeChannelState", () => {
           state: { migratedFromBinding: true, workingDirectory: "/tmp/legacy" },
         },
       },
+      clientSessions: {},
     });
 
     expect(report.droppedAgentRecords).toEqual([]);
@@ -286,12 +333,15 @@ describe("normalizeChannelState", () => {
     expect(() => normalizeChannelState({ version: 2, bindings: {} })).toThrow(
       /missing a valid 'agentSessions'/,
     );
+    expect(() =>
+      normalizeChannelState({ version: 3, bindings: {}, agentSessions: {} }),
+    ).toThrow(/missing a valid 'clientSessions'/);
   });
 
   it("drops invalid entries inside a versioned document and reports them", () => {
     const createdAt = "2026-08-10T00:00:00.000Z";
     const { state, report } = normalizeChannelState({
-      version: 2,
+      version: 3,
       bindings: {
         "client-1": "pi-coding-agent:abc",
         "client-2": 42,
@@ -310,12 +360,29 @@ describe("normalizeChannelState", () => {
         "bad-2": { recordVersion: 1, agentType: "", stateVersion: 1, createdAt, updatedAt: createdAt, state: {} },
         "bad-3": "not-a-record",
       },
+      clientSessions: {
+        "client-1": {
+          recordVersion: 1,
+          clientType: "feishu",
+          stateVersion: 1,
+          createdAt,
+          updatedAt: createdAt,
+          state: { version: 1 },
+        },
+        "client-bad-1": { recordVersion: 2, clientType: "feishu" },
+        "client-bad-2": "not-a-record",
+      },
     });
 
     expect(state.bindings).toEqual({ "client-1": "pi-coding-agent:abc" });
     expect(Object.keys(state.agentSessions)).toEqual(["pi-coding-agent:abc"]);
+    expect(Object.keys(state.clientSessions)).toEqual(["client-1"]);
     expect(report.droppedBindings.map((e) => e.clientSessionId).sort()).toEqual(["client-2", "client-3"]);
     expect(report.droppedAgentRecords.map((e) => e.agentSessionId).sort()).toEqual(["bad-1", "bad-2", "bad-3"]);
+    expect(report.droppedClientRecords.map((e) => e.clientSessionId).sort()).toEqual([
+      "client-bad-1",
+      "client-bad-2",
+    ]);
   });
 });
 
@@ -344,11 +411,12 @@ describe("createFileChannelStateStore", () => {
     const file = await tmpFilePath();
     const store = createFileChannelStateStore(file);
     const state = {
-      version: CHANNEL_STATE_VERSION as 2,
+      version: CHANNEL_STATE_VERSION as 3,
       bindings: { "client-1": "pi-coding-agent:abc" },
       agentSessions: {
         "pi-coding-agent:abc": buildMigratedAgentRecord("pi-coding-agent:abc", "/tmp/a"),
       },
+      clientSessions: {},
     };
 
     await store.save(state);
@@ -381,9 +449,10 @@ describe("createFileChannelStateStore", () => {
     const file = await tmpFilePath();
     const store = createFileChannelStateStore(file);
     const state = {
-      version: CHANNEL_STATE_VERSION as 2,
+      version: CHANNEL_STATE_VERSION as 3,
       bindings: {},
       agentSessions: {},
+      clientSessions: {},
     };
 
     await store.save(state);
@@ -404,7 +473,7 @@ describe("createFileChannelStateStore", () => {
     const store = createFileChannelStateStore(file);
 
     await expect(
-      store.save({ version: CHANNEL_STATE_VERSION as 2, bindings: {}, agentSessions: {} }),
+      store.save({ version: CHANNEL_STATE_VERSION as 3, bindings: {}, agentSessions: {}, clientSessions: {} }),
     ).rejects.toThrow();
 
     const entries = await readdir(path.dirname(file));
@@ -448,6 +517,7 @@ describe("createFileChannelStateStore", () => {
       version: CHANNEL_STATE_VERSION,
       bindings: { "client-1": "pi-coding-agent:abc" },
       agentSessions: {},
+      clientSessions: {},
     });
   });
 
@@ -486,6 +556,7 @@ describe("createFileChannelStateStore", () => {
       version: CHANNEL_STATE_VERSION,
       bindings: { "client-2": "opencode:def" },
       agentSessions: {},
+      clientSessions: {},
     });
   });
 
@@ -495,7 +566,7 @@ describe("createFileChannelStateStore", () => {
 
     await expect(
       store.save({
-        version: CHANNEL_STATE_VERSION as 2,
+        version: CHANNEL_STATE_VERSION as 3,
         bindings: {},
         agentSessions: {
           "pi-coding-agent:abc": {
@@ -507,6 +578,7 @@ describe("createFileChannelStateStore", () => {
             state: { bad: undefined },
           },
         },
+        clientSessions: {},
       }),
     ).rejects.toThrow(/undefined/);
 
@@ -519,8 +591,21 @@ describe("createFileChannelStateStore", () => {
 
     await expect(
       store.transaction((draft) => {
-        (draft as unknown as { version: number }).version = 3;
+        (draft as unknown as { version: number }).version = 2;
       }),
     ).rejects.toThrow(/invalid channel state document/);
+  });
+
+  it("rejects writes with malformed client session records", async () => {
+    const file = await tmpFilePath();
+    const store = createFileChannelStateStore(file);
+
+    await expect(
+      store.transaction((draft) => {
+        draft.clientSessions["client-1"] = { recordVersion: 9 } as never;
+      }),
+    ).rejects.toThrow(/client session record client-1 failed envelope validation/);
+
+    await expect(store.load()).resolves.toEqual(emptyChannelState());
   });
 });

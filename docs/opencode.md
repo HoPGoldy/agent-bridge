@@ -70,13 +70,10 @@ agent-bridge start <channel-name>
 
 ## Working directories
 
-Sending `/new <path>` (or `/n <path>`) starts the next session with `<path>` as the OpenCode workspace instead of the channel-configured directory (or the bridge process cwd). A bare `/new` keeps the configured default.
+Sending `/new <path>` (or `/n <path>`) starts the next session with `<path>` as the OpenCode workspace and remembers it as the chat's default; a later bare `/new` reuses the remembered directory, otherwise the channel-configured directory (then the bridge process cwd) is kept.
 
-The bridge does **not** touch the local filesystem for OpenCode directories. The OpenCode Server may run on a remote host or inside a container, so the bridge only trims the path and forwards it to the server:
-
-- absolute and relative paths are forwarded as typed; a relative path is resolved by the server against the server's own working directory, not the bridge's
-- `~` and shell-style environment variables are **not** expanded
-- the server is responsible for validating the directory (existence, permissions, symlink resolution) and its errors propagate back through the session-new failure message
+> **Deployment note: run the OpenCode Server on the same machine as agent-bridge.**
+> `/new <path>` is validated by the client adapter against the bridge's **local** filesystem before any session is created (`~` expansion, relative paths resolved against the bridge cwd, `realpath` canonicalization, existence/type/permission checks). Deploying the OpenCode Server on a remote host or inside a container is **not recommended**: the local check can reject directories that only exist on the server, and remember choices that are meaningless there.
 
 Prefer absolute paths for predictable behavior:
 
@@ -84,7 +81,7 @@ Prefer absolute paths for predictable behavior:
 /new /Users/wesley/project-learn/demo
 ```
 
-If `defaults.allowedWorkingDirectoryRoots` is configured (see [`docs/command-system.md`](./command-system.md)), a user-supplied directory must be an absolute path inside one of the allowed roots. The bridge performs this lexical check only; filesystem-level safety remains the server's responsibility. The allowlist check applies only to user-supplied paths: a bare `/new` and the channel-configured `directory` are trusted and never checked.
+If `defaults.allowedWorkingDirectoryRoots` is configured (see [`docs/command-system.md`](./command-system.md)), a user-originated directory (an explicit `/new <path>` or a remembered chat default) must be an absolute path inside one of the allowed roots. The bridge performs this lexical check only; filesystem-level safety remains the server's responsibility. The allowlist check applies only to user-originated paths: the client-side cwd fallback and the channel-configured `directory` are trusted and never checked.
 
 ## HTTP Basic Auth
 
@@ -186,4 +183,4 @@ The runtime reconnects SSE automatically. If the server itself was restarted or 
 
 ### `/new <path>` reports an invalid directory
 
-The bridge forwards the path to the server without local validation, so an invalid-directory error comes from the OpenCode Server. Check the path from the server's point of view (for a remote or containerized server, the path must exist inside that server's filesystem), and prefer absolute paths.
+The client adapter validates the path against the bridge's local filesystem before creating the session, so the error usually comes from that local check: make sure the directory exists on the bridge host, is readable, and prefer absolute paths. (The agent-side allowlist, when configured, can also reject the path.)

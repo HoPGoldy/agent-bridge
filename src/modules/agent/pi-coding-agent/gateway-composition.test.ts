@@ -121,6 +121,7 @@ describe("Gateway + Pi module composition", () => {
         type: "command.session.new",
         clientSessionId: "client-1",
         workingDirectory: dir,
+        workingDirectorySource: "user",
       });
 
       await vi.waitFor(() => {
@@ -159,6 +160,7 @@ describe("Gateway + Pi module composition", () => {
         type: "command.session.new",
         clientSessionId: "client-1",
         workingDirectory: dir,
+        workingDirectorySource: "user",
       });
       await vi.waitFor(async () => {
         const document = await store.load();

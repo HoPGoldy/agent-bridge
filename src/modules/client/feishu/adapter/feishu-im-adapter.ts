@@ -2,6 +2,7 @@ import type {
   ChannelCommonContext,
   ClientInputEvent,
   ClientOutputEvent,
+  ClientSessionStateStore,
   FeishuClientConfig,
   IMAdapter,
 } from "../../../../types";
@@ -9,7 +10,11 @@ import { formatSendFailureNotice, getTranslatorForCommon, type Translator } from
 import { createLogger, type Logger } from "../../../../core/logger";
 import { isCompletedCommandResponse, isTerminalAgentError } from "../../utils/error-events";
 import { ProgressRenderer } from "../../utils/progress-renderer";
-import { parseSlashCommand, resolveHelpMarkdown } from "../../utils/slash-commands";
+import { parseSlashCommand, resolveHelpMarkdown, resolveSlashCommandEvent } from "../../utils/slash-commands";
+import {
+  createInMemoryImClientSessionStateStore,
+  type ImClientSessionStateV1,
+} from "../../utils/client-session-state";
 import { renderStatusMarkdown } from "../../utils/status-markdown";
 import { FeishuClient } from "./feishu-client";
 import { buildFeishuSessionId, parseFeishuSessionId } from "./feishu-session";
@@ -50,6 +55,7 @@ export class FeishuIMAdapter implements IMAdapter {
   readonly #config: FeishuClientConfig;
   readonly #logger: Logger;
   readonly #t: Translator;
+  readonly #sessionState: ClientSessionStateStore<ImClientSessionStateV1>;
   #onOutput: ((event: ClientOutputEvent) => Promise<void> | void) | null = null;
   #client: FeishuClient | null = null;
   #egressQueue: ClientInputEvent[] = [];
@@ -97,10 +103,14 @@ export class FeishuIMAdapter implements IMAdapter {
     config: FeishuClientConfig,
     logger: Logger = createLogger("feishu"),
     common?: ChannelCommonContext,
+    sessionState: ClientSessionStateStore<ImClientSessionStateV1> = createInMemoryImClientSessionStateStore(
+      "feishu",
+    ),
   ) {
     this.#config = config;
     this.#logger = logger;
     this.#t = getTranslatorForCommon(common);
+    this.#sessionState = sessionState;
   }
 
   async start(onOutput: (event: ClientOutputEvent) => Promise<void> | void): Promise<void> {
@@ -134,10 +144,32 @@ export class FeishuIMAdapter implements IMAdapter {
         return;
       }
 
-      const commandEvent = parseSlashCommand(normalizedText, clientSessionId);
-      if (commandEvent) {
+      const parsedCommand = parseSlashCommand(normalizedText, clientSessionId);
+      if (parsedCommand) {
         this.#logger.info(`received command ${normalizedText} (session=${clientSessionId})`);
-        await this.#onOutput(commandEvent);
+        const resolved = await resolveSlashCommandEvent(parsedCommand, {
+          sessionState: this.#sessionState.session(clientSessionId),
+          onError: (error) =>
+            this.#logger.error("failed to resolve the remembered /new working directory:", error),
+        });
+        // The adapter may have stopped while the store resolution was in
+        // flight; never emit through a torn-down output handler.
+        if (!this.#onOutput) return;
+        if (resolved.type === "invalid-working-directory") {
+          const text = resolved.remembered
+            ? this.#t("client.invalidRememberedWorkingDirectory", {
+                workingDirectory: resolved.workingDirectory,
+                detail: resolved.detail,
+              })
+            : this.#t("client.invalidNewWorkingDirectory", {
+                workingDirectory: resolved.workingDirectory,
+                detail: resolved.detail,
+              });
+          await this.#client?.sendText(chatId, text, messageId);
+          await this.#client?.stopTyping(chatId);
+          return;
+        }
+        await this.#onOutput(resolved);
         return;
       }
 

@@ -2,6 +2,7 @@ import type {
   ChannelCommonContext,
   ClientInputEvent,
   ClientOutputEvent,
+  ClientSessionStateStore,
   IMAdapter,
   WeixinClientConfig,
 } from "../../../../types";
@@ -9,7 +10,11 @@ import { formatSendFailureNotice, getTranslatorForCommon, type Translator } from
 import { createLogger, type Logger } from "../../../../core/logger";
 import { isCompletedCommandResponse, isTerminalAgentError } from "../../utils/error-events";
 import { ProgressRenderer } from "../../utils/progress-renderer";
-import { parseSlashCommand, resolveHelpMarkdown } from "../../utils/slash-commands";
+import { parseSlashCommand, resolveHelpMarkdown, resolveSlashCommandEvent } from "../../utils/slash-commands";
+import {
+  createInMemoryImClientSessionStateStore,
+  type ImClientSessionStateV1,
+} from "../../utils/client-session-state";
 import { renderStatusMarkdown } from "../../utils/status-markdown";
 import { WeixinClient } from "./weixin-client";
 import { buildWeixinSessionId, parseWeixinSessionId } from "./weixin-session";
@@ -69,6 +74,7 @@ export class WeixinIMAdapter implements IMAdapter {
   readonly #config: WeixinClientConfig;
   readonly #logger: Logger;
   readonly #t: Translator;
+  readonly #sessionState: ClientSessionStateStore<ImClientSessionStateV1>;
   #onOutput: ((event: ClientOutputEvent) => Promise<void> | void) | null = null;
   #client: WeixinClient | null = null;
   #egressQueue: EgressEvent[] = [];
@@ -84,10 +90,14 @@ export class WeixinIMAdapter implements IMAdapter {
     config: WeixinClientConfig,
     logger: Logger = createLogger("weixin"),
     common?: ChannelCommonContext,
+    sessionState: ClientSessionStateStore<ImClientSessionStateV1> = createInMemoryImClientSessionStateStore(
+      "weixin",
+    ),
   ) {
     this.#config = config;
     this.#logger = logger;
     this.#t = getTranslatorForCommon(common);
+    this.#sessionState = sessionState;
   }
 
   async start(onOutput: (event: ClientOutputEvent) => Promise<void> | void): Promise<void> {
@@ -127,9 +137,33 @@ export class WeixinIMAdapter implements IMAdapter {
         return;
       }
 
-      const commandEvent = parseSlashCommand(normalizedText, clientSessionId);
-      if (commandEvent) {
-        await this.#onOutput(commandEvent);
+      const parsedCommand = parseSlashCommand(normalizedText, clientSessionId);
+      if (parsedCommand) {
+        const resolved = await resolveSlashCommandEvent(parsedCommand, {
+          sessionState: this.#sessionState.session(clientSessionId),
+          onError: (error) =>
+            this.#logger.error("failed to resolve the remembered /new working directory:", error),
+        });
+        // The adapter may have stopped while the store resolution was in
+        // flight; never emit through a torn-down output handler.
+        if (!this.#onOutput) return;
+        if (resolved.type === "invalid-working-directory") {
+          const text = resolved.remembered
+            ? this.#t("client.invalidRememberedWorkingDirectory", {
+                workingDirectory: resolved.workingDirectory,
+                detail: resolved.detail,
+              })
+            : this.#t("client.invalidNewWorkingDirectory", {
+                workingDirectory: resolved.workingDirectory,
+                detail: resolved.detail,
+              });
+          await this.#client?.sendText(chatId, text);
+          this.#stopProgressTimer(clientSessionId);
+          this.#stopTypingHeartbeat(clientSessionId);
+          await this.#client?.stopTyping(chatId);
+          return;
+        }
+        await this.#onOutput(resolved);
         return;
       }
 
