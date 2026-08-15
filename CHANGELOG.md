@@ -2,6 +2,13 @@
 
 All notable changes to this project will be documented in this file. See [commit-and-tag-version](https://github.com/absolute-version/commit-and-tag-version) for commit guidelines.
 
+## [0.7.1](https://github.com/HoPGoldy/agent-bridge/compare/v0.7.0...v0.7.1) (2026-08-15)
+
+
+### Features
+
+* resolve and remember /new working directories on the client side ([cf12b0f](https://github.com/HoPGoldy/agent-bridge/commit/cf12b0f70040a630bf1fa2078d428f615fb5d54a))
+
 ## [0.7.0](https://github.com/HoPGoldy/agent-bridge/compare/v0.6.0...v0.7.0) (2026-08-13)
 
 
