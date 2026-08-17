@@ -2,6 +2,13 @@
 
 All notable changes to this project will be documented in this file. See [commit-and-tag-version](https://github.com/absolute-version/commit-and-tag-version) for commit guidelines.
 
+## [0.8.0](https://github.com/HoPGoldy/agent-bridge/compare/v0.7.1...v0.8.0) (2026-08-17)
+
+
+### Features
+
+* add scheduled tasks (cron-style agent sessions) ([08e34e7](https://github.com/HoPGoldy/agent-bridge/commit/08e34e73968548eb1acb300c950a020a19c5cdc1))
+
 ## [0.7.1](https://github.com/HoPGoldy/agent-bridge/compare/v0.7.0...v0.7.1) (2026-08-15)
 
 
