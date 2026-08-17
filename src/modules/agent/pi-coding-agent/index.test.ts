@@ -15,6 +15,23 @@ const adapterOptions: Array<{
   allowedWorkingDirectoryRoots?: string[];
 }> = [];
 
+// The module falls back to process.env.PI_MODEL when no model is configured
+// (index.ts: `config.model ?? process.env.PI_MODEL`). pi itself exports
+// PI_MODEL into the environment of its bash-tool subprocesses, so running
+// this suite from inside a pi session would leak the outer session's model
+// into every assertion. Isolate it for the whole file.
+const previousPiModel = process.env.PI_MODEL;
+beforeEach(() => {
+  delete process.env.PI_MODEL;
+});
+afterEach(() => {
+  if (previousPiModel === undefined) {
+    delete process.env.PI_MODEL;
+  } else {
+    process.env.PI_MODEL = previousPiModel;
+  }
+});
+
 vi.mock("./adapter/pi-coding-agent-adapter", () => ({
   PiCodingAgentAdapter: class FakePiCodingAgentAdapter {
     constructor(options: {

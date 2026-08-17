@@ -900,4 +900,312 @@ describe("FeishuIMAdapter", () => {
       ].join("\n"),
     );
   });
+
+  it("triggers a scheduled task locally on /schedule-run without polluting the core", async () => {
+    const onScheduleRun = vi.fn(async () => ({ ok: true }));
+    const adapter = new FeishuIMAdapter(
+      {
+        appId: "cli_xxx",
+        appSecret: "secret",
+        requireMentionInGroup: true,
+      },
+      createLogger("test"),
+      undefined,
+      undefined,
+      onScheduleRun,
+    );
+    const onOutput = vi.fn(async (_event: ClientOutputEvent) => {});
+
+    await adapter.start(onOutput);
+    await fakeClientState.onMessage?.({
+      chatId: "oc_dm",
+      chatType: "p2p",
+      messageId: "msg-schedule-run",
+      text: "/schedule-run daily-report",
+      mentionedBot: false,
+    });
+
+    expect(onScheduleRun).toHaveBeenCalledWith("daily-report", "feishu:dm:oc_dm");
+    expect(onOutput).not.toHaveBeenCalled();
+    expect(fakeClientState.sendText).toHaveBeenCalledWith(
+      "oc_dm",
+      expect.stringContaining('Task "daily-report"'),
+      "msg-schedule-run",
+    );
+    expect(fakeClientState.sendText.mock.calls[0]?.[1]).toContain("target chat");
+    expect(fakeClientState.stopTyping).toHaveBeenCalledWith("oc_dm");
+  });
+
+  it("replies with a localized error for an unknown /schedule-run task", async () => {
+    const onScheduleRun = vi.fn(async () => ({ ok: false, reason: "task not found" }));
+    const adapter = new FeishuIMAdapter(
+      {
+        appId: "cli_xxx",
+        appSecret: "secret",
+        requireMentionInGroup: true,
+      },
+      createLogger("test"),
+      undefined,
+      undefined,
+      onScheduleRun,
+    );
+    const onOutput = vi.fn(async (_event: ClientOutputEvent) => {});
+
+    await adapter.start(onOutput);
+    await fakeClientState.onMessage?.({
+      chatId: "oc_dm",
+      chatType: "p2p",
+      messageId: "msg-schedule-run-missing",
+      text: "/schedule-run missing",
+      mentionedBot: false,
+    });
+
+    expect(onScheduleRun).toHaveBeenCalledWith("missing", "feishu:dm:oc_dm");
+    expect(onOutput).not.toHaveBeenCalled();
+    expect(fakeClientState.sendText.mock.calls[0]?.[1]).toContain('Scheduled task "missing" was not found.');
+    expect(fakeClientState.stopTyping).toHaveBeenCalledWith("oc_dm");
+  });
+
+  it("maps disabled and no-target failure reasons to localized replies", async () => {
+    const onScheduleRun = vi
+      .fn()
+      .mockResolvedValueOnce({ ok: false, reason: "task is disabled" })
+      .mockResolvedValueOnce({ ok: false, reason: "task has no valid target" });
+    const adapter = new FeishuIMAdapter(
+      {
+        appId: "cli_xxx",
+        appSecret: "secret",
+        requireMentionInGroup: true,
+      },
+      createLogger("test"),
+      undefined,
+      undefined,
+      onScheduleRun,
+    );
+
+    await adapter.start(async () => {});
+    await fakeClientState.onMessage?.({
+      chatId: "oc_dm",
+      chatType: "p2p",
+      messageId: "msg-schedule-run-off",
+      text: "/schedule-run off",
+      mentionedBot: false,
+    });
+    expect(fakeClientState.sendText.mock.calls[0]?.[1]).toContain('Scheduled task "off" is disabled.');
+
+    await fakeClientState.onMessage?.({
+      chatId: "oc_dm",
+      chatType: "p2p",
+      messageId: "msg-schedule-run-no-target",
+      text: "/schedule-run notarget",
+      mentionedBot: false,
+    });
+    expect(fakeClientState.sendText.mock.calls[1]?.[1]).toContain(
+      'Scheduled task "notarget" has no valid target chat configured.',
+    );
+  });
+
+  it("shows a usage reply for a malformed /schedule-run without calling onScheduleRun", async () => {
+    const onScheduleRun = vi.fn(async () => ({ ok: true }));
+    const adapter = new FeishuIMAdapter(
+      {
+        appId: "cli_xxx",
+        appSecret: "secret",
+        requireMentionInGroup: true,
+      },
+      createLogger("test"),
+      undefined,
+      undefined,
+      onScheduleRun,
+    );
+    const onOutput = vi.fn(async (_event: ClientOutputEvent) => {});
+
+    await adapter.start(onOutput);
+    await fakeClientState.onMessage?.({
+      chatId: "oc_dm",
+      chatType: "p2p",
+      messageId: "msg-schedule-run-bad",
+      text: "/schedule-run",
+      mentionedBot: false,
+    });
+
+    expect(onScheduleRun).not.toHaveBeenCalled();
+    expect(onOutput).not.toHaveBeenCalled();
+    expect(fakeClientState.sendText).toHaveBeenCalledWith(
+      "oc_dm",
+      expect.stringContaining("Usage: `/schedule-run <task-name>`"),
+      "msg-schedule-run-bad",
+    );
+    expect(fakeClientState.stopTyping).toHaveBeenCalledWith("oc_dm");
+  });
+
+  it("degrades gracefully when onScheduleRun is absent: logs and replies nothing", async () => {
+    const warnSpy = vi.spyOn(console, "warn").mockImplementation(() => {});
+    try {
+      const adapter = new FeishuIMAdapter(
+        {
+          appId: "cli_xxx",
+          appSecret: "secret",
+          requireMentionInGroup: true,
+        },
+        createLogger("test"),
+      );
+      const onOutput = vi.fn(async (_event: ClientOutputEvent) => {});
+
+      await adapter.start(onOutput);
+      await fakeClientState.onMessage?.({
+        chatId: "oc_dm",
+        chatType: "p2p",
+        messageId: "msg-schedule-run-no-bridge",
+        text: "/schedule-run report",
+        mentionedBot: false,
+      });
+
+      expect(onOutput).not.toHaveBeenCalled();
+      expect(fakeClientState.sendText).not.toHaveBeenCalled();
+      expect(fakeClientState.stopTyping).toHaveBeenCalledWith("oc_dm");
+      expect(warnSpy.mock.calls.some((call) =>
+        call.some((arg) => typeof arg === "string" && arg.includes("onScheduleRun is not injected")),
+      )).toBe(true);
+    } finally {
+      warnSpy.mockRestore();
+    }
+  });
+
+  it("binds this chat as a task's target locally on /schedule-here without polluting the core", async () => {
+    const onScheduleHere = vi.fn(async () => ({ ok: true }));
+    const adapter = new FeishuIMAdapter(
+      {
+        appId: "cli_xxx",
+        appSecret: "secret",
+        requireMentionInGroup: true,
+      },
+      createLogger("test"),
+      undefined,
+      undefined,
+      undefined,
+      onScheduleHere,
+    );
+    const onOutput = vi.fn(async (_event: ClientOutputEvent) => {});
+
+    await adapter.start(onOutput);
+    await fakeClientState.onMessage?.({
+      chatId: "oc_dm",
+      chatType: "p2p",
+      messageId: "msg-schedule-here",
+      text: "/schedule-here daily-report",
+      mentionedBot: false,
+    });
+
+    expect(onScheduleHere).toHaveBeenCalledWith("daily-report", "feishu:dm:oc_dm");
+    expect(onOutput).not.toHaveBeenCalled();
+    expect(fakeClientState.sendText).toHaveBeenCalledWith(
+      "oc_dm",
+      expect.stringContaining('Task "daily-report"'),
+      "msg-schedule-here",
+    );
+    expect(fakeClientState.sendText.mock.calls[0]?.[1]).toContain("send its results to this chat");
+    expect(fakeClientState.stopTyping).toHaveBeenCalledWith("oc_dm");
+  });
+
+  it("replies with a localized error for an unknown /schedule-here task", async () => {
+    const onScheduleHere = vi.fn(async () => ({ ok: false, reason: "task not found" }));
+    const adapter = new FeishuIMAdapter(
+      {
+        appId: "cli_xxx",
+        appSecret: "secret",
+        requireMentionInGroup: true,
+      },
+      createLogger("test"),
+      undefined,
+      undefined,
+      undefined,
+      onScheduleHere,
+    );
+    const onOutput = vi.fn(async (_event: ClientOutputEvent) => {});
+
+    await adapter.start(onOutput);
+    await fakeClientState.onMessage?.({
+      chatId: "oc_dm",
+      chatType: "p2p",
+      messageId: "msg-schedule-here-missing",
+      text: "/schedule-here missing",
+      mentionedBot: false,
+    });
+
+    expect(onScheduleHere).toHaveBeenCalledWith("missing", "feishu:dm:oc_dm");
+    expect(onOutput).not.toHaveBeenCalled();
+    expect(fakeClientState.sendText.mock.calls[0]?.[1]).toContain(
+      'Scheduled task "missing" was not found.',
+    );
+    expect(fakeClientState.stopTyping).toHaveBeenCalledWith("oc_dm");
+  });
+
+  it("shows a usage reply for a malformed /schedule-here without calling onScheduleHere", async () => {
+    const onScheduleHere = vi.fn(async () => ({ ok: true }));
+    const adapter = new FeishuIMAdapter(
+      {
+        appId: "cli_xxx",
+        appSecret: "secret",
+        requireMentionInGroup: true,
+      },
+      createLogger("test"),
+      undefined,
+      undefined,
+      undefined,
+      onScheduleHere,
+    );
+    const onOutput = vi.fn(async (_event: ClientOutputEvent) => {});
+
+    await adapter.start(onOutput);
+    await fakeClientState.onMessage?.({
+      chatId: "oc_dm",
+      chatType: "p2p",
+      messageId: "msg-schedule-here-bad",
+      text: "/schedule-here",
+      mentionedBot: false,
+    });
+
+    expect(onScheduleHere).not.toHaveBeenCalled();
+    expect(onOutput).not.toHaveBeenCalled();
+    expect(fakeClientState.sendText).toHaveBeenCalledWith(
+      "oc_dm",
+      expect.stringContaining("Usage: `/schedule-here <task-name>`"),
+      "msg-schedule-here-bad",
+    );
+    expect(fakeClientState.stopTyping).toHaveBeenCalledWith("oc_dm");
+  });
+
+  it("degrades gracefully when onScheduleHere is absent: logs and replies nothing", async () => {
+    const warnSpy = vi.spyOn(console, "warn").mockImplementation(() => {});
+    try {
+      const adapter = new FeishuIMAdapter(
+        {
+          appId: "cli_xxx",
+          appSecret: "secret",
+          requireMentionInGroup: true,
+        },
+        createLogger("test"),
+      );
+      const onOutput = vi.fn(async (_event: ClientOutputEvent) => {});
+
+      await adapter.start(onOutput);
+      await fakeClientState.onMessage?.({
+        chatId: "oc_dm",
+        chatType: "p2p",
+        messageId: "msg-schedule-here-no-bridge",
+        text: "/schedule-here report",
+        mentionedBot: false,
+      });
+
+      expect(onOutput).not.toHaveBeenCalled();
+      expect(fakeClientState.sendText).not.toHaveBeenCalled();
+      expect(fakeClientState.stopTyping).toHaveBeenCalledWith("oc_dm");
+      expect(warnSpy.mock.calls.some((call) =>
+        call.some((arg) => typeof arg === "string" && arg.includes("onScheduleHere is not injected")),
+      )).toBe(true);
+    } finally {
+      warnSpy.mockRestore();
+    }
+  });
 });

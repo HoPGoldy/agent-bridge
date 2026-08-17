@@ -1,0 +1,545 @@
+/**
+ * Per-channel scheduler for scheduled tasks (spec D8/D9, ticket T3).
+ *
+ * One instance per channel, owned by the channel runner. It owns:
+ *
+ * - the tick loop (default 30 s; spec D8 hot reload by polling) that
+ *   re-scans the channel's task directory through `loadChannelTasks` and
+ *   re-syncs the in-memory task table, so added/edited/deleted/disabled tasks
+ *   take effect on the next tick;
+ * - due-time evaluation (`now >= nextRun`, at most one fire per task per
+ *   tick, no bursting) and next-run recomputation (spec D4/D8);
+ * - the run registry: one record per run, keyed by the run-unique synthetic
+ *   session id, each with its own timeout timer; a run ends when the
+ *   scheduler receives its completion signal through
+ *   {@link Scheduler.handleOutput} or when the timer fires (spec D5);
+ * - firing: a synthetic `command.session.new` (canonical working directory,
+ *   `workingDirectorySource: "default"`) followed by a `user.message`, both
+ *   carrying a run-unique synthetic `schedule:<task-name>:<run-seq>`
+ *   clientSessionId (spec D1), plus fire-time validation of the target and
+ *   working directory (spec D6/D7).
+ *
+ * All external interaction goes through the injected callbacks: `inject`
+ * (synthetic client-output events — the runner wires it to the core's input
+ * path), `deliver` (egress events to a task's `target` chat) and `t` (the
+ * per-channel translator). The runner diverts `schedule:*` agent output into
+ * {@link Scheduler.handleOutput}. This module deliberately knows nothing
+ * about the agent adapter or the core; T4/T5 wire it up.
+ */
+
+import type { ClientInputEvent, ClientOutputEvent, ScheduleHereResult } from "../../types";
+import type { Translator } from "../../i18n";
+import { createLogger, type Logger } from "../../core/logger";
+import { validateWorkingDirectory } from "../client/utils/working-directory";
+import { nextRun } from "./grammar";
+import {
+  loadChannelTasks,
+  setTaskTarget,
+  type LoadedTask,
+  type ScheduleTask,
+} from "./task-file";
+
+/** Default tick interval: 30 s (spec D8). */
+export const DEFAULT_TICK_MS = 30_000;
+
+/** Synthetic clientSessionId prefix for task runs (spec D1). Shared with the core. */
+export const SYNTHETIC_SESSION_PREFIX = "schedule:";
+
+/** Outcome of a fire: `{ ok: true }` or a caller-facing English reason. */
+export type FireResult = { ok: true } | { ok: false; reason: string };
+
+export interface SchedulerOptions {
+  channelName: string;
+  tickMs?: number;
+  now?: () => Date;
+  /** Synthetic client-output events for a fire (session.new + user.message). */
+  inject: (event: ClientOutputEvent) => Promise<void>;
+  /** Egress events delivered to a task's `target` chat (result/failure/notice). */
+  deliver: (event: ClientInputEvent) => Promise<void>;
+  /** Per-channel translator, e.g. `getTranslatorForCommon(common)`. */
+  t: Translator;
+  /**
+   * Optional target validator (the client module's session-id parser). When
+   * provided, a task whose `target` fails the check is skipped and only
+   * logged — there is nowhere to deliver an error to (spec D7).
+   */
+  validateTarget?: (clientSessionId: string) => boolean;
+  logger?: Logger;
+  /**
+   * Task loader override, defaults to `loadChannelTasks` from `./task-file`.
+   * Tests inject a fake, or point {@link SchedulerOptions.schedulesRoot} at a
+   * temporary directory.
+   */
+  loadTasks?: (channelName: string, schedulesRoot?: string) => Promise<LoadedTask[]>;
+  /** Overridable schedules root (defaults to the shared `SCHEDULES_DIR`). */
+  schedulesRoot?: string;
+}
+
+interface TaskRow {
+  task: ScheduleTask;
+  /** Next trigger time, or `null` when the task has no valid schedule. */
+  nextRun: Date | null;
+}
+
+interface RunRecord {
+  /** The run-unique synthetic clientSessionId (`schedule:<task>:<seq>`). */
+  sessionId: string;
+  task: ScheduleTask;
+  startedAt: number;
+  timer: NodeJS.Timeout;
+}
+
+export class Scheduler {
+  readonly #channelName: string;
+  readonly #tickMs: number;
+  readonly #now: () => Date;
+  readonly #inject: (event: ClientOutputEvent) => Promise<void>;
+  readonly #deliver: (event: ClientInputEvent) => Promise<void>;
+  readonly #t: Translator;
+  readonly #validateTarget?: (clientSessionId: string) => boolean;
+  readonly #logger: Logger;
+  readonly #loadTasks: (channelName: string, schedulesRoot?: string) => Promise<LoadedTask[]>;
+  readonly #schedulesRoot?: string;
+
+  /** In-memory task table, re-synced from disk on every tick (spec D8). */
+  readonly #tasks = new Map<string, TaskRow>();
+  /**
+   * Active runs keyed by their run-unique synthetic session id. Concurrent
+   * runs of the same task coexist as independent records (spec D5).
+   */
+  readonly #runs = new Map<string, RunRecord>();
+
+  /** Monotonically increasing run sequence, making every run id unique. */
+  #runSeq = 0;
+
+  #started = false;
+  #tickTimer: NodeJS.Timeout | null = null;
+
+  constructor(options: SchedulerOptions) {
+    this.#channelName = options.channelName;
+    this.#tickMs = options.tickMs ?? DEFAULT_TICK_MS;
+    this.#now = options.now ?? (() => new Date());
+    this.#inject = options.inject;
+    this.#deliver = options.deliver;
+    this.#t = options.t;
+    this.#validateTarget = options.validateTarget;
+    this.#logger = options.logger ?? createLogger("schedule");
+    this.#loadTasks = options.loadTasks ?? loadChannelTasks;
+    this.#schedulesRoot = options.schedulesRoot;
+  }
+
+  /**
+   * Starts the tick loop and performs the initial task-table sync. A missed
+   * fire while stopped is never made up (spec D9): next runs are computed
+   * from the current clock.
+   */
+  async start(): Promise<void> {
+    if (this.#started) return;
+    this.#started = true;
+    await this.#tick();
+    this.#scheduleNextTick();
+  }
+
+  /**
+   * Stops the tick loop and clears every timer (including run timeout
+   * timers). In-flight task sessions are left alone: the core teardown shuts
+   * them down like any ordinary session (spec D9).
+   */
+  async stop(): Promise<void> {
+    this.#started = false;
+    if (this.#tickTimer) {
+      clearTimeout(this.#tickTimer);
+      this.#tickTimer = null;
+    }
+    for (const record of this.#runs.values()) {
+      clearTimeout(record.timer);
+    }
+    this.#runs.clear();
+  }
+
+  /**
+   * Routes a diverted agent-output event for a `schedule:*` session (spec
+   * D2). `assistant.message` is the completion signal: the result (with a
+   * localized task header, or a localized no-output notice when empty) is
+   * delivered to the task's `target` and that run ends. A terminal `error`
+   * delivers a localized failure notice and ends the run. Every other event
+   * type is discarded. Events whose run-unique id has no active run are
+   * discarded and logged. Note: schedule sessions produce no "started a new
+   * session" confirmation (suppressed in the core from T4 on).
+   */
+  handleOutput(event: ClientInputEvent): void {
+    // NOTE (T4): schedule sessions never produce a "started a new session"
+    // confirmation — the core suppresses it for `schedule:*` ids from T4 on.
+    // Until that lands, such a confirmation (or any other event whose run is
+    // not registered) is dropped as an orphan below; it must never be
+    // mistaken for a task result.
+    const parsed = parseSyntheticSessionId(event.clientSessionId);
+    if (parsed === null) return;
+
+    // Attribution is by the exact run id: a late event from an already
+    // ended run can never hit a newer run of the same task (spec D5).
+    const record = this.#runs.get(event.clientSessionId);
+    if (record === undefined) {
+      this.#logger.info(`[schedule] dropping orphan output for run "${event.clientSessionId}"`);
+      return;
+    }
+    const taskName = record.task.name;
+
+    if (event.type === "assistant.message") {
+      this.#endRun(event.clientSessionId);
+      const target = record.task.target;
+      if (target === undefined) {
+        this.#logger.warn(`[schedule] task "${taskName}" has no target to deliver its result to`);
+        return;
+      }
+      const text = event.text ?? "";
+      if (text.trim() === "") {
+        // Spec edge case: never deliver silence.
+        void this.#deliverToTarget(
+          target,
+          this.#t("schedule.taskNoOutput", { name: taskName }),
+        );
+        return;
+      }
+      const header = this.#t("schedule.taskResultHeader", { name: taskName });
+      void this.#deliverToTarget(target, {
+        type: "assistant.message",
+        clientSessionId: target,
+        text: `${header}\n${text}`,
+        ...(event.attachments !== undefined && event.attachments.length > 0
+          ? { attachments: event.attachments }
+          : {}),
+      });
+      return;
+    }
+
+    if (event.type === "error") {
+      this.#endRun(event.clientSessionId);
+      const target = record.task.target;
+      if (target === undefined) {
+        this.#logger.warn(`[schedule] task "${taskName}" has no target to deliver its failure to`);
+        return;
+      }
+      const base = this.#t("schedule.taskFailed", { name: taskName });
+      const detail = event.detail ? ` ${event.detail}` : "";
+      void this.#deliverToTarget(target, `${base}${detail}`);
+      return;
+    }
+
+    // Intermediate/progress events are discarded (spec D2).
+  }
+
+  /**
+   * Runs the task through the exact same path as a scheduled fire (spec
+   * D7a): reloads the task file, validates target/directory/prompt, injects
+   * the two synthetic events and registers a timeout-bounded run. The
+   * localized error reply for the triggering chat is the caller's job.
+   */
+  async runNow(taskName: string): Promise<FireResult> {
+    return this.#fire(taskName);
+  }
+
+  /** The shared fire path; `runNow` is an alias (spec D7a). */
+  async fire(taskName: string): Promise<FireResult> {
+    return this.#fire(taskName);
+  }
+
+  /**
+   * Binds a chat as the task's delivery target (spec D7, `/schedule-here`):
+   * writes the sending chat's `clientSessionId` into the task file's
+   * `target` line. The task must exist — resolved from the in-memory task
+   * table, falling back to an immediate directory load so a file written
+   * after the last tick is still claimable. Unknown task or a write failure
+   * returns `{ ok: false, reason }`; the localized reply for the triggering
+   * chat is the caller's job.
+   */
+  async claimTarget(taskName: string, clientSessionId: string): Promise<ScheduleHereResult> {
+    let exists = this.#tasks.has(taskName);
+    if (!exists) {
+      try {
+        const loaded = await this.#loadTasks(this.#channelName, this.#schedulesRoot);
+        exists = loaded.some((entry) => entry.task.name === taskName);
+      } catch (error) {
+        this.#logger.error(
+          `[schedule] failed to load tasks while claiming target for "${taskName}":`,
+          error,
+        );
+        return { ok: false, reason: "task not found" };
+      }
+    }
+    if (!exists) {
+      this.#logger.warn(`[schedule] task "${taskName}" not found; nothing to claim`);
+      return { ok: false, reason: "task not found" };
+    }
+    return setTaskTarget(this.#channelName, taskName, clientSessionId, this.#schedulesRoot);
+  }
+
+  async #fire(taskName: string): Promise<FireResult> {
+    // SF-2: never start work (and never register a run/timer) once stopped.
+    if (!this.#started) {
+      this.#logger.warn(`[schedule] scheduler is not running; skipping fire of "${taskName}"`);
+      return { ok: false, reason: "scheduler is not running" };
+    }
+    const task = await this.#loadTaskFresh(taskName);
+    if (task === undefined) {
+      this.#logger.warn(`[schedule] task "${taskName}" not found; skipping fire`);
+      return { ok: false, reason: "task not found" };
+    }
+    if (!task.enabled) {
+      this.#logger.warn(`[schedule] task "${taskName}" is disabled; skipping fire`);
+      return { ok: false, reason: "task is disabled" };
+    }
+
+    const target = task.target;
+    if (
+      target === undefined ||
+      (this.#validateTarget !== undefined && !this.#validateTarget(target))
+    ) {
+      // Nowhere to deliver an error to: skip and log only (spec D7).
+      this.#logger.warn(`[schedule] task "${taskName}" has no valid target; skipping fire`);
+      return { ok: false, reason: "task has no valid target" };
+    }
+
+    // Fire-time directory validation (spec D6): nothing is injected on
+    // failure; the localized error goes to the (valid) target chat.
+    const directoryValidation = await validateWorkingDirectory(task.directory ?? process.cwd());
+    if (!directoryValidation.ok) {
+      this.#logger.warn(
+        `[schedule] task "${taskName}" has an invalid working directory "${directoryValidation.directory}": ${directoryValidation.detail}`,
+      );
+      await this.#deliverToTarget(
+        target,
+        this.#t("schedule.fireError", { name: taskName, detail: directoryValidation.detail }),
+      );
+      return { ok: false, reason: `invalid working directory: ${directoryValidation.detail}` };
+    }
+
+    if (task.prompt.trim() === "") {
+      this.#logger.warn(`[schedule] task "${taskName}" has an empty prompt; skipping fire`);
+      await this.#deliverToTarget(
+        target,
+        this.#t("schedule.fireError", { name: taskName, detail: "task body is empty" }),
+      );
+      return { ok: false, reason: "task body is empty" };
+    }
+
+    // Register the run (with its own timeout timer) BEFORE injecting: the
+    // run id must exist before any output can arrive, so a failure that
+    // surfaces during the inject window is still attributed to this run.
+    // SF-2: if stop() landed while we were awaiting validation, no run and
+    // no timer may be created.
+    const sessionId = this.#registerRun(task);
+    if (sessionId === null) {
+      this.#logger.warn(`[schedule] scheduler stopped during fire of "${taskName}"; run not registered`);
+      return { ok: false, reason: "scheduler is not running" };
+    }
+
+    // Inject the two synthetic events in order (spec D1).
+    try {
+      await this.#inject({
+        type: "command.session.new",
+        clientSessionId: sessionId,
+        workingDirectory: directoryValidation.directory,
+        workingDirectorySource: "default",
+      });
+      await this.#inject({
+        type: "user.message",
+        clientSessionId: sessionId,
+        text: task.prompt,
+      });
+    } catch (error) {
+      // The session may or may not exist at this point; either way the run
+      // record must not outlive a failed fire (no stale timeout timer, no
+      // post-failure result delivery). If session.new had landed, the core
+      // idle timeout reclaims the orphaned session.
+      this.#endRun(sessionId);
+      this.#logger.error(`[schedule] failed to inject synthetic events for "${taskName}":`, error);
+      return { ok: false, reason: "failed to inject synthetic events" };
+    }
+
+    return { ok: true };
+  }
+
+  async #tick(): Promise<void> {
+    if (!this.#started) return;
+    const now = this.#now();
+    let loaded: LoadedTask[];
+    try {
+      loaded = await this.#loadTasks(this.#channelName, this.#schedulesRoot);
+    } catch (error) {
+      this.#logger.error("[schedule] failed to load scheduled tasks:", error);
+      return;
+    }
+    this.#syncTasks(loaded, now);
+
+    for (const [taskName, row] of this.#tasks) {
+      // SF-2: a stop() that landed mid-tick must not start new fires.
+      if (!this.#started) return;
+      const { task } = row;
+      if (!task.enabled || task.schedule === null || row.nextRun === null) continue;
+      if (now.getTime() >= row.nextRun.getTime()) {
+        const result = await this.#fire(taskName);
+        if (!result.ok) {
+          this.#logger.warn(`[schedule] fire of "${taskName}" failed: ${result.reason}`);
+        }
+        // Recompute from the current clock: a delayed tick fires at most once
+        // (no bursting) and a failing task does not retry every tick.
+        row.nextRun = nextRun(task.schedule, this.#now());
+      }
+    }
+  }
+
+  #scheduleNextTick(): void {
+    if (!this.#started) return;
+    this.#tickTimer = setTimeout(() => {
+      void this.#tick().finally(() => this.#scheduleNextTick());
+    }, this.#tickMs);
+    this.#tickTimer.unref?.();
+  }
+
+  #syncTasks(loaded: LoadedTask[], now: Date): void {
+    const seen = new Set<string>();
+    for (const { task } of loaded) {
+      seen.add(task.name);
+      const existing = this.#tasks.get(task.name);
+      if (existing === undefined) {
+        this.#tasks.set(task.name, {
+          task,
+          nextRun: task.schedule !== null ? nextRun(task.schedule, now) : null,
+        });
+        continue;
+      }
+      const scheduleChanged = !sameSchedule(existing.task.schedule, task.schedule);
+      const enabledChanged = existing.task.enabled !== task.enabled;
+      if (scheduleChanged || enabledChanged) {
+        // Recompute from the current clock: a schedule edit re-anchors the
+        // task, and re-enabling never catches up a paused task.
+        existing.task = task;
+        existing.nextRun = task.schedule !== null ? nextRun(task.schedule, now) : null;
+      } else {
+        // Body/front-matter edits keep the scheduled nextRun.
+        existing.task = task;
+      }
+    }
+    for (const taskName of [...this.#tasks.keys()]) {
+      if (!seen.has(taskName)) {
+        this.#tasks.delete(taskName);
+      }
+    }
+  }
+
+  /** Re-reads the task file at fire time so the latest prompt is used (spec D8). */
+  async #loadTaskFresh(taskName: string): Promise<ScheduleTask | undefined> {
+    let loaded: LoadedTask[];
+    try {
+      loaded = await this.#loadTasks(this.#channelName, this.#schedulesRoot);
+    } catch (error) {
+      this.#logger.error(`[schedule] failed to load task "${taskName}":`, error);
+      return undefined;
+    }
+    return loaded.find((entry) => entry.task.name === taskName)?.task;
+  }
+
+  #registerRun(task: ScheduleTask): string | null {
+    // SF-2: never register a run (and therefore never create a timer) once
+    // stopped — a stop() landing mid-fire must not leave a timer that
+    // nobody will clear.
+    if (!this.#started) return null;
+    const sessionId = syntheticSessionId(task.name, ++this.#runSeq);
+    const record: RunRecord = {
+      sessionId,
+      task,
+      startedAt: this.#now().getTime(),
+      timer: setTimeout(() => {
+        void this.#handleTimeout(sessionId);
+      }, task.timeoutMs),
+    };
+    record.timer.unref?.();
+    this.#runs.set(sessionId, record);
+    return sessionId;
+  }
+
+  async #handleTimeout(sessionId: string): Promise<void> {
+    const record = this.#runs.get(sessionId);
+    if (record === undefined) return; // run already ended
+    this.#runs.delete(sessionId);
+    const { task } = record;
+    this.#logger.warn(`[schedule] task "${task.name}" timed out after ${task.timeoutMs}ms`);
+
+    const target = task.target;
+    if (target === undefined) {
+      this.#logger.warn(`[schedule] task "${task.name}" has no target to deliver its timeout notice to`);
+      return;
+    }
+
+    // Abort this run's own session. NOTE: the shared event type has no
+    // `command.session.abort`; `command.session.stop` is the equivalent core
+    // command (it calls agentAdapter.abort()).
+    await this.#injectSafe({
+      type: "command.session.stop",
+      clientSessionId: sessionId,
+    });
+    await this.#deliverToTarget(target, this.#t("schedule.taskTimedOut", { name: task.name }));
+  }
+
+  #endRun(sessionId: string): void {
+    const record = this.#runs.get(sessionId);
+    if (record === undefined) return;
+    clearTimeout(record.timer);
+    this.#runs.delete(sessionId);
+  }
+
+  async #injectSafe(event: ClientOutputEvent): Promise<void> {
+    try {
+      await this.#inject(event);
+    } catch (error) {
+      this.#logger.error("[schedule] failed to inject synthetic event:", error);
+    }
+  }
+
+  async #deliverToTarget(target: string, textOrEvent: string | ClientInputEvent): Promise<void> {
+    const event: ClientInputEvent =
+      typeof textOrEvent === "string"
+        ? { type: "assistant.message", clientSessionId: target, text: textOrEvent }
+        : textOrEvent;
+    try {
+      await this.#deliver(event);
+    } catch (error) {
+      this.#logger.error(`[schedule] failed to deliver event to target "${target}":`, error);
+    }
+  }
+}
+
+/** A parsed synthetic clientSessionId: task name plus its run sequence. */
+export interface ParsedSyntheticId {
+  taskName: string;
+  runSeq: number;
+}
+
+/**
+ * Returns the run-unique synthetic clientSessionId for a task run
+ * (`schedule:<task-name>:<run-seq>`, spec D1). The run sequence guarantees
+ * that concurrent runs of the same task have distinct ids.
+ */
+export function syntheticSessionId(taskName: string, runSeq: number): string {
+  return `${SYNTHETIC_SESSION_PREFIX}${taskName}:${runSeq}`;
+}
+
+/**
+ * Parses a `schedule:<task-name>:<run-seq>` clientSessionId; `null` when it
+ * is not a well-formed synthetic schedule session id.
+ */
+export function parseSyntheticSessionId(clientSessionId: string): ParsedSyntheticId | null {
+  if (!clientSessionId.startsWith(SYNTHETIC_SESSION_PREFIX)) return null;
+  const rest = clientSessionId.slice(SYNTHETIC_SESSION_PREFIX.length);
+  const colon = rest.lastIndexOf(":");
+  if (colon <= 0 || colon === rest.length - 1) return null;
+  const taskName = rest.slice(0, colon);
+  const runSeq = Number(rest.slice(colon + 1));
+  if (!Number.isInteger(runSeq) || runSeq < 1) return null;
+  return { taskName, runSeq };
+}
+
+function sameSchedule(a: ScheduleTask["schedule"], b: ScheduleTask["schedule"]): boolean {
+  return JSON.stringify(a) === JSON.stringify(b);
+}

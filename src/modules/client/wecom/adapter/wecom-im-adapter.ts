@@ -4,13 +4,25 @@ import type {
   ClientOutputEvent,
   ClientSessionStateStore,
   IMAdapter,
+  OnScheduleHere,
+  OnScheduleRun,
   WecomClientConfig,
 } from "../../../../types";
 import { formatSendFailureNotice, getTranslatorForCommon, type Translator } from "../../../../i18n";
 import { createLogger, type Logger } from "../../../../core/logger";
 import { isCompletedCommandResponse, isTerminalAgentError } from "../../utils/error-events";
 import { ProgressRenderer } from "../../utils/progress-renderer";
-import { parseSlashCommand, resolveHelpMarkdown, resolveSlashCommandEvent } from "../../utils/slash-commands";
+import {
+  formatScheduleHereReply,
+  formatScheduleRunReply,
+  parseSlashCommand,
+  resolveHelpMarkdown,
+  resolveSlashCommandEvent,
+  type ScheduleHereCommand,
+  type ScheduleHereUsageCommand,
+  type ScheduleRunCommand,
+  type ScheduleRunUsageCommand,
+} from "../../utils/slash-commands";
 import {
   createInMemoryImClientSessionStateStore,
   type ImClientSessionStateV1,
@@ -61,6 +73,8 @@ export class WecomIMAdapter implements IMAdapter {
   readonly #logger: Logger;
   readonly #t: Translator;
   readonly #sessionState: ClientSessionStateStore<ImClientSessionStateV1>;
+  readonly #onScheduleRun: OnScheduleRun | undefined;
+  readonly #onScheduleHere: OnScheduleHere | undefined;
   #onOutput: ((event: ClientOutputEvent) => Promise<void> | void) | null = null;
   #client: WecomClient | null = null;
   #egressQueue: ClientInputEvent[] = [];
@@ -96,11 +110,15 @@ export class WecomIMAdapter implements IMAdapter {
     sessionState: ClientSessionStateStore<ImClientSessionStateV1> = createInMemoryImClientSessionStateStore(
       "wecom",
     ),
+    onScheduleRun?: OnScheduleRun,
+    onScheduleHere?: OnScheduleHere,
   ) {
     this.#config = config;
     this.#logger = logger;
     this.#t = getTranslatorForCommon(common);
     this.#sessionState = sessionState;
+    this.#onScheduleRun = onScheduleRun;
+    this.#onScheduleHere = onScheduleHere;
   }
 
   async start(onOutput: (event: ClientOutputEvent) => Promise<void> | void): Promise<void> {
@@ -144,6 +162,18 @@ export class WecomIMAdapter implements IMAdapter {
 
       const parsedCommand = parseSlashCommand(normalizedText, clientSessionId);
       if (parsedCommand) {
+        if (parsedCommand.type === "schedule.run" || parsedCommand.type === "schedule.run.usage") {
+          // Adapter-local manual trigger (spec D7a): never reaches the core.
+          this.#logger.info(`received local schedule-run command ${normalizedText} (session=${clientSessionId})`);
+          await this.#handleScheduleRun(parsedCommand, chatId, messageId);
+          return;
+        }
+        if (parsedCommand.type === "schedule.here" || parsedCommand.type === "schedule.here.usage") {
+          // Adapter-local target binding (spec D7): never reaches the core.
+          this.#logger.info(`received local schedule-here command ${normalizedText} (session=${clientSessionId})`);
+          await this.#handleScheduleHere(parsedCommand, chatId, messageId);
+          return;
+        }
         const resolved = await resolveSlashCommandEvent(parsedCommand, {
           sessionState: this.#sessionState.session(clientSessionId),
           onError: (error) =>
@@ -337,5 +367,59 @@ const replyToMessageId = this.#lastInboundMessageIdBySession.get(event.clientSes
       renderer: new ProgressRenderer({ t: this.#t }),
       announced: false,
     });
+  }
+
+  async #handleScheduleRun(
+    command: ScheduleRunCommand | ScheduleRunUsageCommand,
+    chatId: string,
+    messageId: string,
+  ): Promise<void> {
+    if (command.type === "schedule.run.usage") {
+      await this.#client?.sendText(chatId, this.#t("client.scheduleRunUsage"), messageId);
+      return;
+    }
+
+    if (!this.#onScheduleRun) {
+      // The runner always injects the bridge (spec D7a); degrade gracefully
+      // if it is ever absent: log, and reply nothing.
+      this.#logger.warn(
+        `onScheduleRun is not injected; dropping /schedule-run for task "${command.taskName}" (session=${command.clientSessionId})`,
+      );
+      return;
+    }
+
+    const result = await this.#onScheduleRun(command.taskName, command.clientSessionId);
+    await this.#client?.sendText(
+      chatId,
+      formatScheduleRunReply(result, command.taskName, this.#t),
+      messageId,
+    );
+  }
+
+  async #handleScheduleHere(
+    command: ScheduleHereCommand | ScheduleHereUsageCommand,
+    chatId: string,
+    messageId: string,
+  ): Promise<void> {
+    if (command.type === "schedule.here.usage") {
+      await this.#client?.sendText(chatId, this.#t("client.scheduleHereUsage"), messageId);
+      return;
+    }
+
+    if (!this.#onScheduleHere) {
+      // The runner always injects the bridge (spec D7); degrade gracefully
+      // if it is ever absent: log, and reply nothing.
+      this.#logger.warn(
+        `onScheduleHere is not injected; dropping /schedule-here for task "${command.taskName}" (session=${command.clientSessionId})`,
+      );
+      return;
+    }
+
+    const result = await this.#onScheduleHere(command.taskName, command.clientSessionId);
+    await this.#client?.sendText(
+      chatId,
+      formatScheduleHereReply(result, command.taskName, this.#t),
+      messageId,
+    );
   }
 }

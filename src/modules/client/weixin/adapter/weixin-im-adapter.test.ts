@@ -817,4 +817,232 @@ describe("WeixinIMAdapter", () => {
     expect(fakeClientState.sendText.mock.calls[1]?.[1]).toContain("frequency limit");
     expect(fakeClientState.stopTyping).toHaveBeenCalledWith("wxid_user_1");
   });
+
+  it("triggers a scheduled task locally on /schedule-run and stops typing", async () => {
+    const onScheduleRun = vi.fn(async () => ({ ok: true }));
+    const adapter = new WeixinIMAdapter(
+      {
+        accountId: "bot-account",
+        token: "bot-token",
+      },
+      createLogger("test"),
+      undefined,
+      undefined,
+      onScheduleRun,
+    );
+    const onOutput = vi.fn(async (_event: ClientOutputEvent) => {});
+
+    await adapter.start(onOutput);
+    await fakeClientState.onMessage?.({
+      chatId: "wxid_user_1",
+      chatType: "dm",
+      messageId: "msg-schedule-run",
+      text: "/schedule-run report",
+      mentionedBot: false,
+    });
+
+    expect(onScheduleRun).toHaveBeenCalledWith("report", "weixin:dm:wxid_user_1");
+    expect(onOutput).not.toHaveBeenCalled();
+    expect(fakeClientState.sendText).toHaveBeenCalledWith(
+      "wxid_user_1",
+      expect.stringContaining('Task "report"'),
+    );
+    expect(fakeClientState.stopTyping).toHaveBeenCalledWith("wxid_user_1");
+  });
+
+  it("replies with a localized error for an unknown /schedule-run task", async () => {
+    const onScheduleRun = vi.fn(async () => ({ ok: false, reason: "task not found" }));
+    const adapter = new WeixinIMAdapter(
+      {
+        accountId: "bot-account",
+        token: "bot-token",
+      },
+      createLogger("test"),
+      undefined,
+      undefined,
+      onScheduleRun,
+    );
+    const onOutput = vi.fn(async (_event: ClientOutputEvent) => {});
+
+    await adapter.start(onOutput);
+    await fakeClientState.onMessage?.({
+      chatId: "wxid_user_1",
+      chatType: "dm",
+      messageId: "msg-schedule-run-missing",
+      text: "/schedule-run missing",
+      mentionedBot: false,
+    });
+
+    expect(onScheduleRun).toHaveBeenCalledWith("missing", "weixin:dm:wxid_user_1");
+    expect(onOutput).not.toHaveBeenCalled();
+    expect(fakeClientState.sendText).toHaveBeenCalledWith(
+      "wxid_user_1",
+      expect.stringContaining('Scheduled task "missing" was not found.'),
+    );
+    expect(fakeClientState.stopTyping).toHaveBeenCalledWith("wxid_user_1");
+  });
+
+  it("shows a usage reply for a malformed /schedule-run without calling onScheduleRun", async () => {
+    const onScheduleRun = vi.fn(async () => ({ ok: true }));
+    const adapter = new WeixinIMAdapter(
+      {
+        accountId: "bot-account",
+        token: "bot-token",
+      },
+      createLogger("test"),
+      { channelName: "demo-channel", language: "zh-CN" },
+      undefined,
+      onScheduleRun,
+    );
+    const onOutput = vi.fn(async (_event: ClientOutputEvent) => {});
+
+    await adapter.start(onOutput);
+    await fakeClientState.onMessage?.({
+      chatId: "wxid_user_1",
+      chatType: "dm",
+      messageId: "msg-schedule-run-bad",
+      text: "/schedule-run",
+      mentionedBot: false,
+    });
+
+    expect(onScheduleRun).not.toHaveBeenCalled();
+    expect(onOutput).not.toHaveBeenCalled();
+    expect(fakeClientState.sendText).toHaveBeenCalledWith(
+      "wxid_user_1",
+      expect.stringContaining("用法：`/schedule-run <任务名>`"),
+    );
+    expect(fakeClientState.stopTyping).toHaveBeenCalledWith("wxid_user_1");
+  });
+
+  it("binds this chat as a task's target locally on /schedule-here and stops typing", async () => {
+    const onScheduleHere = vi.fn(async () => ({ ok: true }));
+    const adapter = new WeixinIMAdapter(
+      {
+        accountId: "bot-account",
+        token: "bot-token",
+      },
+      createLogger("test"),
+      undefined,
+      undefined,
+      undefined,
+      onScheduleHere,
+    );
+    const onOutput = vi.fn(async (_event: ClientOutputEvent) => {});
+
+    await adapter.start(onOutput);
+    await fakeClientState.onMessage?.({
+      chatId: "wxid_user_1",
+      chatType: "dm",
+      messageId: "msg-schedule-here",
+      text: "/schedule-here report",
+      mentionedBot: false,
+    });
+
+    expect(onScheduleHere).toHaveBeenCalledWith("report", "weixin:dm:wxid_user_1");
+    expect(onOutput).not.toHaveBeenCalled();
+    expect(fakeClientState.sendText).toHaveBeenCalledWith(
+      "wxid_user_1",
+      expect.stringContaining('Task "report"'),
+    );
+    expect(fakeClientState.sendText.mock.calls[0]?.[1]).toContain("send its results to this chat");
+    expect(fakeClientState.stopTyping).toHaveBeenCalledWith("wxid_user_1");
+  });
+
+  it("replies with a localized error for an unknown /schedule-here task", async () => {
+    const onScheduleHere = vi.fn(async () => ({ ok: false, reason: "task not found" }));
+    const adapter = new WeixinIMAdapter(
+      {
+        accountId: "bot-account",
+        token: "bot-token",
+      },
+      createLogger("test"),
+      undefined,
+      undefined,
+      undefined,
+      onScheduleHere,
+    );
+    const onOutput = vi.fn(async (_event: ClientOutputEvent) => {});
+
+    await adapter.start(onOutput);
+    await fakeClientState.onMessage?.({
+      chatId: "wxid_user_1",
+      chatType: "dm",
+      messageId: "msg-schedule-here-missing",
+      text: "/schedule-here missing",
+      mentionedBot: false,
+    });
+
+    expect(onScheduleHere).toHaveBeenCalledWith("missing", "weixin:dm:wxid_user_1");
+    expect(onOutput).not.toHaveBeenCalled();
+    expect(fakeClientState.sendText).toHaveBeenCalledWith(
+      "wxid_user_1",
+      expect.stringContaining('Scheduled task "missing" was not found.'),
+    );
+    expect(fakeClientState.stopTyping).toHaveBeenCalledWith("wxid_user_1");
+  });
+
+  it("shows a usage reply for a malformed /schedule-here without calling onScheduleHere", async () => {
+    const onScheduleHere = vi.fn(async () => ({ ok: true }));
+    const adapter = new WeixinIMAdapter(
+      {
+        accountId: "bot-account",
+        token: "bot-token",
+      },
+      createLogger("test"),
+      { channelName: "demo-channel", language: "zh-CN" },
+      undefined,
+      undefined,
+      onScheduleHere,
+    );
+    const onOutput = vi.fn(async (_event: ClientOutputEvent) => {});
+
+    await adapter.start(onOutput);
+    await fakeClientState.onMessage?.({
+      chatId: "wxid_user_1",
+      chatType: "dm",
+      messageId: "msg-schedule-here-bad",
+      text: "/schedule-here",
+      mentionedBot: false,
+    });
+
+    expect(onScheduleHere).not.toHaveBeenCalled();
+    expect(onOutput).not.toHaveBeenCalled();
+    expect(fakeClientState.sendText).toHaveBeenCalledWith(
+      "wxid_user_1",
+      expect.stringContaining("用法：`/schedule-here <任务名>`"),
+    );
+    expect(fakeClientState.stopTyping).toHaveBeenCalledWith("wxid_user_1");
+  });
+
+  it("degrades gracefully when onScheduleHere is absent: logs and replies nothing", async () => {
+    const warnSpy = vi.spyOn(console, "warn").mockImplementation(() => {});
+    try {
+      const adapter = new WeixinIMAdapter(
+        {
+          accountId: "bot-account",
+          token: "bot-token",
+        },
+        createLogger("test"),
+      );
+      const onOutput = vi.fn(async (_event: ClientOutputEvent) => {});
+
+      await adapter.start(onOutput);
+      await fakeClientState.onMessage?.({
+        chatId: "wxid_user_1",
+        chatType: "dm",
+        messageId: "msg-schedule-here-no-bridge",
+        text: "/schedule-here report",
+        mentionedBot: false,
+      });
+
+      expect(onOutput).not.toHaveBeenCalled();
+      expect(fakeClientState.sendText).not.toHaveBeenCalled();
+      expect(fakeClientState.stopTyping).toHaveBeenCalledWith("wxid_user_1");
+      expect(warnSpy.mock.calls.some((call) =>
+        call.some((arg) => typeof arg === "string" && arg.includes("onScheduleHere is not injected")),
+      )).toBe(true);
+    } finally {
+      warnSpy.mockRestore();
+    }
+  });
 });

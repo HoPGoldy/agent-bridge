@@ -206,6 +206,35 @@ export interface ChannelCommonContext extends ChannelCommonConfig {
   channelName: string;
 }
 
+/** Outcome of a manual task trigger (`/schedule-run`, spec D7a). */
+export type ScheduleRunResult = { ok: true } | { ok: false; reason: string };
+
+/**
+ * Manual-trigger bridge (spec D7a): the client adapter calls this for a local
+ * `/schedule-run <task>` command; the channel runner wires it to the per-
+ * channel scheduler's `runNow`. Optional: adapters degrade gracefully (log,
+ * no reply) when absent.
+ */
+export type OnScheduleRun = (
+  taskName: string,
+  clientSessionId: string,
+) => Promise<ScheduleRunResult>;
+
+/** Outcome of binding a chat as a task's delivery target (`/schedule-here`, spec D7). */
+export type ScheduleHereResult = { ok: true } | { ok: false; reason: string };
+
+/**
+ * Target-binding bridge (spec D7): the client adapter calls this for a local
+ * `/schedule-here <task>` command sent in the destination chat; the channel
+ * runner wires it to the per-channel scheduler's `claimTarget`, which writes
+ * the sending chat's `clientSessionId` into the task file's `target` field.
+ * Optional: adapters degrade gracefully (log, no reply) when absent.
+ */
+export type OnScheduleHere = (
+  taskName: string,
+  clientSessionId: string,
+) => Promise<ScheduleHereResult>;
+
 export interface ClientModule<TConfig = unknown, TState extends object = Record<string, never>> {
   readonly type: string;
   /**
@@ -215,12 +244,35 @@ export interface ClientModule<TConfig = unknown, TState extends object = Record<
    * must keep its state JSON-compatible and versioned.
    */
   readonly sessionStateCodec: ClientSessionStateCodec<TState>;
+  /**
+   * Validates a clientSessionId against this module's session-id grammar
+   * (spec D7): true when the module's parser accepts it without throwing.
+   * Used by the scheduler to validate a task file's `target` at fire time;
+   * ids from other channels fail because their platform prefix cannot match
+   * this module.
+   */
+  validateSessionId(clientSessionId: string): boolean;
   createConfigCollector?: () => ConfigAdapter<TConfig>;
   createClientAdapter(args: {
     config: TConfig;
     common: ChannelCommonContext;
     /** Per-channel client session state store scoped to this module's codec. */
     sessionState: ClientSessionStateStore<TState>;
+    /**
+     * Manual-trigger bridge (spec D7a): called by the adapter for a local
+     * `/schedule-run <task>` command; the runner wires it to the per-channel
+     * scheduler's `runNow`. Optional: adapters must degrade gracefully when
+     * absent.
+     */
+    onScheduleRun?: OnScheduleRun;
+    /**
+     * Target-binding bridge (spec D7): called by the adapter for a local
+     * `/schedule-here <task>` command sent in the destination chat; the
+     * runner wires it to the per-channel scheduler's `claimTarget`, which
+     * writes the sending chat's `clientSessionId` into the task file's
+     * `target` field. Optional: adapters must degrade gracefully when absent.
+     */
+    onScheduleHere?: OnScheduleHere;
   }): IMAdapter;
 }
 

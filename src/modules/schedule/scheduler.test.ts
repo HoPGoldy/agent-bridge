@@ -1,0 +1,718 @@
+import { mkdir, mkdtemp, readFile, readdir, realpath, rm, writeFile } from "node:fs/promises";
+import os from "node:os";
+import path from "node:path";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+import type { ClientInputEvent, ClientOutputEvent, OutboundAttachment } from "../../types";
+import { getTranslator } from "../../i18n";
+import type { Logger } from "../../core/logger";
+import { DEFAULT_TIMEOUT_MS, type LoadedTask, type ScheduleTask } from "./task-file";
+import { Scheduler } from "./scheduler";
+
+const TARGET = "feishu:dm:oc_6f9d408e630098e6dd06bb071d6b60fc";
+
+function sleep(ms: number): Promise<void> {
+  return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
+async function waitFor(assertion: () => void | Promise<void>, timeoutMs = 1500): Promise<void> {
+  const start = Date.now();
+  while (Date.now() - start < timeoutMs) {
+    try {
+      await assertion();
+      return;
+    } catch {
+      await sleep(10);
+    }
+  }
+  await assertion();
+}
+
+class FakeClock {
+  #ms: number;
+  constructor(ms = 1_700_000_000_000) {
+    this.#ms = ms;
+  }
+  now(): Date {
+    return new Date(this.#ms);
+  }
+  advance(ms: number): void {
+    this.#ms += ms;
+  }
+}
+
+function makeTask(overrides: Partial<ScheduleTask> & { name: string }): ScheduleTask {
+  return {
+    name: overrides.name,
+    scheduleRaw: overrides.scheduleRaw ?? "every 30m",
+    schedule: overrides.schedule ?? { type: "every", intervalMs: 30 * 60_000 },
+    directory: overrides.directory,
+    timeoutMs: overrides.timeoutMs ?? DEFAULT_TIMEOUT_MS,
+    enabled: overrides.enabled ?? true,
+    target: overrides.target,
+    prompt: overrides.prompt ?? "do the thing",
+  };
+}
+
+function makeLoaded(task: ScheduleTask, errors: string[] = [], warnings: string[] = []): LoadedTask {
+  return { task, errors, warnings };
+}
+
+type MockLogger = { debug: ReturnType<typeof vi.fn>; info: ReturnType<typeof vi.fn>; warn: ReturnType<typeof vi.fn>; error: ReturnType<typeof vi.fn> };
+
+interface Harness {
+  clock: FakeClock;
+  injected: ClientOutputEvent[];
+  delivered: ClientInputEvent[];
+  inject: ReturnType<typeof vi.fn>;
+  deliver: ReturnType<typeof vi.fn>;
+  loadTasks: ReturnType<typeof vi.fn>;
+  logger: MockLogger;
+  tasks: LoadedTask[];
+  scheduler: Scheduler;
+}
+
+const schedulers: Scheduler[] = [];
+
+function createHarness(options: { tasks?: LoadedTask[]; validateTarget?: (id: string) => boolean } = {}): Harness {
+  const clock = new FakeClock();
+  const injected: ClientOutputEvent[] = [];
+  const delivered: ClientInputEvent[] = [];
+  const inject = vi.fn(async (event: ClientOutputEvent) => {
+    injected.push(event);
+  });
+  const deliver = vi.fn(async (event: ClientInputEvent) => {
+    delivered.push(event);
+  });
+  const tasks = options.tasks ?? [];
+  const loadTasks = vi.fn(async () => [...tasks]);
+  const logger: MockLogger = { debug: vi.fn(), info: vi.fn(), warn: vi.fn(), error: vi.fn() };
+  const scheduler = new Scheduler({
+    channelName: "test",
+    tickMs: 20,
+    now: () => clock.now(),
+    inject,
+    deliver,
+    t: getTranslator("en-US"),
+    loadTasks,
+    logger,
+    ...(options.validateTarget !== undefined ? { validateTarget: options.validateTarget } : {}),
+  });
+  schedulers.push(scheduler);
+  return { clock, injected, delivered, inject, deliver, loadTasks, logger, tasks, scheduler };
+}
+
+afterEach(async () => {
+  for (const scheduler of schedulers.splice(0)) {
+    await scheduler.stop();
+  }
+});
+
+describe("tick loop and hot reload (D8)", () => {
+  it("loads tasks on start and fires a due task with the exact synthetic event sequence", async () => {
+    const h = createHarness({
+      tasks: [makeLoaded(makeTask({ name: "report", target: TARGET, prompt: "summarize" }))],
+    });
+    await h.scheduler.start();
+    expect(h.loadTasks).toHaveBeenCalled();
+
+    h.clock.advance(30 * 60_000);
+    await waitFor(() => expect(h.injected).toHaveLength(2));
+
+    expect(h.injected[0]).toEqual({
+      type: "command.session.new",
+      clientSessionId: "schedule:report:1",
+      workingDirectory: await realpath(process.cwd()),
+      workingDirectorySource: "default",
+    });
+    expect(h.injected[1]).toEqual({
+      type: "user.message",
+      clientSessionId: "schedule:report:1",
+      text: "summarize",
+    });
+    expect(h.delivered).toEqual([]);
+
+    // No re-fire while the clock stands still.
+    await sleep(100);
+    expect(h.injected).toHaveLength(2);
+  });
+
+  it("does not burst: a delayed tick fires at most once per task", async () => {
+    const h = createHarness({ tasks: [makeLoaded(makeTask({ name: "report", target: TARGET }))] });
+    await h.scheduler.start();
+
+    h.clock.advance(3 * 60 * 60_000); // several due intervals at once
+    await waitFor(() => expect(h.injected).toHaveLength(2));
+    await sleep(100);
+    expect(h.injected).toHaveLength(2); // exactly one fire despite the backlog
+
+    h.clock.advance(30 * 60_000); // only the recomputed nextRun triggers again
+    await waitFor(() => expect(h.injected).toHaveLength(4));
+  });
+
+  it("re-reads the task at fire time, so an edited prompt is used on the next fire", async () => {
+    const h = createHarness({
+      tasks: [makeLoaded(makeTask({ name: "report", target: TARGET, prompt: "v1" }))],
+    });
+    await h.scheduler.start();
+
+    h.clock.advance(30 * 60_000);
+    await waitFor(() => expect(h.injected).toHaveLength(2));
+    expect(h.injected[1]).toEqual({ type: "user.message", clientSessionId: "schedule:report:1", text: "v1" });
+
+    h.tasks[0] = makeLoaded(makeTask({ name: "report", target: TARGET, prompt: "v2" }));
+    h.clock.advance(30 * 60_000);
+    await waitFor(() => expect(h.injected).toHaveLength(4));
+    expect(h.injected[3]).toEqual({ type: "user.message", clientSessionId: "schedule:report:2", text: "v2" });
+  });
+
+  it("picks up newly added tasks on the next tick", async () => {
+    const h = createHarness();
+    await h.scheduler.start();
+
+    h.tasks.push(makeLoaded(makeTask({ name: "fresh", target: TARGET })));
+    await waitFor(() => expect(h.loadTasks.mock.calls.length).toBeGreaterThanOrEqual(2));
+    h.clock.advance(30 * 60_000);
+    await waitFor(() => expect(h.injected).toHaveLength(2));
+    expect(h.injected[0]).toMatchObject({
+      type: "command.session.new",
+      clientSessionId: "schedule:fresh:1",
+    });
+  });
+
+  it("removes deleted tasks and never fires disabled ones", async () => {
+    const h = createHarness({ tasks: [makeLoaded(makeTask({ name: "gone", target: TARGET }))] });
+    await h.scheduler.start();
+    h.clock.advance(30 * 60_000);
+    await waitFor(() => expect(h.injected).toHaveLength(2));
+
+    // Delete the task file: no further fires.
+    h.tasks.length = 0;
+    h.clock.advance(30 * 60_000);
+    await sleep(100);
+    expect(h.injected).toHaveLength(2);
+
+    // A disabled task never fires.
+    const h2 = createHarness({
+      tasks: [makeLoaded(makeTask({ name: "paused", target: TARGET, enabled: false }))],
+    });
+    await h2.scheduler.start();
+    h2.clock.advance(30 * 60_000);
+    await sleep(100);
+    expect(h2.injected).toEqual([]);
+  });
+
+  it("re-anchors nextRun when the schedule changes", async () => {
+    const h = createHarness({ tasks: [makeLoaded(makeTask({ name: "report", target: TARGET }))] });
+    await h.scheduler.start();
+
+    h.tasks[0] = makeLoaded(
+      makeTask({ name: "report", target: TARGET, schedule: { type: "every", intervalMs: 24 * 60 * 60_000 } }),
+    );
+    await waitFor(() => expect(h.loadTasks.mock.calls.length).toBeGreaterThanOrEqual(2));
+    h.clock.advance(30 * 60_000); // due under the old schedule, not the new one
+    await sleep(100);
+    expect(h.injected).toEqual([]);
+  });
+});
+
+describe("fire-time validation (D6/D7)", () => {
+  it("injects nothing and delivers a localized error when the working directory is invalid", async () => {
+    const h = createHarness({
+      tasks: [
+        makeLoaded(
+          makeTask({ name: "bad", directory: `/definitely/not/a/real/dir-${Date.now()}`, target: TARGET }),
+        ),
+      ],
+    });
+    await h.scheduler.start();
+    const result = await h.scheduler.fire("bad");
+    expect(result).toEqual({ ok: false, reason: "invalid working directory: no such file or directory" });
+    expect(h.injected).toEqual([]);
+    expect(h.delivered).toEqual([
+      {
+        type: "assistant.message",
+        clientSessionId: TARGET,
+        text: '❌ Scheduled task "bad" could not start: no such file or directory',
+      },
+    ]);
+  });
+
+  it("skips and only logs when the target is missing or fails validation", async () => {
+    const h = createHarness({ tasks: [makeLoaded(makeTask({ name: "no-target" }))] });
+    await h.scheduler.start();
+    const result = await h.scheduler.fire("no-target");
+    expect(result).toEqual({ ok: false, reason: "task has no valid target" });
+    expect(h.injected).toEqual([]);
+    expect(h.delivered).toEqual([]);
+    expect(h.logger.warn).toHaveBeenCalledWith(expect.stringContaining("no valid target"));
+
+    const h2 = createHarness({
+      tasks: [makeLoaded(makeTask({ name: "bad-target", target: TARGET }))],
+      validateTarget: () => false,
+    });
+    await h2.scheduler.start();
+    const result2 = await h2.scheduler.fire("bad-target");
+    expect(result2).toEqual({ ok: false, reason: "task has no valid target" });
+    expect(h2.injected).toEqual([]);
+    expect(h2.delivered).toEqual([]);
+  });
+
+  it("delivers a localized error when the prompt is empty", async () => {
+    const h = createHarness({
+      tasks: [makeLoaded(makeTask({ name: "empty", target: TARGET, prompt: "   " }))],
+    });
+    await h.scheduler.start();
+    const result = await h.scheduler.fire("empty");
+    expect(result).toEqual({ ok: false, reason: "task body is empty" });
+    expect(h.injected).toEqual([]);
+    expect(h.delivered).toEqual([
+      {
+        type: "assistant.message",
+        clientSessionId: TARGET,
+        text: '❌ Scheduled task "empty" could not start: task body is empty',
+      },
+    ]);
+  });
+
+  it("reports task not found and disabled from fire and runNow", async () => {
+    const h = createHarness({ tasks: [makeLoaded(makeTask({ name: "off", target: TARGET, enabled: false }))] });
+    await h.scheduler.start();
+    expect(await h.scheduler.fire("missing")).toEqual({ ok: false, reason: "task not found" });
+    expect(await h.scheduler.fire("off")).toEqual({ ok: false, reason: "task is disabled" });
+    expect(await h.scheduler.runNow("missing")).toEqual({ ok: false, reason: "task not found" });
+  });
+
+  it("fire and runNow share the same success path", async () => {
+    const h = createHarness({ tasks: [makeLoaded(makeTask({ name: "ok", target: TARGET, prompt: "hello" }))] });
+    await h.scheduler.start();
+    const result = await h.scheduler.runNow("ok");
+    expect(result).toEqual({ ok: true });
+    expect(h.injected).toEqual([
+      {
+        type: "command.session.new",
+        clientSessionId: "schedule:ok:1",
+        workingDirectory: await realpath(process.cwd()),
+        workingDirectorySource: "default",
+      },
+      { type: "user.message", clientSessionId: "schedule:ok:1", text: "hello" },
+    ]);
+
+    // A run was registered: its completion signal is honored.
+    h.scheduler.handleOutput({ type: "assistant.message", clientSessionId: "schedule:ok:1", text: "done" });
+    expect(h.delivered).toEqual([
+      { type: "assistant.message", clientSessionId: TARGET, text: '📋 Scheduled task "ok":\ndone' },
+    ]);
+  });
+});
+
+describe("timeout (D5)", () => {
+  it("aborts the synthetic session and delivers a localized timeout notice", async () => {
+    const h = createHarness({
+      tasks: [makeLoaded(makeTask({ name: "slow", target: TARGET, timeoutMs: 100 }))],
+    });
+    await h.scheduler.start();
+    await h.scheduler.runNow("slow");
+
+    await waitFor(() => expect(h.delivered).toHaveLength(1));
+    expect(h.injected[2]).toEqual({ type: "command.session.stop", clientSessionId: "schedule:slow:1" });
+    expect(h.delivered[0]).toEqual({
+      type: "assistant.message",
+      clientSessionId: TARGET,
+      text: '⏰ Scheduled task "slow" timed out.',
+    });
+
+    // The run has ended: a late completion is an orphan and delivers nothing.
+    h.scheduler.handleOutput({ type: "assistant.message", clientSessionId: "schedule:slow:1", text: "too late" });
+    expect(h.delivered).toHaveLength(1);
+    expect(h.logger.info).toHaveBeenCalledWith(expect.stringContaining("orphan"));
+  });
+});
+
+describe("handleOutput (D2)", () => {
+  it("delivers the result with the localized task header and ends the run", async () => {
+    const h = createHarness({ tasks: [makeLoaded(makeTask({ name: "report", target: TARGET }))] });
+    await h.scheduler.start();
+    await h.scheduler.runNow("report");
+
+    h.scheduler.handleOutput({ type: "assistant.message", clientSessionId: "schedule:report:1", text: "line1\nline2" });
+    expect(h.delivered).toEqual([
+      { type: "assistant.message", clientSessionId: TARGET, text: '📋 Scheduled task "report":\nline1\nline2' },
+    ]);
+
+    // The run ended: a second completion is an orphan.
+    h.scheduler.handleOutput({ type: "assistant.message", clientSessionId: "schedule:report:1", text: "again" });
+    expect(h.delivered).toHaveLength(1);
+  });
+
+  it("passes attachments through on the result", async () => {
+    const h = createHarness({ tasks: [makeLoaded(makeTask({ name: "report", target: TARGET }))] });
+    await h.scheduler.start();
+    await h.scheduler.runNow("report");
+
+    const attachments: OutboundAttachment[] = [{ kind: "file", filePath: "/tmp/x.txt", fileName: "x.txt" }];
+    h.scheduler.handleOutput({
+      type: "assistant.message",
+      clientSessionId: "schedule:report:1",
+      text: "see attached",
+      attachments,
+    });
+    expect(h.delivered[0]).toEqual({
+      type: "assistant.message",
+      clientSessionId: TARGET,
+      text: '📋 Scheduled task "report":\nsee attached',
+      attachments,
+    });
+  });
+
+  it("delivers a no-output notice for an empty result instead of silence", async () => {
+    const h = createHarness({ tasks: [makeLoaded(makeTask({ name: "quiet", target: TARGET }))] });
+    await h.scheduler.start();
+    await h.scheduler.runNow("quiet");
+
+    h.scheduler.handleOutput({ type: "assistant.message", clientSessionId: "schedule:quiet:1", text: "   " });
+    expect(h.delivered).toEqual([
+      { type: "assistant.message", clientSessionId: TARGET, text: 'Scheduled task "quiet" finished with no output.' },
+    ]);
+  });
+
+  it("delivers a localized failure notice on a terminal error and ends the run", async () => {
+    const h = createHarness({ tasks: [makeLoaded(makeTask({ name: "report", target: TARGET }))] });
+    await h.scheduler.start();
+    await h.scheduler.runNow("report");
+
+    h.scheduler.handleOutput({ type: "error", clientSessionId: "schedule:report:1", kind: "agent.run.failed", detail: "boom" });
+    expect(h.delivered).toEqual([
+      { type: "assistant.message", clientSessionId: TARGET, text: '❌ Scheduled task "report" failed. boom' },
+    ]);
+
+    // The run ended: a second error is an orphan.
+    h.scheduler.handleOutput({ type: "error", clientSessionId: "schedule:report:1", kind: "agent.run.failed" });
+    expect(h.delivered).toHaveLength(1);
+  });
+
+  it("ignores non-schedule sessions and discards intermediate events", async () => {
+    const h = createHarness({ tasks: [makeLoaded(makeTask({ name: "report", target: TARGET }))] });
+    await h.scheduler.start();
+    await h.scheduler.runNow("report");
+
+    h.scheduler.handleOutput({ type: "assistant.message", clientSessionId: TARGET, text: "user's chat reply" });
+    h.scheduler.handleOutput({ type: "assistant.thinking", clientSessionId: "schedule:report:1", text: "thinking..." });
+    h.scheduler.handleOutput({
+      type: "agent.status.info",
+      clientSessionId: "schedule:report:1",
+      status: { sessionId: "s1" },
+    });
+    expect(h.delivered).toEqual([]);
+
+    // The run is still alive after the discarded intermediate events.
+    h.scheduler.handleOutput({ type: "assistant.message", clientSessionId: "schedule:report:1", text: "final" });
+    expect(h.delivered).toHaveLength(1);
+  });
+
+  it("drops orphan events for schedule sessions with no active run", async () => {
+    const h = createHarness();
+    h.scheduler.handleOutput({ type: "assistant.message", clientSessionId: "schedule:ghost:1", text: "x" });
+    expect(h.delivered).toEqual([]);
+    expect(h.logger.info).toHaveBeenCalledWith(expect.stringContaining("orphan"));
+  });
+});
+
+describe("concurrent runs of the same task (D5)", () => {
+  it("keeps concurrent runs isolated: results are attributed to their own run", async () => {
+    const h = createHarness({ tasks: [makeLoaded(makeTask({ name: "report", target: TARGET }))] });
+    await h.scheduler.start();
+
+    // Two fires of the same task while the first run is still active.
+    expect(await h.scheduler.fire("report")).toEqual({ ok: true });
+    expect(await h.scheduler.fire("report")).toEqual({ ok: true });
+
+    // Each run got its own run-unique synthetic session id.
+    expect(h.injected.map((e) => e.clientSessionId)).toEqual([
+      "schedule:report:1",
+      "schedule:report:1",
+      "schedule:report:2",
+      "schedule:report:2",
+    ]);
+
+    // Run 1 completes: its result is delivered and run 2 is untouched.
+    h.scheduler.handleOutput({ type: "assistant.message", clientSessionId: "schedule:report:1", text: "first" });
+    expect(h.delivered).toEqual([
+      { type: "assistant.message", clientSessionId: TARGET, text: '📋 Scheduled task "report":\nfirst' },
+    ]);
+
+    // A late event from the ended run 1 is an orphan — it can never be
+    // mistaken for run 2's result.
+    h.scheduler.handleOutput({ type: "assistant.message", clientSessionId: "schedule:report:1", text: "stale" });
+    expect(h.delivered).toHaveLength(1);
+    expect(h.logger.info).toHaveBeenCalledWith(expect.stringContaining("orphan"));
+
+    // Run 2 still completes normally with its own result.
+    h.scheduler.handleOutput({ type: "assistant.message", clientSessionId: "schedule:report:2", text: "second" });
+    expect(h.delivered).toHaveLength(2);
+    expect(h.delivered[1]).toEqual({
+      type: "assistant.message",
+      clientSessionId: TARGET,
+      text: '📋 Scheduled task "report":\nsecond',
+    });
+  });
+
+  it("times out only its own run when concurrent runs overlap", async () => {
+    const h = createHarness({
+      tasks: [makeLoaded(makeTask({ name: "report", target: TARGET, timeoutMs: 100 }))],
+    });
+    await h.scheduler.start();
+    expect(await h.scheduler.fire("report")).toEqual({ ok: true });
+    expect(await h.scheduler.fire("report")).toEqual({ ok: true });
+
+    // Run 1 completes normally, clearing only its own timer...
+    h.scheduler.handleOutput({ type: "assistant.message", clientSessionId: "schedule:report:1", text: "ok" });
+    expect(h.delivered).toHaveLength(1);
+
+    // ...so run 2's independent timer still fires: it aborts only run 2's
+    // session and delivers the timeout notice for run 2.
+    await waitFor(() => expect(h.delivered).toHaveLength(2));
+    expect(
+      h.injected.some((e) => e.type === "command.session.stop" && e.clientSessionId === "schedule:report:2"),
+    ).toBe(true);
+    expect(
+      h.injected.some((e) => e.type === "command.session.stop" && e.clientSessionId === "schedule:report:1"),
+    ).toBe(false);
+    expect(h.delivered[1]).toEqual({
+      type: "assistant.message",
+      clientSessionId: TARGET,
+      text: '⏰ Scheduled task "report" timed out.',
+    });
+  });
+});
+
+describe("stop() races (SF-2)", () => {
+  it("registers no run and delivers nothing when stop lands during a fire's load await", async () => {
+    const h = createHarness({ tasks: [makeLoaded(makeTask({ name: "report", target: TARGET }))] });
+    await h.scheduler.start();
+
+    // Slow down every subsequent task load so the fire blocks mid-await.
+    let releaseLoad: () => void = () => {};
+    const loadGate = new Promise<void>((resolve) => {
+      releaseLoad = resolve;
+    });
+    h.loadTasks.mockImplementation(async () => {
+      await loadGate;
+      return [...h.tasks];
+    });
+
+    const firePromise = h.scheduler.fire("report"); // blocks on the load gate
+    await h.scheduler.stop(); // lands while the fire is awaiting
+    releaseLoad();
+
+    const result = await firePromise;
+    expect(result).toEqual({ ok: false, reason: "scheduler is not running" });
+    expect(h.injected).toEqual([]);
+    expect(h.delivered).toEqual([]);
+
+    // Nothing was registered after stop: any event is an orphan.
+    h.scheduler.handleOutput({ type: "assistant.message", clientSessionId: "schedule:report:1", text: "x" });
+    expect(h.delivered).toEqual([]);
+    expect(h.logger.info).toHaveBeenCalledWith(expect.stringContaining("orphan"));
+  });
+
+  it("stop during the inject await leaves no run record and no timer behind", async () => {
+    const h = createHarness({
+      tasks: [makeLoaded(makeTask({ name: "report", target: TARGET, timeoutMs: 50 }))],
+    });
+    await h.scheduler.start();
+
+    // Hold the fire inside its first inject (the run is already registered).
+    let enteredInject: () => void = () => {};
+    const injectEntered = new Promise<void>((resolve) => {
+      enteredInject = resolve;
+    });
+    let releaseInject: () => void = () => {};
+    const injectGate = new Promise<void>((resolve) => {
+      releaseInject = resolve;
+    });
+    h.inject.mockImplementation(async (event: ClientOutputEvent) => {
+      if (event.type === "command.session.new") {
+        enteredInject();
+        await injectGate;
+      }
+    });
+
+    const firePromise = h.scheduler.fire("report");
+    await injectEntered; // run registered, session.new in flight
+    await h.scheduler.stop(); // clears the registered run and its timer
+    releaseInject();
+
+    expect(await firePromise).toEqual({ ok: true });
+
+    // The run's 50 ms timer was cleared by stop(): long past its timeout
+    // there is no stop inject and no timeout notice.
+    await sleep(200);
+    expect(h.injected.filter((e) => e.type === "command.session.stop")).toEqual([]);
+    expect(h.delivered).toEqual([]);
+  });
+});
+
+describe("integration with the real task-file loader", () => {
+  let tempRoot: string;
+  beforeEach(async () => {
+    tempRoot = await mkdtemp(path.join(os.tmpdir(), "scheduler-it-"));
+  });
+  afterEach(async () => {
+    await rm(tempRoot, { recursive: true, force: true });
+  });
+
+  it("loads a task file from disk, fires it on schedule, and delivers the result", async () => {
+    const channelDir = path.join(tempRoot, "test");
+    await mkdir(channelDir, { recursive: true });
+    await writeFile(
+      path.join(channelDir, "report.md"),
+      `---
+schedule: every 30m
+directory: ${tempRoot}
+target: ${TARGET}
+---
+
+summarize the logs
+`,
+      "utf8",
+    );
+
+    const clock = new FakeClock();
+    const injected: ClientOutputEvent[] = [];
+    const delivered: ClientInputEvent[] = [];
+    const inject = vi.fn(async (event: ClientOutputEvent) => {
+      injected.push(event);
+    });
+    const deliver = vi.fn(async (event: ClientInputEvent) => {
+      delivered.push(event);
+    });
+    const logger: MockLogger = { debug: vi.fn(), info: vi.fn(), warn: vi.fn(), error: vi.fn() };
+    const scheduler = new Scheduler({
+      channelName: "test",
+      tickMs: 20,
+      now: () => clock.now(),
+      inject,
+      deliver,
+      t: getTranslator("en-US"),
+      schedulesRoot: tempRoot,
+      logger,
+    });
+    schedulers.push(scheduler);
+
+    await scheduler.start();
+    clock.advance(30 * 60_000);
+    await waitFor(() => expect(injected).toHaveLength(2));
+    expect(injected[0]).toMatchObject({
+      type: "command.session.new",
+      clientSessionId: "schedule:report:1",
+      workingDirectory: await realpath(tempRoot),
+      workingDirectorySource: "default",
+    });
+    expect(injected[1]).toMatchObject({ type: "user.message", text: "summarize the logs" });
+
+    scheduler.handleOutput({ type: "assistant.message", clientSessionId: "schedule:report:1", text: "done!" });
+    expect(delivered).toEqual([
+      { type: "assistant.message", clientSessionId: TARGET, text: '📋 Scheduled task "report":\ndone!' },
+    ]);
+  });
+
+  it("claims a target for an existing task by writing the target line, and rebinds on a second claim", async () => {
+    const channelDir = path.join(tempRoot, "test");
+    await mkdir(channelDir, { recursive: true });
+    await writeFile(
+      path.join(channelDir, "report.md"),
+      "---\nschedule: every 30m\n---\nsummarize\n",
+      "utf8",
+    );
+
+    const clock = new FakeClock();
+    const inject = vi.fn(async () => {});
+    const deliver = vi.fn(async () => {});
+    const logger: MockLogger = { debug: vi.fn(), info: vi.fn(), warn: vi.fn(), error: vi.fn() };
+    const scheduler = new Scheduler({
+      channelName: "test",
+      tickMs: 20,
+      now: () => clock.now(),
+      inject,
+      deliver,
+      t: getTranslator("en-US"),
+      schedulesRoot: tempRoot,
+      logger,
+    });
+    schedulers.push(scheduler);
+
+    await scheduler.start(); // initial tick populates the task table
+
+    expect(await scheduler.claimTarget("report", TARGET)).toEqual({ ok: true });
+    const content = await readFile(path.join(channelDir, "report.md"), "utf8");
+    expect(content).toContain(`target: ${TARGET}`);
+    expect(content.match(/target:/g)).toHaveLength(1);
+
+    // A second claim (rebind) replaces the line.
+    expect(await scheduler.claimTarget("report", "feishu:dm:oc_other")).toEqual({ ok: true });
+    const content2 = await readFile(path.join(channelDir, "report.md"), "utf8");
+    expect(content2).toContain("target: feishu:dm:oc_other");
+    expect(content2.match(/target:/g)).toHaveLength(1);
+    expect(content2).not.toContain(TARGET);
+  });
+
+  it("claimTarget reports task not found without a side effect", async () => {
+    const channelDir = path.join(tempRoot, "test");
+    const clock = new FakeClock();
+    const inject = vi.fn(async () => {});
+    const deliver = vi.fn(async () => {});
+    const logger: MockLogger = { debug: vi.fn(), info: vi.fn(), warn: vi.fn(), error: vi.fn() };
+    const scheduler = new Scheduler({
+      channelName: "test",
+      tickMs: 20,
+      now: () => clock.now(),
+      inject,
+      deliver,
+      t: getTranslator("en-US"),
+      schedulesRoot: tempRoot,
+      logger,
+    });
+    schedulers.push(scheduler);
+
+    await scheduler.start();
+    expect(await scheduler.claimTarget("ghost", TARGET)).toEqual({
+      ok: false,
+      reason: "task not found",
+    });
+    // Nothing new was written to the directory.
+    expect(await readdir(channelDir).catch(() => [] as string[])).toEqual([]);
+  });
+
+  it("claimTarget finds a file written after the last tick via an immediate load", async () => {
+    const channelDir = path.join(tempRoot, "test");
+    await mkdir(channelDir, { recursive: true });
+    const clock = new FakeClock();
+    const inject = vi.fn(async () => {});
+    const deliver = vi.fn(async () => {});
+    const logger: MockLogger = { debug: vi.fn(), info: vi.fn(), warn: vi.fn(), error: vi.fn() };
+    const scheduler = new Scheduler({
+      channelName: "test",
+      tickMs: 20,
+      now: () => clock.now(),
+      inject,
+      deliver,
+      t: getTranslator("en-US"),
+      schedulesRoot: tempRoot,
+      logger,
+    });
+    schedulers.push(scheduler);
+
+    await scheduler.start(); // empty directory at start: task table has nothing
+
+    // The file appears after the last tick...
+    await writeFile(
+      path.join(channelDir, "late.md"),
+      "---\nschedule: daily 09:00\n---\nBody.\n",
+      "utf8",
+    );
+    // ...and claimTarget finds it through the immediate-load fallback.
+    expect(await scheduler.claimTarget("late", TARGET)).toEqual({ ok: true });
+    const content = await readFile(path.join(channelDir, "late.md"), "utf8");
+    expect(content).toContain(`target: ${TARGET}`);
+  });
+});

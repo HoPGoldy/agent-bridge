@@ -2637,4 +2637,390 @@ describe("GatewayCore", () => {
       logSpy.mockRestore();
     }
   });
+
+  it("input() processes synthetic events like adapter messages with schedule bindings kept in memory only", async () => {
+    const imAdapter = new FakeIMAdapter();
+    const store = makeStore();
+    const createdAdapters: FakeAgentAdapter[] = [];
+
+    const agentModule = makeFakeModule({ createdAdapters });
+
+    const core = new GatewayCore({
+      imAdapter,
+      agentModule,
+      agentConfig: {},
+      agentIdleTimeoutMs: 60_000,
+      channelStateStore: store,
+    });
+    running.push(core);
+    await core.start();
+
+    // A fresh task run fires through the public ingress: session.new first
+    // (spec D1), then the prompt as a user.message.
+    await core.input({
+      type: "command.session.new",
+      clientSessionId: "schedule:report:1",
+      workingDirectory: "/tmp/project-a",
+      workingDirectorySource: "default",
+    });
+    await core.input({
+      type: "user.message",
+      clientSessionId: "schedule:report:1",
+      text: "produce the report",
+    });
+
+    await waitFor(() => {
+      expect(createdAdapters).toHaveLength(1);
+      expect(createdAdapters[0]!.inputs).toEqual([{ type: "user.message", text: "produce the report" }]);
+      // The agent session record is still created like for any session ...
+      expect(store.state.agentSessions[createdAdapters[0]!.agentSessionId]).toBeDefined();
+    });
+
+    // ... but the schedule:* binding never reaches the state file (spec D1),
+    // and no "started a new session" confirmation is delivered (T3 review).
+    expect(store.state.bindings).toEqual({});
+    expect(imAdapter.outputs).toEqual([]);
+
+    // SF-1: releasing the runtime (stop path) deletes the ephemeral record, so
+    // a restart leaves no residue in the state file.
+    const agentSessionId = createdAdapters[0]!.agentSessionId;
+    await core.stop();
+    expect(store.state.agentSessions[agentSessionId]).toBeUndefined();
+  });
+
+  it("keeps a first-message schedule:* binding in memory without a state-store write", async () => {
+    const imAdapter = new FakeIMAdapter();
+    const store = makeStore();
+    const createdAdapters: FakeAgentAdapter[] = [];
+
+    const agentModule = makeFakeModule({ createdAdapters });
+
+    const core = new GatewayCore({
+      imAdapter,
+      agentModule,
+      agentConfig: {},
+      agentIdleTimeoutMs: 60_000,
+      channelStateStore: store,
+    });
+    running.push(core);
+    await core.start();
+
+    // A user.message with no prior session.new exercises the first-time
+    // binding path (#bindClientToAgent), which must skip the transaction for
+    // schedule:* ids just like the switch path.
+    await core.input({
+      type: "user.message",
+      clientSessionId: "schedule:report:1",
+      text: "produce the report",
+    });
+
+    await waitFor(() => {
+      expect(createdAdapters).toHaveLength(1);
+      expect(createdAdapters[0]!.inputs).toEqual([{ type: "user.message", text: "produce the report" }]);
+    });
+    expect(store.state.bindings).toEqual({});
+
+    // The session is still routable in memory: a follow-up message reaches
+    // the same adapter.
+    await core.input({
+      type: "user.message",
+      clientSessionId: "schedule:report:1",
+      text: "again",
+    });
+    await waitFor(() => {
+      expect(createdAdapters).toHaveLength(1);
+      expect(createdAdapters[0]!.inputs).toEqual([
+        { type: "user.message", text: "produce the report" },
+        { type: "user.message", text: "again" },
+      ]);
+    });
+  });
+
+  it("deletes the agent session record when a schedule:* runtime is released by the idle timer", async () => {
+    const imAdapter = new FakeIMAdapter();
+    const store = makeStore();
+    const createdAdapters: FakeAgentAdapter[] = [];
+
+    const agentModule = makeFakeModule({ createdAdapters });
+
+    const core = new GatewayCore({
+      imAdapter,
+      agentModule,
+      agentConfig: {},
+      agentIdleTimeoutMs: 10,
+      channelStateStore: store,
+    });
+    running.push(core);
+    await core.start();
+
+    await core.input({
+      type: "user.message",
+      clientSessionId: "schedule:report:1",
+      text: "produce the report",
+    });
+
+    await waitFor(() => {
+      expect(createdAdapters).toHaveLength(1);
+    });
+
+    // #releaseIdleRuntime → #stopRuntime releases the runtime; for an
+    // ephemeral schedule session the record is deleted with it (SF-1), while
+    // the memory-only binding never touches the state file (spec D1).
+    const agentSessionId = createdAdapters[0]!.agentSessionId;
+    await waitFor(() => {
+      expect(store.state.agentSessions[agentSessionId]).toBeUndefined();
+    });
+    expect(store.state.bindings).toEqual({});
+  });
+
+  it("keeps the agent session record of an ordinary session after the runtime is released", async () => {
+    const imAdapter = new FakeIMAdapter();
+    const store = makeStore();
+    const createdAdapters: FakeAgentAdapter[] = [];
+
+    const agentModule = makeFakeModule({ createdAdapters });
+
+    const core = new GatewayCore({
+      imAdapter,
+      agentModule,
+      agentConfig: {},
+      agentIdleTimeoutMs: 60_000,
+      channelStateStore: store,
+    });
+    running.push(core);
+    await core.start();
+
+    await imAdapter.emit({
+      type: "user.message",
+      clientSessionId: "client-1",
+      text: "hello",
+    });
+
+    await waitFor(() => {
+      expect(createdAdapters).toHaveLength(1);
+      expect(store.state.agentSessions[createdAdapters[0]!.agentSessionId]).toBeDefined();
+    });
+
+    const agentSessionId = createdAdapters[0]!.agentSessionId;
+    await core.stop();
+
+    // Ordinary sessions keep their record (and durable binding) across a
+    // stop, so they can be resumed after a restart — the schedule-only
+    // deletion in #stopRuntime must not affect them (SF-1).
+    expect(store.state.agentSessions[agentSessionId]).toBeDefined();
+    expect(store.state.bindings["client-1"]).toBe(agentSessionId);
+  });
+
+  it("rejects input() after stop like a late adapter event", async () => {
+    const imAdapter = new FakeIMAdapter();
+    const createdAdapters: FakeAgentAdapter[] = [];
+
+    const agentModule = makeFakeModule({ createdAdapters });
+
+    const core = new GatewayCore({
+      imAdapter,
+      agentModule,
+      agentConfig: {},
+      agentIdleTimeoutMs: 60_000,
+    });
+    running.push(core);
+    await core.start();
+
+    await core.stop();
+    await core.input({
+      type: "user.message",
+      clientSessionId: "client-1",
+      text: "ignored",
+    });
+    await core.input({
+      type: "command.session.new",
+      clientSessionId: "schedule:report:1",
+      workingDirectory: "/tmp/project-a",
+      workingDirectorySource: "default",
+    });
+
+    // No runtime was created and nothing was delivered: the shutdown guard
+    // applies to the public ingress exactly as it does to adapter messages.
+    expect(createdAdapters).toHaveLength(0);
+    expect(imAdapter.outputs).toEqual([]);
+  });
+
+  it("diverts every schedule:* output event to onScheduleOutput and never to the IM adapter", async () => {
+    const imAdapter = new FakeIMAdapter();
+    const store = makeStore();
+    const createdAdapters: FakeAgentAdapter[] = [];
+    const diverted: ClientInputEvent[] = [];
+    const logSpy = vi.spyOn(console, "log").mockImplementation(() => {});
+
+    try {
+      const agentModule = makeFakeModule({ createdAdapters });
+
+      const core = new GatewayCore({
+        imAdapter,
+        agentModule,
+        agentConfig: {},
+        agentIdleTimeoutMs: 60_000,
+        channelStateStore: store,
+        onScheduleOutput: (event) => {
+          diverted.push(event);
+        },
+      });
+      running.push(core);
+      await core.start();
+
+      // Fire a synthetic run through the public ingress (spec D1).
+      await core.input({
+        type: "command.session.new",
+        clientSessionId: "schedule:report:1",
+        workingDirectory: "/tmp/project-a",
+        workingDirectorySource: "default",
+      });
+      await core.input({
+        type: "user.message",
+        clientSessionId: "schedule:report:1",
+        text: "produce the report",
+      });
+      await waitFor(() => {
+        expect(createdAdapters).toHaveLength(1);
+      });
+      const adapter = createdAdapters[0]!;
+
+      // Progress, completion and terminal-error events are all diverted.
+      await adapter.emit({
+        type: "assistant.thinking",
+        agentSessionId: adapter.agentSessionId,
+        text: "hmm",
+      });
+      await adapter.emit({
+        type: "assistant.tool.running",
+        agentSessionId: adapter.agentSessionId,
+        toolName: "read_file",
+        text: undefined,
+      });
+      await adapter.emitAssistant("the final report");
+      await adapter.emit({
+        type: "error",
+        agentSessionId: adapter.agentSessionId,
+        kind: "agent.run.failed",
+        detail: "boom",
+      });
+
+      await waitFor(() => {
+        expect(diverted).toHaveLength(4);
+      });
+      expect(diverted.map(({ type, clientSessionId }) => ({ type, clientSessionId }))).toEqual([
+        { type: "assistant.thinking", clientSessionId: "schedule:report:1" },
+        { type: "assistant.tool.running", clientSessionId: "schedule:report:1" },
+        { type: "assistant.message", clientSessionId: "schedule:report:1" },
+        { type: "error", clientSessionId: "schedule:report:1" },
+      ]);
+      expect(diverted[2]).toMatchObject({ text: "the final report" });
+      expect(diverted[3]).toMatchObject({ kind: "agent.run.failed", detail: "boom" });
+      // Nothing reached the IM adapter, and the schedule:* binding stayed out
+      // of the state file.
+      expect(imAdapter.outputs).toEqual([]);
+      expect(Object.keys(store.state.bindings).filter((key) => key.startsWith("schedule:"))).toEqual([]);
+
+      // A normal chat session is completely unaffected: same handler, same
+      // delivery path, and its binding is still persisted.
+      await imAdapter.emit({
+        type: "user.message",
+        clientSessionId: "client-1",
+        text: "hello",
+      });
+      await waitFor(() => {
+        expect(createdAdapters).toHaveLength(2);
+      });
+      const chatAdapter = createdAdapters[1]!;
+      await chatAdapter.emitAssistant("a normal reply");
+      await waitFor(() => {
+        expect(imAdapter.outputs.some((event) => event.text === "a normal reply")).toBe(true);
+        expect(store.state.bindings["client-1"]).toBe(chatAdapter.agentSessionId);
+      });
+      expect(diverted.some((event) => event.clientSessionId === "client-1")).toBe(false);
+    } finally {
+      logSpy.mockRestore();
+    }
+  });
+
+  it("falls back to the IM adapter path for schedule:* output when no onScheduleOutput is injected", async () => {
+    const imAdapter = new FakeIMAdapter();
+    const createdAdapters: FakeAgentAdapter[] = [];
+
+    const agentModule = makeFakeModule({ createdAdapters });
+
+    const core = new GatewayCore({
+      imAdapter,
+      agentModule,
+      agentConfig: {},
+      agentIdleTimeoutMs: 60_000,
+    });
+    running.push(core);
+    await core.start();
+
+    await core.input({
+      type: "command.session.new",
+      clientSessionId: "schedule:report:1",
+      workingDirectory: "/tmp/project-a",
+      workingDirectorySource: "default",
+    });
+    await waitFor(() => {
+      expect(createdAdapters).toHaveLength(1);
+    });
+
+    await createdAdapters[0]!.emitAssistant("fallback reply");
+    await waitFor(() => {
+      expect(imAdapter.outputs).toContainEqual({
+        type: "assistant.message",
+        clientSessionId: "schedule:report:1",
+        text: "fallback reply",
+      });
+    });
+  });
+
+  it("swallows a throwing onScheduleOutput without affecting the core", async () => {
+    const imAdapter = new FakeIMAdapter();
+    const createdAdapters: FakeAgentAdapter[] = [];
+    const logSpy = vi.spyOn(console, "error").mockImplementation(() => {});
+
+    try {
+      const agentModule = makeFakeModule({ createdAdapters });
+
+      const core = new GatewayCore({
+        imAdapter,
+        agentModule,
+        agentConfig: {},
+        agentIdleTimeoutMs: 60_000,
+        onScheduleOutput: () => {
+          throw new Error("divert boom");
+        },
+      });
+      running.push(core);
+      await core.start();
+
+      await core.input({
+        type: "command.session.new",
+        clientSessionId: "schedule:report:1",
+        workingDirectory: "/tmp/project-a",
+        workingDirectorySource: "default",
+      });
+      await waitFor(() => {
+        expect(createdAdapters).toHaveLength(1);
+      });
+
+      await createdAdapters[0]!.emitAssistant("boom");
+      await sleep(30);
+
+      // The divert error was logged and swallowed: no unhandled rejection,
+      // nothing delivered to the IM adapter, and the core keeps working.
+      expect(imAdapter.outputs).toEqual([]);
+      expect(logSpy).toHaveBeenCalledWith(
+        expect.stringContaining("[core]"),
+        "failed to divert schedule output for schedule:report:1:",
+        expect.any(Error),
+      );
+    } finally {
+      logSpy.mockRestore();
+    }
+  });
 });

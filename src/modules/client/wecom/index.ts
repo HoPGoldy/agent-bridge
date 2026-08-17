@@ -1,4 +1,5 @@
 import { WecomIMAdapter } from "./adapter/wecom-im-adapter";
+import { parseWecomSessionId } from "./adapter/wecom-session";
 import type { ClientModule, ConfigAdapter, WecomClientConfig } from "../../../types";
 import {
   imClientSessionStateCodec,
@@ -54,8 +55,16 @@ function createWecomConfigCollector(): ConfigAdapter<WecomClientConfig> {
 export const wecomClientModule: ClientModule<WecomClientConfig, ImClientSessionStateV1> = {
   type: "wecom",
   sessionStateCodec: imClientSessionStateCodec,
+  validateSessionId(clientSessionId) {
+    try {
+      parseWecomSessionId(clientSessionId);
+      return true;
+    } catch {
+      return false;
+    }
+  },
   createConfigCollector: createWecomConfigCollector,
-  createClientAdapter({ config, common, sessionState }) {
-    return new WecomIMAdapter(config, undefined, common, sessionState);
+  createClientAdapter({ config, common, sessionState, onScheduleRun, onScheduleHere }) {
+    return new WecomIMAdapter(config, undefined, common, sessionState, onScheduleRun, onScheduleHere);
   },
 };

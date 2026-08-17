@@ -85,6 +85,8 @@ Architecture overview: [`docs/architecture-design.md`](./docs/architecture-desig
 
 Command usage across IM adapters: [`docs/command-system.md`](./docs/command-system.md)
 
+Scheduled tasks (cron-style agent sessions with file-based prompts): [`docs/scheduled-tasks.md`](./docs/scheduled-tasks.md)
+
 ## Start a session in a specific directory
 
 From any IM chat, `/new <path>` starts the next agent session in that directory instead of the bridge's working directory:

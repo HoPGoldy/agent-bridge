@@ -70,8 +70,33 @@ describe("renderStatusMarkdown", () => {
         "- Model: `anthropic/claude-sonnet-4-5`",
         "- Thinking level: `medium`",
         "- Context: `60,000 / 200,000 (30%)`",
+        "- Chat session ID: `client-1`",
       ].join("\n"),
     );
+  });
+
+  it("renders the chat session ID line with a real chat id and Chinese label", () => {
+    const markdown = renderStatusMarkdown(
+      {
+        type: "agent.status.info",
+        clientSessionId: "feishu:dm:oc_6f9dabcd",
+        status: {
+          sessionId: "agent-1",
+          provider: "anthropic",
+          modelId: "claude-sonnet-4-5",
+          thinkingLevel: "medium",
+          context: {
+            tokens: 60000,
+            contextWindow: 200000,
+            percent: 30,
+          },
+        },
+      },
+      getTranslator("zh-CN"),
+    );
+
+    expect(markdown).toContain("- 聊天会话 ID: `feishu:dm:oc_6f9dabcd`");
+    expect(markdown?.split("\n").pop()).toBe("- 聊天会话 ID: `feishu:dm:oc_6f9dabcd`");
   });
 
   it("renders status and model errors in Chinese and includes optional detail", () => {

@@ -4,10 +4,16 @@ import path from "node:path";
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
 import { getTranslator } from "../../../i18n";
 import {
+  formatScheduleHereReply,
+  formatScheduleRunReply,
+  parseSlashCommand,
+  resolveHelpMarkdown,
+  resolveSlashCommandEvent,
+} from "./slash-commands";
+import {
   createInMemoryImClientSessionStateStore,
   type ImClientSessionStateV1,
 } from "./client-session-state";
-import { parseSlashCommand, resolveHelpMarkdown, resolveSlashCommandEvent } from "./slash-commands";
 import type { ClientSessionStateApi } from "../../../types";
 
 describe("resolveHelpMarkdown", () => {
@@ -19,6 +25,16 @@ describe("resolveHelpMarkdown", () => {
     expect(resolveHelpMarkdown("/h", en)).toContain("/stop");
     expect(resolveHelpMarkdown("/H", zh)).toContain("可用命令：");
     expect(resolveHelpMarkdown("/HELP", zh)).toContain("查看这条帮助信息");
+  });
+
+  it("documents /schedule-run and /schedule-here in the help text", () => {
+    const en = getTranslator("en-US");
+    const zh = getTranslator("zh-CN");
+
+    expect(resolveHelpMarkdown("/help", en)).toContain("/schedule-run <task-name>");
+    expect(resolveHelpMarkdown("/help", zh)).toContain("/schedule-run <任务名>");
+    expect(resolveHelpMarkdown("/help", en)).toContain("/schedule-here <task-name>");
+    expect(resolveHelpMarkdown("/help", zh)).toContain("/schedule-here <任务名>");
   });
 
   it("returns null for non-help text", () => {
@@ -221,6 +237,190 @@ describe("parseSlashCommand", () => {
 
   it("returns null for empty text", () => {
     expect(parseSlashCommand("", "session-1")).toBeNull();
+  });
+
+  it("parses /schedule-run <task-name> into an adapter-local schedule.run command", () => {
+    expect(parseSlashCommand("/schedule-run daily-report", "session-1")).toEqual({
+      type: "schedule.run",
+      clientSessionId: "session-1",
+      taskName: "daily-report",
+    });
+    expect(parseSlashCommand("/schedule-run 123", "session-1")).toEqual({
+      type: "schedule.run",
+      clientSessionId: "session-1",
+      taskName: "123",
+    });
+  });
+
+  it("matches /schedule-run case-insensitively and normalizes the task name to lowercase", () => {
+    expect(parseSlashCommand("/Schedule-Run DailyReport", "session-1")).toEqual({
+      type: "schedule.run",
+      clientSessionId: "session-1",
+      taskName: "dailyreport",
+    });
+    expect(parseSlashCommand("/SCHEDULE-RUN my-task", "session-1")).toEqual({
+      type: "schedule.run",
+      clientSessionId: "session-1",
+      taskName: "my-task",
+    });
+  });
+
+  it("returns a usage error for /schedule-run without a task name", () => {
+    expect(parseSlashCommand("/schedule-run", "session-1")).toEqual({
+      type: "schedule.run.usage",
+      clientSessionId: "session-1",
+    });
+    expect(parseSlashCommand("/schedule-run   ", "session-1")).toEqual({
+      type: "schedule.run.usage",
+      clientSessionId: "session-1",
+    });
+  });
+
+  it("returns a usage error for /schedule-run with an invalid task name", () => {
+    for (const bad of ["/schedule-run foo_bar", "/schedule-run a b", "/schedule-run täsk", "/schedule-run x.y"]) {
+      expect(parseSlashCommand(bad, "session-1")).toEqual({
+        type: "schedule.run.usage",
+        clientSessionId: "session-1",
+      });
+    }
+  });
+
+  it("returns null for schedule-run-like text that is not the command", () => {
+    expect(parseSlashCommand("/schedule-runner", "session-1")).toBeNull();
+    expect(parseSlashCommand("hello /schedule-run daily", "session-1")).toBeNull();
+  });
+});
+
+describe("parse /schedule-here", () => {
+  it("parses /schedule-here <task-name> into an adapter-local schedule.here command", () => {
+    expect(parseSlashCommand("/schedule-here daily-report", "session-1")).toEqual({
+      type: "schedule.here",
+      clientSessionId: "session-1",
+      taskName: "daily-report",
+    });
+    expect(parseSlashCommand("/schedule-here 123", "session-1")).toEqual({
+      type: "schedule.here",
+      clientSessionId: "session-1",
+      taskName: "123",
+    });
+  });
+
+  it("matches /schedule-here case-insensitively and normalizes the task name to lowercase", () => {
+    expect(parseSlashCommand("/Schedule-Here DailyReport", "session-1")).toEqual({
+      type: "schedule.here",
+      clientSessionId: "session-1",
+      taskName: "dailyreport",
+    });
+    expect(parseSlashCommand("/SCHEDULE-HERE my-task", "session-1")).toEqual({
+      type: "schedule.here",
+      clientSessionId: "session-1",
+      taskName: "my-task",
+    });
+  });
+
+  it("returns a usage error for /schedule-here without a task name", () => {
+    expect(parseSlashCommand("/schedule-here", "session-1")).toEqual({
+      type: "schedule.here.usage",
+      clientSessionId: "session-1",
+    });
+    expect(parseSlashCommand("/schedule-here   ", "session-1")).toEqual({
+      type: "schedule.here.usage",
+      clientSessionId: "session-1",
+    });
+  });
+
+  it("returns a usage error for /schedule-here with an invalid task name", () => {
+    for (const bad of ["/schedule-here foo_bar", "/schedule-here a b", "/schedule-here täsk", "/schedule-here x.y"]) {
+      expect(parseSlashCommand(bad, "session-1")).toEqual({
+        type: "schedule.here.usage",
+        clientSessionId: "session-1",
+      });
+    }
+  });
+
+  it("returns null for schedule-here-like text that is not the command", () => {
+    expect(parseSlashCommand("/schedule-hereafter", "session-1")).toBeNull();
+    expect(parseSlashCommand("hello /schedule-here daily", "session-1")).toBeNull();
+    expect(parseSlashCommand("/schedule-run here", "session-1")).toEqual({
+      type: "schedule.run",
+      clientSessionId: "session-1",
+      taskName: "here",
+    });
+  });
+});
+
+describe("formatScheduleHereReply", () => {
+  it("renders a localized success reply", () => {
+    const en = getTranslator("en-US");
+    const zh = getTranslator("zh-CN");
+
+    expect(formatScheduleHereReply({ ok: true }, "report", en)).toContain('Task "report"');
+    expect(formatScheduleHereReply({ ok: true }, "report", en)).toContain("this chat");
+    expect(formatScheduleHereReply({ ok: true }, "报告", zh)).toContain('任务 "报告"');
+    expect(formatScheduleHereReply({ ok: true }, "报告", zh)).toContain("本会话");
+  });
+
+  it("maps known failure reasons to localized messages", () => {
+    const en = getTranslator("en-US");
+    const zh = getTranslator("zh-CN");
+
+    expect(formatScheduleHereReply({ ok: false, reason: "task not found" }, "x", en)).toContain(
+      "was not found",
+    );
+    expect(formatScheduleHereReply({ ok: false, reason: "task not found" }, "x", zh)).toContain(
+      "未找到定时任务",
+    );
+  });
+
+  it("falls back to a generic failure message carrying the raw reason", () => {
+    const en = getTranslator("en-US");
+
+    expect(formatScheduleHereReply({ ok: false, reason: "failed to write task file: boom" }, "x", en)).toContain(
+      "failed to write task file: boom",
+    );
+    expect(formatScheduleHereReply({ ok: false, reason: "invalid task name" }, "x", en)).toContain(
+      "invalid task name",
+    );
+  });
+});
+
+describe("formatScheduleRunReply", () => {
+  it("renders a localized success reply", () => {
+    const en = getTranslator("en-US");
+    const zh = getTranslator("zh-CN");
+
+    expect(formatScheduleRunReply({ ok: true }, "report", en)).toContain('Task "report"');
+    expect(formatScheduleRunReply({ ok: true }, "report", en)).toContain("target chat");
+    expect(formatScheduleRunReply({ ok: true }, "报告", zh)).toContain('任务 "报告"');
+  });
+
+  it("maps known failure reasons to localized messages", () => {
+    const en = getTranslator("en-US");
+    const zh = getTranslator("zh-CN");
+
+    expect(formatScheduleRunReply({ ok: false, reason: "task not found" }, "x", en)).toContain(
+      "was not found",
+    );
+    expect(formatScheduleRunReply({ ok: false, reason: "task is disabled" }, "x", en)).toContain(
+      "disabled",
+    );
+    expect(formatScheduleRunReply({ ok: false, reason: "task has no valid target" }, "x", en)).toContain(
+      "target chat",
+    );
+    expect(formatScheduleRunReply({ ok: false, reason: "task not found" }, "x", zh)).toContain(
+      "未找到定时任务",
+    );
+  });
+
+  it("falls back to a generic failure message carrying the raw reason", () => {
+    const en = getTranslator("en-US");
+
+    expect(formatScheduleRunReply({ ok: false, reason: "task body is empty" }, "x", en)).toContain(
+      "task body is empty",
+    );
+    expect(formatScheduleRunReply({ ok: false, reason: "scheduler is not running" }, "x", en)).toContain(
+      "scheduler is not running",
+    );
   });
 });
 

@@ -22,6 +22,9 @@ export const MIGRATED_AGENT_STATE_VERSION = 1 as const;
 
 const STATE_DIR = path.join(os.homedir(), ".config", "agent-bridge", "session-bindings");
 
+/** Root directory of scheduled task files (`schedules/<channel>/<task>.md`, spec D3). */
+export const SCHEDULES_DIR = path.join(os.homedir(), ".config", "agent-bridge", "schedules");
+
 /** Bridge agent session id prefixes for the built-in agent modules. */
 const KNOWN_AGENT_TYPE_PREFIXES: ReadonlyArray<readonly [prefix: string, agentType: string]> = [
   ["pi-coding-agent:", "pi-coding-agent"],

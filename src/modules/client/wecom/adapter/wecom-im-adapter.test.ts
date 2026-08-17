@@ -733,4 +733,238 @@ describe("WecomIMAdapter", () => {
       fakeClientState.sendAttachment.mock.invocationCallOrder[0],
     );
   });
+
+  it("triggers a scheduled task locally on /schedule-run without polluting the core", async () => {
+    const onScheduleRun = vi.fn(async () => ({ ok: true }));
+    const adapter = new WecomIMAdapter(
+      {
+        botId: "bot-id",
+        secret: "secret",
+        requireMentionInGroup: true,
+      },
+      createLogger("test"),
+      undefined,
+      undefined,
+      onScheduleRun,
+    );
+    const onOutput = vi.fn(async (_event: ClientOutputEvent) => {});
+
+    await adapter.start(onOutput);
+    await fakeClientState.onMessage?.({
+      chatId: "user_1",
+      chatType: "dm",
+      messageId: "msg-schedule-run",
+      text: "/schedule-run report",
+      mentionedBot: false,
+    });
+
+    expect(onScheduleRun).toHaveBeenCalledWith("report", "wecom:dm:user_1");
+    expect(onOutput).not.toHaveBeenCalled();
+    expect(fakeClientState.sendText).toHaveBeenCalledWith(
+      "user_1",
+      expect.stringContaining('Task "report"'),
+      "msg-schedule-run",
+    );
+  });
+
+  it("replies with a localized error for an unknown /schedule-run task", async () => {
+    const onScheduleRun = vi.fn(async () => ({ ok: false, reason: "task not found" }));
+    const adapter = new WecomIMAdapter(
+      {
+        botId: "bot-id",
+        secret: "secret",
+        requireMentionInGroup: true,
+      },
+      createLogger("test"),
+      undefined,
+      undefined,
+      onScheduleRun,
+    );
+    const onOutput = vi.fn(async (_event: ClientOutputEvent) => {});
+
+    await adapter.start(onOutput);
+    await fakeClientState.onMessage?.({
+      chatId: "user_1",
+      chatType: "dm",
+      messageId: "msg-schedule-run-missing",
+      text: "/schedule-run missing",
+      mentionedBot: false,
+    });
+
+    expect(onScheduleRun).toHaveBeenCalledWith("missing", "wecom:dm:user_1");
+    expect(onOutput).not.toHaveBeenCalled();
+    expect(fakeClientState.sendText).toHaveBeenCalledWith(
+      "user_1",
+      expect.stringContaining('Scheduled task "missing" was not found.'),
+      "msg-schedule-run-missing",
+    );
+  });
+
+  it("shows a usage reply for a malformed /schedule-run without calling onScheduleRun", async () => {
+    const onScheduleRun = vi.fn(async () => ({ ok: true }));
+    const adapter = new WecomIMAdapter(
+      {
+        botId: "bot-id",
+        secret: "secret",
+        requireMentionInGroup: true,
+      },
+      createLogger("test"),
+      undefined,
+      undefined,
+      onScheduleRun,
+    );
+    const onOutput = vi.fn(async (_event: ClientOutputEvent) => {});
+
+    await adapter.start(onOutput);
+    await fakeClientState.onMessage?.({
+      chatId: "user_1",
+      chatType: "dm",
+      messageId: "msg-schedule-run-bad",
+      text: "/schedule-run",
+      mentionedBot: false,
+    });
+
+    expect(onScheduleRun).not.toHaveBeenCalled();
+    expect(onOutput).not.toHaveBeenCalled();
+    expect(fakeClientState.sendText).toHaveBeenCalledWith(
+      "user_1",
+      expect.stringContaining("Usage: `/schedule-run <task-name>`"),
+      "msg-schedule-run-bad",
+    );
+  });
+
+  it("binds this chat as a task's target locally on /schedule-here without polluting the core", async () => {
+    const onScheduleHere = vi.fn(async () => ({ ok: true }));
+    const adapter = new WecomIMAdapter(
+      {
+        botId: "bot-id",
+        secret: "secret",
+        requireMentionInGroup: true,
+      },
+      createLogger("test"),
+      undefined,
+      undefined,
+      undefined,
+      onScheduleHere,
+    );
+    const onOutput = vi.fn(async (_event: ClientOutputEvent) => {});
+
+    await adapter.start(onOutput);
+    await fakeClientState.onMessage?.({
+      chatId: "user_1",
+      chatType: "dm",
+      messageId: "msg-schedule-here",
+      text: "/schedule-here report",
+      mentionedBot: false,
+    });
+
+    expect(onScheduleHere).toHaveBeenCalledWith("report", "wecom:dm:user_1");
+    expect(onOutput).not.toHaveBeenCalled();
+    expect(fakeClientState.sendText).toHaveBeenCalledWith(
+      "user_1",
+      expect.stringContaining('Task "report"'),
+      "msg-schedule-here",
+    );
+    expect(fakeClientState.sendText.mock.calls[0]?.[1]).toContain("send its results to this chat");
+  });
+
+  it("replies with a localized error for an unknown /schedule-here task", async () => {
+    const onScheduleHere = vi.fn(async () => ({ ok: false, reason: "task not found" }));
+    const adapter = new WecomIMAdapter(
+      {
+        botId: "bot-id",
+        secret: "secret",
+        requireMentionInGroup: true,
+      },
+      createLogger("test"),
+      undefined,
+      undefined,
+      undefined,
+      onScheduleHere,
+    );
+    const onOutput = vi.fn(async (_event: ClientOutputEvent) => {});
+
+    await adapter.start(onOutput);
+    await fakeClientState.onMessage?.({
+      chatId: "user_1",
+      chatType: "dm",
+      messageId: "msg-schedule-here-missing",
+      text: "/schedule-here missing",
+      mentionedBot: false,
+    });
+
+    expect(onScheduleHere).toHaveBeenCalledWith("missing", "wecom:dm:user_1");
+    expect(onOutput).not.toHaveBeenCalled();
+    expect(fakeClientState.sendText).toHaveBeenCalledWith(
+      "user_1",
+      expect.stringContaining('Scheduled task "missing" was not found.'),
+      "msg-schedule-here-missing",
+    );
+  });
+
+  it("shows a usage reply for a malformed /schedule-here without calling onScheduleHere", async () => {
+    const onScheduleHere = vi.fn(async () => ({ ok: true }));
+    const adapter = new WecomIMAdapter(
+      {
+        botId: "bot-id",
+        secret: "secret",
+        requireMentionInGroup: true,
+      },
+      createLogger("test"),
+      undefined,
+      undefined,
+      undefined,
+      onScheduleHere,
+    );
+    const onOutput = vi.fn(async (_event: ClientOutputEvent) => {});
+
+    await adapter.start(onOutput);
+    await fakeClientState.onMessage?.({
+      chatId: "user_1",
+      chatType: "dm",
+      messageId: "msg-schedule-here-bad",
+      text: "/schedule-here",
+      mentionedBot: false,
+    });
+
+    expect(onScheduleHere).not.toHaveBeenCalled();
+    expect(onOutput).not.toHaveBeenCalled();
+    expect(fakeClientState.sendText).toHaveBeenCalledWith(
+      "user_1",
+      expect.stringContaining("Usage: `/schedule-here <task-name>`"),
+      "msg-schedule-here-bad",
+    );
+  });
+
+  it("degrades gracefully when onScheduleHere is absent: logs and replies nothing", async () => {
+    const warnSpy = vi.spyOn(console, "warn").mockImplementation(() => {});
+    try {
+      const adapter = new WecomIMAdapter(
+        {
+          botId: "bot-id",
+          secret: "secret",
+          requireMentionInGroup: true,
+        },
+        createLogger("test"),
+      );
+      const onOutput = vi.fn(async (_event: ClientOutputEvent) => {});
+
+      await adapter.start(onOutput);
+      await fakeClientState.onMessage?.({
+        chatId: "user_1",
+        chatType: "dm",
+        messageId: "msg-schedule-here-no-bridge",
+        text: "/schedule-here report",
+        mentionedBot: false,
+      });
+
+      expect(onOutput).not.toHaveBeenCalled();
+      expect(fakeClientState.sendText).not.toHaveBeenCalled();
+      expect(warnSpy.mock.calls.some((call) =>
+        call.some((arg) => typeof arg === "string" && arg.includes("onScheduleHere is not injected")),
+      )).toBe(true);
+    } finally {
+      warnSpy.mockRestore();
+    }
+  });
 });

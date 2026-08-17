@@ -4,13 +4,25 @@ import type {
   ClientOutputEvent,
   ClientSessionStateStore,
   IMAdapter,
+  OnScheduleHere,
+  OnScheduleRun,
   WeixinClientConfig,
 } from "../../../../types";
 import { formatSendFailureNotice, getTranslatorForCommon, type Translator } from "../../../../i18n";
 import { createLogger, type Logger } from "../../../../core/logger";
 import { isCompletedCommandResponse, isTerminalAgentError } from "../../utils/error-events";
 import { ProgressRenderer } from "../../utils/progress-renderer";
-import { parseSlashCommand, resolveHelpMarkdown, resolveSlashCommandEvent } from "../../utils/slash-commands";
+import {
+  formatScheduleHereReply,
+  formatScheduleRunReply,
+  parseSlashCommand,
+  resolveHelpMarkdown,
+  resolveSlashCommandEvent,
+  type ScheduleHereCommand,
+  type ScheduleHereUsageCommand,
+  type ScheduleRunCommand,
+  type ScheduleRunUsageCommand,
+} from "../../utils/slash-commands";
 import {
   createInMemoryImClientSessionStateStore,
   type ImClientSessionStateV1,
@@ -75,6 +87,8 @@ export class WeixinIMAdapter implements IMAdapter {
   readonly #logger: Logger;
   readonly #t: Translator;
   readonly #sessionState: ClientSessionStateStore<ImClientSessionStateV1>;
+  readonly #onScheduleRun: OnScheduleRun | undefined;
+  readonly #onScheduleHere: OnScheduleHere | undefined;
   #onOutput: ((event: ClientOutputEvent) => Promise<void> | void) | null = null;
   #client: WeixinClient | null = null;
   #egressQueue: EgressEvent[] = [];
@@ -93,11 +107,15 @@ export class WeixinIMAdapter implements IMAdapter {
     sessionState: ClientSessionStateStore<ImClientSessionStateV1> = createInMemoryImClientSessionStateStore(
       "weixin",
     ),
+    onScheduleRun?: OnScheduleRun,
+    onScheduleHere?: OnScheduleHere,
   ) {
     this.#config = config;
     this.#logger = logger;
     this.#t = getTranslatorForCommon(common);
     this.#sessionState = sessionState;
+    this.#onScheduleRun = onScheduleRun;
+    this.#onScheduleHere = onScheduleHere;
   }
 
   async start(onOutput: (event: ClientOutputEvent) => Promise<void> | void): Promise<void> {
@@ -139,6 +157,18 @@ export class WeixinIMAdapter implements IMAdapter {
 
       const parsedCommand = parseSlashCommand(normalizedText, clientSessionId);
       if (parsedCommand) {
+        if (parsedCommand.type === "schedule.run" || parsedCommand.type === "schedule.run.usage") {
+          // Adapter-local manual trigger (spec D7a): never reaches the core.
+          this.#logger.info(`received local schedule-run command ${normalizedText} (session=${clientSessionId})`);
+          await this.#handleScheduleRun(parsedCommand, chatId, clientSessionId);
+          return;
+        }
+        if (parsedCommand.type === "schedule.here" || parsedCommand.type === "schedule.here.usage") {
+          // Adapter-local target binding (spec D7): never reaches the core.
+          this.#logger.info(`received local schedule-here command ${normalizedText} (session=${clientSessionId})`);
+          await this.#handleScheduleHere(parsedCommand, chatId, clientSessionId);
+          return;
+        }
         const resolved = await resolveSlashCommandEvent(parsedCommand, {
           sessionState: this.#sessionState.session(clientSessionId),
           onError: (error) =>
@@ -472,5 +502,75 @@ export class WeixinIMAdapter implements IMAdapter {
 
   #isStaleSessionError(error: unknown): boolean {
     return error instanceof Error && error.name === "WeixinStaleSessionError";
+  }
+
+  async #handleScheduleRun(
+    command: ScheduleRunCommand | ScheduleRunUsageCommand,
+    chatId: string,
+    clientSessionId: string,
+  ): Promise<void> {
+    const cleanup = async (): Promise<void> => {
+      this.#stopProgressTimer(clientSessionId);
+      this.#stopTypingHeartbeat(clientSessionId);
+      await this.#client?.stopTyping(chatId);
+    };
+
+    if (command.type === "schedule.run.usage") {
+      await this.#client?.sendText(chatId, this.#t("client.scheduleRunUsage"));
+      await cleanup();
+      return;
+    }
+
+    if (!this.#onScheduleRun) {
+      // The runner always injects the bridge (spec D7a); degrade gracefully
+      // if it is ever absent: log, and reply nothing.
+      this.#logger.warn(
+        `onScheduleRun is not injected; dropping /schedule-run for task "${command.taskName}" (session=${command.clientSessionId})`,
+      );
+      await cleanup();
+      return;
+    }
+
+    const result = await this.#onScheduleRun(command.taskName, command.clientSessionId);
+    await this.#client?.sendText(
+      chatId,
+      formatScheduleRunReply(result, command.taskName, this.#t),
+    );
+    await cleanup();
+  }
+
+  async #handleScheduleHere(
+    command: ScheduleHereCommand | ScheduleHereUsageCommand,
+    chatId: string,
+    clientSessionId: string,
+  ): Promise<void> {
+    const cleanup = async (): Promise<void> => {
+      this.#stopProgressTimer(clientSessionId);
+      this.#stopTypingHeartbeat(clientSessionId);
+      await this.#client?.stopTyping(chatId);
+    };
+
+    if (command.type === "schedule.here.usage") {
+      await this.#client?.sendText(chatId, this.#t("client.scheduleHereUsage"));
+      await cleanup();
+      return;
+    }
+
+    if (!this.#onScheduleHere) {
+      // The runner always injects the bridge (spec D7); degrade gracefully
+      // if it is ever absent: log, and reply nothing.
+      this.#logger.warn(
+        `onScheduleHere is not injected; dropping /schedule-here for task "${command.taskName}" (session=${command.clientSessionId})`,
+      );
+      await cleanup();
+      return;
+    }
+
+    const result = await this.#onScheduleHere(command.taskName, command.clientSessionId);
+    await this.#client?.sendText(
+      chatId,
+      formatScheduleHereReply(result, command.taskName, this.#t),
+    );
+    await cleanup();
   }
 }

@@ -60,6 +60,7 @@ export function renderStatusMarkdown(event: ClientInputEvent, t: Translator): st
       `- ${t("client.statusModel")}: ${formatModel(event.status, t)}`,
       `- ${t("client.statusThinkingLevel")}: ${event.status.thinkingLevel ? `\`${event.status.thinkingLevel}\`` : t("client.statusUnavailableValue")}`,
       `- ${t("client.statusContext")}: ${formatContext(event.status, t)}`,
+      `- ${t("client.statusChatSessionId")}: \`${event.clientSessionId}\``,
     ].join("\n");
   }
 

@@ -3,6 +3,8 @@ import type {
   ClientOutputEvent,
   ClientSessionStateApi,
   ClientWorkingDirectorySource,
+  ScheduleHereResult,
+  ScheduleRunResult,
 } from "../../../types";
 import type { ImClientSessionStateV1 } from "./client-session-state";
 import { validateWorkingDirectory } from "./working-directory";
@@ -63,6 +65,91 @@ function parseNewCommand(text: string, clientSessionId: string): ParsedSlashComm
 }
 
 /**
+ * Adapter-local `/schedule-run <task-name>` command (spec D7a): the adapter
+ * triggers the named task through the injected `onScheduleRun` bridge and
+ * replies with a localized result. Never reaches the core.
+ */
+export interface ScheduleRunCommand {
+  type: "schedule.run";
+  clientSessionId: string;
+  taskName: string;
+}
+
+/**
+ * Adapter-local usage error for a malformed `/schedule-run` (spec D7a): the
+ * task name is missing or does not match `[a-z0-9-]+`. The adapter replies
+ * with a localized usage hint; nothing reaches the core.
+ */
+export interface ScheduleRunUsageCommand {
+  type: "schedule.run.usage";
+  clientSessionId: string;
+}
+
+/** Task names are lowercased slugs matching the task file names (spec D3). */
+const TASK_NAME_RE = /^[a-z0-9-]+$/i;
+
+function parseScheduleRunCommand(
+  text: string,
+  clientSessionId: string,
+): ScheduleRunCommand | ScheduleRunUsageCommand | null {
+  const match = text.match(/^\/schedule-run(?:\s+(.*))?$/i);
+  if (!match) {
+    return null;
+  }
+
+  const raw = match[1]?.trim() ?? "";
+  if (!TASK_NAME_RE.test(raw)) {
+    return { type: "schedule.run.usage", clientSessionId };
+  }
+
+  // Task files are lowercased slugs; normalize so `/schedule-run DailyReport`
+  // triggers the `dailyreport` task.
+  return { type: "schedule.run", clientSessionId, taskName: raw.toLowerCase() };
+}
+
+/**
+ * Adapter-local `/schedule-here <task-name>` command (spec D7): the adapter
+ * binds this chat as the task's delivery target through the injected
+ * `onScheduleHere` bridge and replies with a localized result. This chat's
+ * `clientSessionId` is written into the task file's `target` line — a
+ * one-line shortcut for the manual `/st` copy-paste. Never reaches the core.
+ */
+export interface ScheduleHereCommand {
+  type: "schedule.here";
+  clientSessionId: string;
+  taskName: string;
+}
+
+/**
+ * Adapter-local usage error for a malformed `/schedule-here` (spec D7): the
+ * task name is missing or does not match `[a-z0-9-]+`. The adapter replies
+ * with a localized usage hint; nothing reaches the core.
+ */
+export interface ScheduleHereUsageCommand {
+  type: "schedule.here.usage";
+  clientSessionId: string;
+}
+
+function parseScheduleHereCommand(
+  text: string,
+  clientSessionId: string,
+): ScheduleHereCommand | ScheduleHereUsageCommand | null {
+  const match = text.match(/^\/schedule-here(?:\s+(.*))?$/i);
+  if (!match) {
+    return null;
+  }
+
+  const raw = match[1]?.trim() ?? "";
+  if (!TASK_NAME_RE.test(raw)) {
+    return { type: "schedule.here.usage", clientSessionId };
+  }
+
+  // Task files are lowercased slugs; normalize so `/schedule-here DailyReport`
+  // binds the `dailyreport` task.
+  return { type: "schedule.here", clientSessionId, taskName: raw.toLowerCase() };
+}
+
+/**
  * Result of syntactic slash-command parsing. Identical to
  * {@link ClientOutputEvent} except that a parsed `command.session.new` still
  * has an optional, unresolved `workingDirectory` (exactly what the user
@@ -79,11 +166,36 @@ export type ParsedSlashCommand =
 
 /**
  * Parses a trimmed inbound text as one of the standard agent-bridge slash
- * commands (`/new [path]`, `/n [path]`, `/compact`, `/c`, `/stop`, `/s`, `/status`, `/st`, `/model`, `/m`) and returns the
- * corresponding {@link ParsedSlashCommand}, or `null` if `text` is not a recognized
- * command and should be treated as a regular user message.
+ * commands (`/new [path]`, `/n [path]`, `/compact`, `/c`, `/stop`, `/s`, `/status`, `/st`, `/model`, `/m`, `/schedule-run <name>`, `/schedule-here <name>`) and returns the
+ * corresponding {@link ParsedSlashCommand} (or an adapter-local
+ * {@link ScheduleRunCommand}/{@link ScheduleRunUsageCommand}/
+ * {@link ScheduleHereCommand}/{@link ScheduleHereUsageCommand}), or `null` if
+ * `text` is not a recognized command and should be treated as a regular user
+ * message.
  */
-export function parseSlashCommand(text: string, clientSessionId: string): ParsedSlashCommand | null {
+export function parseSlashCommand(
+  text: string,
+  clientSessionId: string,
+):
+  | ParsedSlashCommand
+  | ScheduleRunCommand
+  | ScheduleRunUsageCommand
+  | ScheduleHereCommand
+  | ScheduleHereUsageCommand
+  | null {
+  // `/schedule-run` and `/schedule-here` are handled entirely by the adapter
+  // (spec D7a/D7): they never go through `resolveSlashCommandEvent` nor reach
+  // the core.
+  const scheduleRunCommand = parseScheduleRunCommand(text, clientSessionId);
+  if (scheduleRunCommand) {
+    return scheduleRunCommand;
+  }
+
+  const scheduleHereCommand = parseScheduleHereCommand(text, clientSessionId);
+  if (scheduleHereCommand) {
+    return scheduleHereCommand;
+  }
+
   const newCommand = parseNewCommand(text, clientSessionId);
   if (newCommand) {
     return newCommand;
@@ -206,6 +318,56 @@ async function resolveNewCommandEvent(
   // Nothing remembered: fall back to the bridge process cwd. This is a
   // trusted client-side fallback, never validated or allowlist-checked.
   return build(deps.cwd ?? process.cwd(), "default");
+}
+
+/**
+ * Localized reply text for a `/schedule-run` outcome (spec D7a). Maps the
+ * scheduler's caller-facing English reasons (see the `runNow`/`fire` path in
+ * the scheduler) to localized messages; unrecognized reasons fall back to a
+ * generic failure message carrying the raw reason.
+ */
+export function formatScheduleRunReply(
+  result: ScheduleRunResult,
+  taskName: string,
+  t: Translator,
+): string {
+  if (result.ok) {
+    return t("client.scheduleRunTriggered", { name: taskName });
+  }
+
+  switch (result.reason) {
+    case "task not found":
+      return t("client.scheduleRunTaskNotFound", { name: taskName });
+    case "task is disabled":
+      return t("client.scheduleRunTaskDisabled", { name: taskName });
+    case "task has no valid target":
+      return t("client.scheduleRunNoTarget", { name: taskName });
+    default:
+      return t("client.scheduleRunFailed", { name: taskName, reason: result.reason });
+  }
+}
+
+/**
+ * Localized reply text for a `/schedule-here` outcome (spec D7). Maps the
+ * scheduler's caller-facing English reasons (see the `claimTarget`/`setTask-
+ * Target` path) to localized messages; unrecognized reasons fall back to a
+ * generic failure message carrying the raw reason.
+ */
+export function formatScheduleHereReply(
+  result: ScheduleHereResult,
+  taskName: string,
+  t: Translator,
+): string {
+  if (result.ok) {
+    return t("client.scheduleHereBound", { name: taskName });
+  }
+
+  switch (result.reason) {
+    case "task not found":
+      return t("client.scheduleHereTaskNotFound", { name: taskName });
+    default:
+      return t("client.scheduleHereFailed", { name: taskName, reason: result.reason });
+  }
 }
 
 /**

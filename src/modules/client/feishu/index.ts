@@ -1,4 +1,5 @@
 import { FeishuIMAdapter } from "./adapter/feishu-im-adapter";
+import { parseFeishuSessionId } from "./adapter/feishu-session";
 import type { ClientModule, ConfigAdapter, FeishuClientConfig } from "../../../types";
 import {
   imClientSessionStateCodec,
@@ -58,8 +59,16 @@ function createFeishuConfigCollector(): ConfigAdapter<FeishuClientConfig> {
 export const feishuClientModule: ClientModule<FeishuClientConfig, ImClientSessionStateV1> = {
   type: "feishu",
   sessionStateCodec: imClientSessionStateCodec,
+  validateSessionId(clientSessionId) {
+    try {
+      parseFeishuSessionId(clientSessionId);
+      return true;
+    } catch {
+      return false;
+    }
+  },
   createConfigCollector: createFeishuConfigCollector,
-  createClientAdapter({ config, common, sessionState }) {
-    return new FeishuIMAdapter(config, undefined, common, sessionState);
+  createClientAdapter({ config, common, sessionState, onScheduleRun, onScheduleHere }) {
+    return new FeishuIMAdapter(config, undefined, common, sessionState, onScheduleRun, onScheduleHere);
   },
 };

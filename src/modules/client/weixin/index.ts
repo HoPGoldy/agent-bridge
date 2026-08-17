@@ -1,4 +1,5 @@
 import { WeixinIMAdapter } from "./adapter/weixin-im-adapter";
+import { parseWeixinSessionId } from "./adapter/weixin-session";
 import { loginWithWeixinQr } from "./adapter/weixin-qr-login";
 import type { ClientModule, ConfigAdapter, WeixinClientConfig } from "../../../types";
 import {
@@ -50,8 +51,16 @@ function createWeixinConfigCollector(): ConfigAdapter<WeixinClientConfig> {
 export const weixinClientModule: ClientModule<WeixinClientConfig, ImClientSessionStateV1> = {
   type: "weixin",
   sessionStateCodec: imClientSessionStateCodec,
+  validateSessionId(clientSessionId) {
+    try {
+      parseWeixinSessionId(clientSessionId);
+      return true;
+    } catch {
+      return false;
+    }
+  },
   createConfigCollector: createWeixinConfigCollector,
-  createClientAdapter({ config, common, sessionState }) {
-    return new WeixinIMAdapter(config, undefined, common, sessionState);
+  createClientAdapter({ config, common, sessionState, onScheduleRun, onScheduleHere }) {
+    return new WeixinIMAdapter(config, undefined, common, sessionState, onScheduleRun, onScheduleHere);
   },
 };

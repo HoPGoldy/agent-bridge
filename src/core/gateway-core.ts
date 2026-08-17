@@ -11,8 +11,29 @@ import type {
 } from "../types";
 import { createAgentSessionStateRegistry } from "../config/agent-session-state";
 import { createInMemoryChannelStateStore } from "../config/channel-state";
+import { SYNTHETIC_SESSION_PREFIX } from "../modules/schedule/scheduler";
 import { getTranslatorForCommon, type Translator } from "../i18n";
 import { createLogger, type Logger } from "./logger";
+
+/**
+ * Constructor options for `GatewayCore`: the shared `GatewayCoreOptions` plus
+ * the optional schedule-output divert callback (spec D2). Declared here rather
+ * than in `types.ts` because the divert target is a core-internal mechanism —
+ * the channel runner wires it to the per-channel scheduler. The callback type
+ * is structural; the only scheduler import is the shared `SYNTHETIC_SESSION_PREFIX`
+ * constant, so core and scheduler can never drift on the `schedule:` prefix.
+ */
+export interface GatewayCoreConstructorOptions extends GatewayCoreOptions {
+  /**
+   * Optional divert target for agent output of `schedule:*` sessions (spec
+   * D2). When provided, every output event whose resolved clientSessionId
+   * starts with `schedule:` is handed to this callback (with the replaced
+   * clientSessionId) instead of being delivered through the IM adapter. A
+   * throwing callback is logged and swallowed; without the callback
+   * `schedule:*` output falls back to the normal adapter path (defensive).
+   */
+  onScheduleOutput?: (event: ClientInputEvent) => void | Promise<void>;
+}
 
 interface AgentRuntime {
   agentSessionId: string;
@@ -33,6 +54,11 @@ export class GatewayCore {
   readonly #common?: ChannelCommonContext;
   readonly #t: Translator;
   readonly #logger: Logger = createLogger("core");
+  /**
+   * Optional divert target for `schedule:*` agent output (spec D2), wired by
+   * the channel runner to the scheduler's `handleOutput`.
+   */
+  readonly #onScheduleOutput?: (event: ClientInputEvent) => void | Promise<void>;
   /** Pure routing map: client session id -> agent session id. */
   readonly #clientToAgentSession = new Map<string, string>();
   readonly #agentRuntimes = new Map<string, AgentRuntime>();
@@ -54,7 +80,8 @@ export class GatewayCore {
     channelStateStore,
     agentSessionStateRegistry,
     common,
-  }: GatewayCoreOptions) {
+    onScheduleOutput,
+  }: GatewayCoreConstructorOptions) {
     this.#imAdapter = imAdapter;
     this.#agentModule = agentModule;
     this.#agentConfig = agentConfig;
@@ -65,6 +92,7 @@ export class GatewayCore {
       agentSessionStateRegistry ?? createAgentSessionStateRegistry(this.#channelStateStore);
     this.#common = common;
     this.#t = getTranslatorForCommon(common);
+    this.#onScheduleOutput = onScheduleOutput;
   }
 
   async start(): Promise<void> {
@@ -77,27 +105,50 @@ export class GatewayCore {
     }
 
     await this.#imAdapter.start(async (event) => {
-      // Reject new client output once stop has begun: the adapter may still
-      // deliver events while it is shutting down, and those must not start
-      // any new work after we have decided to stop.
-      if (!this.#started) return;
-
-      // The handled promise never rejects, so a failing handler can never
-      // produce an unhandled rejection; the adapter still awaits it so per-
-      // channel backpressure and ordering are preserved.
-      const handled = this.#handleClientOutput(event).then(
-        () => undefined,
-        (error: unknown) => {
-          this.#logger.error("failed to process client output event:", error);
-        },
-      );
-      this.#inFlightHandlers.add(handled);
-      try {
-        await handled;
-      } finally {
-        this.#inFlightHandlers.delete(handled);
-      }
+      await this.#processClientOutput(event);
     });
+  }
+
+  /**
+   * Public ingress for synthetic client-output events (spec D2): the
+   * scheduler fires task runs by injecting `command.session.new` and
+   * `user.message` here. Events travel the exact same path as
+   * adapter-delivered messages — the same shutdown guard, error capture and
+   * in-flight tracking — so task sessions behave like ordinary sessions in
+   * every respect except the `schedule:*` divert below.
+   */
+  async input(event: ClientOutputEvent): Promise<void> {
+    await this.#processClientOutput(event);
+  }
+
+  /**
+   * Shared client-output ingress used by both the adapter callback in
+   * `start()` and the public `input()`: reject once stop has begun, track
+   * every handler until it settles, and never let a failing handler produce
+   * an unhandled rejection. A single implementation keeps the two entry
+   * points from drifting apart.
+   */
+  async #processClientOutput(event: ClientOutputEvent): Promise<void> {
+    // Reject new client output once stop has begun: the adapter may still
+    // deliver events while it is shutting down, and those must not start
+    // any new work after we have decided to stop.
+    if (!this.#started) return;
+
+    // The handled promise never rejects, so a failing handler can never
+    // produce an unhandled rejection; the adapter still awaits it so per-
+    // channel backpressure and ordering are preserved.
+    const handled = this.#handleClientOutput(event).then(
+      () => undefined,
+      (error: unknown) => {
+        this.#logger.error("failed to process client output event:", error);
+      },
+    );
+    this.#inFlightHandlers.add(handled);
+    try {
+      await handled;
+    } finally {
+      this.#inFlightHandlers.delete(handled);
+    }
   }
 
   async stop(): Promise<void> {
@@ -425,11 +476,15 @@ export class GatewayCore {
       }
     }
 
-    await this.#deliverClientInput({
-      type: "assistant.message",
-      clientSessionId,
-      text: this.#t("gateway.startedNewSession", { workingDirectory }),
-    });
+    if (!this.#isSyntheticScheduleSession(clientSessionId)) {
+      // Spec D1: no "started a new session" confirmation for ephemeral task
+      // runs — it would be mistaken for the task result (T3 review).
+      await this.#deliverClientInput({
+        type: "assistant.message",
+        clientSessionId,
+        text: this.#t("gateway.startedNewSession", { workingDirectory }),
+      });
+    }
   }
 
   async #deliverClientInput(event: ClientInputEvent): Promise<void> {
@@ -626,6 +681,15 @@ export class GatewayCore {
    * caller can clean up the new runtime.
    */
   async #bindClientToAgent(clientSessionId: string, agentSessionId: string): Promise<void> {
+    if (this.#isSyntheticScheduleSession(clientSessionId)) {
+      // Spec D1: schedule:* bindings live in memory only. The run-unique id
+      // would grow the state file forever and ephemeral runs have no resume
+      // semantics; a restart dropping the binding matches the "runs are lost
+      // on restart" expectation. There is no durable commit here, so the
+      // caller's rollback path can never trigger.
+      this.#clientToAgentSession.set(clientSessionId, agentSessionId);
+      return;
+    }
     const proposed = new Map(this.#clientToAgentSession);
     proposed.set(clientSessionId, agentSessionId);
     await this.#channelStateStore.transaction((draft) => {
@@ -648,6 +712,11 @@ export class GatewayCore {
     newAgentSessionId: string,
     previousAgentSessionId?: string,
   ): Promise<void> {
+    if (this.#isSyntheticScheduleSession(clientSessionId)) {
+      // Spec D1: schedule:* bindings are memory-only (see #bindClientToAgent).
+      this.#clientToAgentSession.set(clientSessionId, newAgentSessionId);
+      return;
+    }
     const proposed = new Map(this.#clientToAgentSession);
     proposed.set(clientSessionId, newAgentSessionId);
     const snapshot = Object.fromEntries(proposed);
@@ -730,6 +799,15 @@ export class GatewayCore {
 
     this.#touchRuntime(runtime);
 
+    if (this.#isSyntheticScheduleSession(clientSessionId) && this.#onScheduleOutput !== undefined) {
+      // Spec D2 divert: a `schedule:*` session has no real chat behind it and
+      // its output is not streamed into any chat — every event (including the
+      // `assistant.message` completion signal) goes to the injected callback
+      // (the scheduler's handleOutput) instead of the IM adapter.
+      await this.#divertScheduleOutput(event, clientSessionId);
+      return;
+    }
+
     if (this.#isToolRelatedEvent(event)) {
       this.#logger.info("forwarding tool event from agent", {
         type: event.type,
@@ -756,6 +834,39 @@ export class GatewayCore {
       ...event,
       clientSessionId,
     });
+  }
+
+  /**
+   * Spec D2: hands an agent-output event for a `schedule:*` session to the
+   * injected divert callback with the resolved clientSessionId substituted
+   * (the `assistant.message` branch mirrors the normal delivery path so the
+   * scheduler receives exactly what an adapter would have). A throwing
+   * callback is logged and swallowed — it must never surface through the
+   * core's ingress. Only called when a callback was injected; without one
+   * `schedule:*` output falls back to the normal adapter path.
+   */
+  async #divertScheduleOutput(event: AgentOutputEvent, clientSessionId: string): Promise<void> {
+    const onScheduleOutput = this.#onScheduleOutput;
+    if (onScheduleOutput === undefined) return;
+    const diverted: ClientInputEvent =
+      event.type === "assistant.message"
+        ? {
+            type: "assistant.message",
+            clientSessionId,
+            text: event.text,
+            attachments: event.attachments,
+          }
+        : { ...event, clientSessionId };
+    try {
+      await onScheduleOutput(diverted);
+    } catch (error) {
+      this.#logger.error(`failed to divert schedule output for ${clientSessionId}:`, error);
+    }
+  }
+
+  /** Spec D1: synthetic task-run sessions use `schedule:<task>:<run-seq>` ids. */
+  #isSyntheticScheduleSession(clientSessionId: string): boolean {
+    return clientSessionId.startsWith(SYNTHETIC_SESSION_PREFIX);
   }
 
   #isToolRelatedEvent(
@@ -829,12 +940,14 @@ export class GatewayCore {
 
   /**
    * Stops the adapter, removes the runtime and revokes every live state handle
-   * for the session. The persisted record and binding are left intact, so the
-   * session can be resumed later (idle release, bridge stop). The runtime is
-   * always removed from the map and the state handle always revoked, even when
-   * `isBusy()`, `abort()` or `adapter.stop()` throws, so a stale adapter can
-   * never write its state again; the original error still propagates to the
-   * caller.
+   * for the session. The persisted record and binding are left intact for
+   * ordinary sessions, so they can be resumed later (idle release, bridge
+   * stop). An ephemeral `schedule:*` session has no resume semantics: its
+   * record is deleted with the runtime (SF-1 — a unique record per run would
+   * otherwise grow the state file forever). The runtime is always removed from
+   * the map and the state handle always revoked, even when `isBusy()`, `abort()`
+   * or `adapter.stop()` throws, so a stale adapter can never write its state
+   * again; the original error still propagates to the caller.
    */
   async #stopRuntime(runtime: AgentRuntime): Promise<void> {
     if (runtime.idleTimer) {
@@ -854,6 +967,21 @@ export class GatewayCore {
     } finally {
       this.#agentRuntimes.delete(runtime.agentSessionId);
       await this.#revokeSessionStateBestEffort(runtime.agentSessionId);
+      if (this.#isSyntheticScheduleSession(runtime.clientSessionId)) {
+        // SF-1: a schedule run leaves no residue. The adapter has stopped and
+        // can no longer write state (its only state writes happen inside
+        // #prepareWorkingDirectory during start), so deleting the record here
+        // cannot race a later write. Same deletion semantics as
+        // #cleanupNewRuntime (registry revoke + transactional record delete).
+        try {
+          await this.#agentSessionStateRegistry.delete(runtime.agentSessionId);
+        } catch (error) {
+          this.#logger.error(
+            `failed to delete schedule agent session state ${runtime.agentSessionId}:`,
+            error,
+          );
+        }
+      }
     }
   }
 }
