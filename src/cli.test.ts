@@ -347,12 +347,12 @@ describe("runCli schedule add", () => {
     // The example prompt is channel-agnostic and always DEFAULT_LOCALE (English).
     expect(content).toContain("Tell me what time it is right now, in one sentence.");
     expect(content).not.toContain("告诉我现在几点了");
-    expect(logs.lines.join("\n")).toContain("Created /tmp/schedules/daily-report.md");
+    expect(logs.lines.join("\n")).toContain("Created successfully!");
     expect(logs.lines.join("\n")).toContain(
-      "Edit /tmp/schedules/daily-report.md to set your prompt.",
+      "- Edit /tmp/schedules/daily-report.md to set your prompt.",
     );
     expect(logs.lines.join("\n")).toContain(
-      "To set the destination chat, send `/schedule-here daily-report` in target chat.",
+      "- Send `/schedule-here daily-report` in chat app to set the report place.",
     );
     expect(logs.lines.join("\n")).not.toContain("/st");
     expect(close).toHaveBeenCalledTimes(1);

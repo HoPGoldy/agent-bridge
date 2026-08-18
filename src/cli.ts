@@ -297,9 +297,9 @@ async function addScheduleTask(): Promise<void> {
       "utf8",
     );
 
-    console.log(`Created ${filePath}`);
-    console.log(`Edit ${filePath} to set your prompt.`);
-    console.log(`To set the destination chat, send \`/schedule-here ${name}\` in target chat.`);
+    console.log("Created successfully!");
+    console.log(`- Edit ${filePath} to set your prompt.`);
+    console.log(`- Send \`/schedule-here ${name}\` in chat app to set the report place.`);
   } finally {
     ctx.close();
   }
