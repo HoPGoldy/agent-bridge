@@ -8,11 +8,21 @@
 
 ### 任务文件（Task File）
 
-定义：`~/.config/agent-bridge/schedules/<channel>/<task-name>.md`，front matter（扁平 key:value 子集）存配置（schedule、directory、timeout、enabled、target），正文是提示词。文件名（去 .md）即任务在 channel 内的唯一键。
+定义：`~/.config/agent-bridge/schedules/<task-name>.md`（去 channel 化改造后：所有 channel 共享一个目录，不再按 channel 分目录），front matter（扁平 key:value 子集）存配置（schedule、directory、timeout、enabled、target、channel），正文是提示词。文件名（去 .md）即任务的全局唯一键。
+
+### 会话绑定 map（bindings）
+
+定义：GatewayCore 的 `#clientToAgentSession`（clientSessionId → agentSessionId），记录"这个聊天由本 channel 服务过"。持久化在 channel 状态文件的 `bindings` 字段，启动时 rehydrate。填充时机是聊天第一次创建 agent 会话；adapter-local 命令（如 `/schedule-here`、`/st`）不产生 binding。
+
+易混淆点：它不是 Client Adapter 的状态，adapter 无法直接访问；也不是"bot 能投递到的聊天清单"——投递走 adapter API，不要求聊天在 map 里。
+
+### 归属 channel（channel 字段）
+
+定义：任务文件 front matter 的 `channel` 字段，值是 channel 配置名，由处理 `/schedule-here` 的 channel 在绑定时写入。运行时每个 channel 扫描全部任务，只触发 `channel` 等于自己名字的任务。未绑定的任务没有 channel，不会被任何 channel 触发。
 
 ### 目标投递地址（target 字段）
 
-定义：任务文件 front matter 的 `target` 字段，值是目标 IM 聊天的 clientSessionId（如 `feishu:dm:oc_xxx`），用户在目标聊天里发 `/st` 即可复制到。填写=绑定、改行=改绑、删行=解绑，全部靠热加载生效，无任何运行时绑定状态。
+定义：任务文件 front matter 的 `target` 字段，值是目标 IM 聊天的 clientSessionId（如 `feishu:dm:oc_xxx`），由 `/schedule-here` 在目标聊天里发送时写入。已绑定的任务再次 `/schedule-here` 会被拒绝，需先解绑。
 
 易混淆点：它仅是结果投递地址，不授予对目标聊天会话的任何控制；与已否决的"绑定码"（6 位随机码 + `/schedule-bind` 命令 + channel 状态持久化绑定）不是一回事。
 
