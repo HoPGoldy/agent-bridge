@@ -113,3 +113,39 @@
 问题：会话创建失败如何回传给 Scheduler（T6 设计讨论，含用户提问后澄清：inject === core.input 的直接 await，core 入口吞错误导致异常传播不可行）？
 
 用户回答：不用异常。core 吞错误没问题，但 input/inject 的返回值从 `Promise<void>` 改为返回结果对象（`{ ok: true } | { ok: false; reason: string }`）：正常创建返回 ok:true；失败返回 ok:false + 原因。adapter 调用方忽略返回值（fire-and-forget 不变），scheduler 检查返回值决定是否继续注入 user.message、结束 run 并投递失败通知。另：`inject` 命名不佳，需改为更语义化的名字。
+
+---
+
+### Event 队列（Agent 任务队列，2026-08-19 开始 grill）
+
+背景：新特性——Event/Agent 队列。队列有名字、Worker 数量、Worker 模型；可插入任务（结构体暂只有 prompt）；Controller 定期检查、FIFO 取任务、并发上限 = Worker 数。整体架构与定时任务同构。
+
+问题：插任务的命令是什么形态（CLI / IM / 两者）？队列归属（全局 vs per-channel）？
+
+用户回答：队列和 Schedule 一样绑定到指定 Channel——启用前必须先执行 `/queue-here` 命令绑定当前聊天为投递目标（任务完成总要有个地方告诉用户）。插入命令 CLI 和 IM 两个都要，命名统一为 queue insert 语义。
+
+问题：队列创建命令形态？
+
+用户回答：A——只有 CLI `agent-bridge queue add` 交互向导（队列名、channel、Worker 数量、Worker 模型），写入 queues/<name>.md（front matter 记 channel/workers/model）；创建后在对应 channel 执行 /queue-here 绑定目标聊天才启用；后续改配置靠 AI 编辑文件。**另外：队列 MD 文件的正文内容会附加到每个队列任务的 prompt 中**（作为共享上下文/指令）。
+
+问题：任务执行失败语义？
+
+用户回答：A——失败即弃：投递失败通知（带真实原因）到绑定聊天，任务出队，继续跑下一个。无重试、不阻塞队列；想重跑就重新 insert。与定时任务一致。
+
+问题：重启时在途任务怎么办？
+
+用户回答：A——重新入队重新执行（at-least-once）。用户补充设想：Controller 定时触发前先检查持久化状态里的 pending 任务，有就直接重启这些任务。
+
+事实自查（用户提问）：定时任务无 pending 持久化——任务定义（schedules/*.md）持久化，但运行状态纯内存，重启时在途 run 静默消失、停机期错过的触发跳过。当前持久化：config.json（channel 配置）、schedules/*.md、session-bindings/<channel>.json v3（bindings 活跃聊天绑定 + agentSessions/clientSessions 记录）、pi-sessions/（pi 自己的会话历史）。Event 队列的 pending task 持久化是新能力。
+
+问题：队列查看/管理命令？
+
+用户回答：A——只加 CLI `agent-bridge queue list`（队列名、绑定状态、pending 数、在途数）；删除队列、清空 pending 等低频操作让 AI 直接操作文件，不加命令；IM 无 queue-list。
+
+问题：IM `/queue-insert` 命令？
+
+用户回答：本版本不做 IM 的 queue insert——只能通过 CLI（`agent-bridge queue insert <name> --prompt "..."`）插入任务。
+
+问题：未绑定队列的行为？
+
+用户回答：A——CLI 随时可 insert（任务落盘等待），Controller 只在已绑定（有 target）时才消费，绑定后自动消化积压；**但 CLI insert 时若队列未绑定聊天，CLI 要输出警告提醒调用者**。
