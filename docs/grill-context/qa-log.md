@@ -149,3 +149,7 @@
 问题：未绑定队列的行为？
 
 用户回答：A——CLI 随时可 insert（任务落盘等待），Controller 只在已绑定（有 target）时才消费，绑定后自动消化积压；**但 CLI insert 时若队列未绑定聊天，CLI 要输出警告提醒调用者**。
+
+问题：Worker 槽位释放后的补充时机（workers=2、4 个任务时一个 tick 立即 fire 2 个；跑完后等 tick 还是立刻补）？
+
+用户回答：A——纯 tick 驱动，跑完等下次 tick（最坏 30s 空转）再取下一个。实现最简单，与 scheduler 完全同构。
