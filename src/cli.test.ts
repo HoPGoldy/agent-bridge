@@ -34,8 +34,8 @@ const saveConfig = vi.fn(async () => {});
 const mkdir = vi.fn(async () => {});
 const writeFile = vi.fn(async () => {});
 const unlink = vi.fn(async () => {});
-const loadChannelTasks = vi.fn(async () => []);
-const getSchedulesDir = vi.fn((channel: string) => `/tmp/schedules/${channel}`);
+const loadAllTasks = vi.fn(async () => []);
+const getSchedulesDir = vi.fn(() => "/tmp/schedules");
 
 const fakeClientModule = {
   type: "fake-client",
@@ -89,7 +89,7 @@ vi.mock("node:fs/promises", () => ({ mkdir, writeFile, unlink }));
 
 vi.mock("./modules/schedule/task-file", async (importOriginal) => {
   const original = await importOriginal<typeof import("./modules/schedule/task-file")>();
-  return { ...original, loadChannelTasks, getSchedulesDir };
+  return { ...original, loadAllTasks, getSchedulesDir };
 });
 
 describe("runCli add", () => {
@@ -187,7 +187,7 @@ const CHANNEL_WITH_DEMO = {
 };
 
 describe("schedule wizard validators", () => {
-  it("validateTaskNameInput enforces the slug shape and channel-local uniqueness", async () => {
+  it("validateTaskNameInput enforces the slug shape and global task-name uniqueness", async () => {
     const { validateTaskNameInput } = await import("./cli");
     expect(validateTaskNameInput("daily-report", new Set())).toBeNull();
     expect(validateTaskNameInput("Daily", new Set())).toContain("[a-z0-9-]+");
@@ -256,7 +256,7 @@ describe("schedule wizard validators", () => {
   });
 
   it("writes task files that the real T2 parseTaskFile reads back cleanly", async () => {
-    // The task-file module is mocked above (loadChannelTasks/getSchedulesDir
+    // The task-file module is mocked above (loadAllTasks/getSchedulesDir
     // replaced with vi.fn), but vi.importActual bypasses that mock entirely and
     // returns the genuine T2 parser. parseTaskFile is a pure function (no fs
     // access), so it works unchanged even though node:fs/promises is mocked.
@@ -315,10 +315,10 @@ describe("runCli schedule add", () => {
   beforeEach(() => {
     resetPromptMocks();
     delete inputOverrides["Working directory (optional, blank = bridge cwd)"];
-    loadConfig.mockImplementation(async () => CHANNEL_WITH_DEMO);
-    loadChannelTasks.mockResolvedValue([]);
     mkdir.mockClear();
     writeFile.mockClear();
+    loadAllTasks.mockClear();
+    loadAllTasks.mockResolvedValue([]);
   });
 
   it("writes a task file with the collected values and prints path + targeting instruction", async () => {
@@ -331,25 +331,25 @@ describe("runCli schedule add", () => {
     }
 
     expect(promptCalls).toEqual([
-      "select:Select channel",
       "input:Task name",
       "input:Schedule (examples: every 5m, daily 09:00, weekly mon 09:00, monthly 15 09:00)",
       "input:Working directory (optional, blank = bridge cwd)",
       "input:Timeout (default 10m)",
     ]);
-    expect(loadChannelTasks).toHaveBeenCalledWith("demo");
-    expect(mkdir).toHaveBeenCalledWith("/tmp/schedules/demo", { recursive: true });
+    expect(loadAllTasks).toHaveBeenCalledWith();
+    expect(mkdir).toHaveBeenCalledWith("/tmp/schedules", { recursive: true });
     expect(writeFile).toHaveBeenCalledTimes(1);
     const [filePath, content] = writeFile.mock.calls[0] as [string, string, string];
-    expect(filePath).toBe("/tmp/schedules/demo/daily-report.md");
+    expect(filePath).toBe("/tmp/schedules/daily-report.md");
     expect(content).toContain("schedule: daily 09:00");
     expect(content).toContain("timeout: 10m");
     expect(content).not.toContain("directory:");
-    // demo channel is zh-CN (CHANNEL_WITH_DEMO): the example prompt is localized.
-    expect(content).toContain("告诉我现在几点了，一句话就好。");
-    expect(logs.lines.join("\n")).toContain("Created /tmp/schedules/demo/daily-report.md");
+    // The example prompt is channel-agnostic and always DEFAULT_LOCALE (English).
+    expect(content).toContain("Tell me what time it is right now, in one sentence.");
+    expect(content).not.toContain("告诉我现在几点了");
+    expect(logs.lines.join("\n")).toContain("Created /tmp/schedules/daily-report.md");
     expect(logs.lines.join("\n")).toContain(
-      "Edit /tmp/schedules/demo/daily-report.md to set your prompt.",
+      "Edit /tmp/schedules/daily-report.md to set your prompt.",
     );
     expect(logs.lines.join("\n")).toContain(
       "To set the destination chat, send `/schedule-here daily-report` in target chat.",
@@ -371,17 +371,9 @@ describe("runCli schedule add", () => {
     expect(content).toContain("directory: /data/reports");
   });
 
-  it("writes the English example prompt for an en-US channel", async () => {
-    loadConfig.mockImplementation(async () => ({
-      channels: {
-        demo: {
-          common: { language: "en-US" },
-          client: { type: "fake-client", config: {} },
-          agent: { type: "fake-agent", config: {} },
-        },
-      },
-      defaults: { agentIdleTimeoutMs: 60_000 },
-    }));
+  it("writes the English (default locale) example prompt regardless of channel language", async () => {
+    // CHANNEL_WITH_DEMO is zh-CN; the prompt must still be the channel-agnostic default.
+    loadConfig.mockImplementation(async () => CHANNEL_WITH_DEMO);
     const { runCli } = await import("./cli");
     try {
       await runCli(["node", "agent-bridge", "schedule", "add"]);
@@ -398,37 +390,23 @@ describe("runCli schedule add", () => {
 describe("runCli schedule list", () => {
   beforeEach(() => {
     resetPromptMocks();
-    loadConfig.mockImplementation(async () => ({
-      channels: {
-        alpha: {
-          common: { language: "en-US" },
-          client: { type: "fake-client", config: {} },
-          agent: { type: "fake-agent", config: {} },
-        },
-        beta: {
-          common: { language: "en-US" },
-          client: { type: "fake-client", config: {} },
-          agent: { type: "fake-agent", config: {} },
-        },
-      },
-      defaults: { agentIdleTimeoutMs: 60_000 },
-    }));
-    loadChannelTasks.mockClear();
+    loadAllTasks.mockClear();
   });
 
   it("prints a table with one row per task and marks load errors", async () => {
-    loadChannelTasks.mockImplementation(async (channel: string) => {
-      if (channel === "alpha") return [makeLoadedTask()];
-      if (channel === "beta") {
-        return [
-          makeLoadedTask(
-            { name: "broken", scheduleRaw: "sometimes", schedule: null, enabled: false },
-            { errors: ['invalid schedule "sometimes": unknown schedule type "sometimes"'] },
-          ),
-        ];
-      }
-      return [];
-    });
+    loadAllTasks.mockResolvedValue([
+      makeLoadedTask({ channel: "alpha" }),
+      makeLoadedTask(
+        {
+          name: "broken",
+          scheduleRaw: "sometimes",
+          schedule: null,
+          enabled: false,
+          channel: "beta",
+        },
+        { errors: ['invalid schedule "sometimes": unknown schedule type "sometimes"'] },
+      ),
+    ]);
 
     const { runCli } = await import("./cli");
     const logs = captureLogs();
@@ -453,7 +431,7 @@ describe("runCli schedule list", () => {
   });
 
   it("prints a friendly hint when no tasks exist", async () => {
-    loadChannelTasks.mockResolvedValue([]);
+    loadAllTasks.mockResolvedValue([]);
     const { runCli } = await import("./cli");
     const logs = captureLogs();
     try {
@@ -463,17 +441,30 @@ describe("runCli schedule list", () => {
     }
     expect(logs.lines.join("\n")).toContain("No scheduled tasks found");
   });
+
+  it("shows a dash in the Channel column for unbound tasks", async () => {
+    loadAllTasks.mockResolvedValue([makeLoadedTask()]);
+    const { runCli } = await import("./cli");
+    const logs = captureLogs();
+    try {
+      await runCli(["node", "agent-bridge", "schedule", "list"]);
+    } finally {
+      logs.restore();
+    }
+    expect(logs.lines.join("\n")).toContain("daily-report");
+    expect(logs.lines.join("\n")).toMatch(/Channel[\s\S]*-/);
+  });
 });
 
 describe("runCli schedule remove", () => {
   beforeEach(() => {
     resetPromptMocks();
-    loadConfig.mockImplementation(async () => CHANNEL_WITH_DEMO);
-    loadChannelTasks.mockResolvedValue([makeLoadedTask()]);
+    loadAllTasks.mockClear();
+    loadAllTasks.mockResolvedValue([makeLoadedTask()]);
     unlink.mockClear();
   });
 
-  it("deletes the task file directly when the name matches exactly one channel", async () => {
+  it("deletes the task file directly when the task exists", async () => {
     const { runCli } = await import("./cli");
     const logs = captureLogs();
     try {
@@ -484,8 +475,8 @@ describe("runCli schedule remove", () => {
 
     // No prompts, no confirmation — direct delete.
     expect(promptCalls).toEqual([]);
-    expect(unlink).toHaveBeenCalledWith("/tmp/schedules/demo/daily-report.md");
-    expect(logs.lines.join("\n")).toContain("Deleted /tmp/schedules/demo/daily-report.md");
+    expect(unlink).toHaveBeenCalledWith("/tmp/schedules/daily-report.md");
+    expect(logs.lines.join("\n")).toContain("Deleted /tmp/schedules/daily-report.md");
   });
 
   it("rejects an invalid task name without touching the filesystem", async () => {
@@ -496,54 +487,12 @@ describe("runCli schedule remove", () => {
     expect(unlink).not.toHaveBeenCalled();
   });
 
-  it("reports when no channel has the task", async () => {
-    loadChannelTasks.mockResolvedValue([]);
+  it("reports when no task with that name exists", async () => {
+    loadAllTasks.mockResolvedValue([]);
     const { runCli } = await import("./cli");
     await expect(
       runCli(["node", "agent-bridge", "schedule", "remove", "daily-report"]),
     ).rejects.toThrow('No scheduled task "daily-report" found.');
-    expect(unlink).not.toHaveBeenCalled();
-  });
-
-  it("refuses to choose when the name exists in multiple channels", async () => {
-    loadConfig.mockImplementation(async () => ({
-      channels: {
-        demo: CHANNEL_WITH_DEMO.channels.demo,
-        other: CHANNEL_WITH_DEMO.channels.demo,
-      },
-      defaults: CHANNEL_WITH_DEMO.defaults,
-    }));
-    const { runCli } = await import("./cli");
-    await expect(
-      runCli(["node", "agent-bridge", "schedule", "remove", "daily-report"]),
-    ).rejects.toThrow('exists in multiple channels (demo, other)');
-    expect(unlink).not.toHaveBeenCalled();
-  });
-
-  it("--channel disambiguates and deletes only that channel's file", async () => {
-    loadConfig.mockImplementation(async () => ({
-      channels: {
-        demo: CHANNEL_WITH_DEMO.channels.demo,
-        other: CHANNEL_WITH_DEMO.channels.demo,
-      },
-      defaults: CHANNEL_WITH_DEMO.defaults,
-    }));
-    const { runCli } = await import("./cli");
-    const logs = captureLogs();
-    try {
-      await runCli(["node", "agent-bridge", "schedule", "remove", "daily-report", "--channel", "other"]);
-    } finally {
-      logs.restore();
-    }
-    expect(unlink).toHaveBeenCalledWith("/tmp/schedules/other/daily-report.md");
-    expect(logs.lines.join("\n")).toContain("Deleted /tmp/schedules/other/daily-report.md");
-  });
-
-  it("rejects an unknown --channel", async () => {
-    const { runCli } = await import("./cli");
-    await expect(
-      runCli(["node", "agent-bridge", "schedule", "remove", "daily-report", "--channel", "nope"]),
-    ).rejects.toThrow('Unknown channel "nope".');
     expect(unlink).not.toHaveBeenCalled();
   });
 });
@@ -552,13 +501,29 @@ describe("runCli schedule with no channels", () => {
   beforeEach(() => {
     resetPromptMocks();
     loadConfig.mockImplementation(async () => ({ channels: {}, defaults: { agentIdleTimeoutMs: 60_000 } }));
+    loadAllTasks.mockClear();
+    loadAllTasks.mockResolvedValue([]);
+    mkdir.mockClear();
+    writeFile.mockClear();
   });
 
-  it("fails fast with a hint to run agent-bridge add first", async () => {
+  it("still creates a task with no channels configured (channel-agnostic)", async () => {
     const { runCli } = await import("./cli");
-    await expect(runCli(["node", "agent-bridge", "schedule", "add"])).rejects.toThrow(
-      "No channels configured",
-    );
+    await runCli(["node", "agent-bridge", "schedule", "add"]);
+    const [filePath] = writeFile.mock.calls[0] as [string, string, string];
+    expect(filePath).toBe("/tmp/schedules/daily-report.md");
     expect(close).toHaveBeenCalledTimes(1);
+  });
+
+  it("still lists unbound tasks with no channels configured", async () => {
+    loadAllTasks.mockResolvedValue([makeLoadedTask()]);
+    const { runCli } = await import("./cli");
+    const logs = captureLogs();
+    try {
+      await runCli(["node", "agent-bridge", "schedule", "list"]);
+    } finally {
+      logs.restore();
+    }
+    expect(logs.lines.join("\n")).toContain("daily-report");
   });
 });

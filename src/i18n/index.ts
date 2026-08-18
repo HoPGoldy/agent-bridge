@@ -19,7 +19,7 @@ const resources = {
       client: {
         processing: "Processing...",
         helpMessage:
-          "Available commands:\n\n- `/new [path]` (`/n [path]`) - Start a new agent session; optionally start it in a specific directory, e.g. `/new /path/to/project`. A directory given once is remembered and reused by later `/new` without a path\n- `/compact` (`/c`) - Compact the current session context\n- `/stop` (`/s`) - Stop the active agent run\n- `/status` (`/st`) - Show the current agent session status\n- `/model` (`/m`) - List available models, or switch with `/model provider/modelId`\n- `/schedule-run <task-name>` - Run a scheduled task once now (the result is sent to the task's target chat)\n- `/schedule-here <task-name>` - Bind this chat as a task's result destination (send this in the chat that should receive the results)\n- `/help` (`/h`) - Show this help message",
+          "Available commands:\n\n- `/new [path]` (`/n [path]`) - Start a new agent session; optionally start it in a specific directory, e.g. `/new /path/to/project`. A directory given once is remembered and reused by later `/new` without a path\n- `/compact` (`/c`) - Compact the current session context\n- `/stop` (`/s`) - Stop the active agent run\n- `/status` (`/st`) - Show the current agent session status\n- `/model` (`/m`) - List available models, or switch with `/model provider/modelId`\n- `/schedule-run <task-name>` - Run a scheduled task once now (the result is sent to the task's target chat)\n- `/schedule-here <task-name>` - Bind this chat as a task's result destination and set the task's owning channel (send this in the chat that should receive the results; an already-bound task must be unbound first)\n- `/help` (`/h`) - Show this help message",
         messageDeliveryFailedTitle: "[agent-bridge error] Message delivery failed",
         invalidNewWorkingDirectory:
           "Cannot start a new session: the working directory `{{workingDirectory}}` is invalid ({{detail}}).",
@@ -32,10 +32,14 @@ const resources = {
         scheduleRunTaskDisabled: 'Scheduled task "{{name}}" is disabled.',
         scheduleRunNoTarget: 'Scheduled task "{{name}}" has no valid target chat configured.',
         scheduleRunFailed: 'Failed to trigger scheduled task "{{name}}": {{reason}}',
+        scheduleRunWrongChannel:
+          'Scheduled task "{{name}}" belongs to channel "{{channel}}". Please run it from that channel.',
         scheduleRunUsage: 'Usage: `/schedule-run <task-name>` (task names match `[a-z0-9-]+`).',
         scheduleHereBound: 'Task "{{name}}" will send its results to this chat.',
         scheduleHereTaskNotFound: 'Scheduled task "{{name}}" was not found.',
         scheduleHereFailed: 'Failed to bind task "{{name}}": {{reason}}',
+        scheduleHereAlreadyBound:
+          'Task "{{name}}" is already bound to a chat. To rebind it, remove the `target`/`channel` lines from its task file (ask the AI in its current bound chat, or edit the file manually).',
         scheduleHereUsage: 'Usage: `/schedule-here <task-name>` (task names match `[a-z0-9-]+`).',
         statusTitle: "Current session status",
         statusSessionId: "Session ID",
@@ -93,7 +97,7 @@ const resources = {
       client: {
         processing: "正在处理中...",
         helpMessage:
-          "可用命令：\n\n- `/new [path]` (`/n [path]`) - 开始一个新会话；可选指定工作目录，例如 `/new /path/to/project`。指定过的目录会被记住，之后不带路径的 `/new` 会继续使用它\n- `/compact` (`/c`) - 压缩当前会话上下文\n- `/stop` (`/s`) - 停止当前正在运行的任务\n- `/status` (`/st`) - 查看当前智能体会话状态\n- `/model` (`/m`) - 查看可用模型，或使用 `/model provider/modelId` 切换模型\n- `/schedule-run <任务名>` - 立即运行一次定时任务（结果会发送到该任务的目标聊天）\n- `/schedule-here <任务名>` - 把本会话设为该任务结果的发送目标（请在希望接收结果的聊天里发送）\n- `/help` (`/h`) - 查看这条帮助信息",
+          "可用命令：\n\n- `/new [path]` (`/n [path]`) - 开始一个新会话；可选指定工作目录，例如 `/new /path/to/project`。指定过的目录会被记住，之后不带路径的 `/new` 会继续使用它\n- `/compact` (`/c`) - 压缩当前会话上下文\n- `/stop` (`/s`) - 停止当前正在运行的任务\n- `/status` (`/st`) - 查看当前智能体会话状态\n- `/model` (`/m`) - 查看可用模型，或使用 `/model provider/modelId` 切换模型\n- `/schedule-run <任务名>` - 立即运行一次定时任务（结果会发送到该任务的目标聊天）\n- `/schedule-here <任务名>` - 把本会话设为该任务结果的发送目标并确定其归属 channel（请在希望接收结果的聊天里发送；已绑定的任务需先解绑）\n- `/help` (`/h`) - 查看这条帮助信息",
         messageDeliveryFailedTitle: "[agent-bridge 错误] 消息发送失败",
         invalidNewWorkingDirectory:
           "无法开始新会话：工作目录 `{{workingDirectory}}` 无效（{{detail}}）。",
@@ -105,10 +109,14 @@ const resources = {
         scheduleRunTaskDisabled: '定时任务 "{{name}}" 已禁用。',
         scheduleRunNoTarget: '定时任务 "{{name}}" 未配置有效的目标聊天。',
         scheduleRunFailed: '无法触发定时任务 "{{name}}"：{{reason}}',
+        scheduleRunWrongChannel:
+          '定时任务 "{{name}}" 归属于 channel "{{channel}}"。请在该 channel 中运行它。',
         scheduleRunUsage: '用法：`/schedule-run <任务名>`（任务名需匹配 `[a-z0-9-]+`）。',
         scheduleHereBound: '任务 "{{name}}" 的结果将发送到本会话。',
         scheduleHereTaskNotFound: '未找到定时任务 "{{name}}"。',
         scheduleHereFailed: '无法绑定任务 "{{name}}"：{{reason}}',
+        scheduleHereAlreadyBound:
+          '任务 "{{name}}" 已绑定到某聊天。要重新绑定，请删除其任务文件中的 `target`/`channel` 行（可在它当前绑定的聊天里让 AI 处理，或手动编辑文件）。',
         scheduleHereUsage: '用法：`/schedule-here <任务名>`（任务名需匹配 `[a-z0-9-]+`）。',
         statusTitle: "当前会话状态",
         statusSessionId: "Session ID",

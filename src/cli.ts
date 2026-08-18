@@ -196,11 +196,12 @@ async function startChannel(channelName: string): Promise<void> {
 // ---------------------------------------------------------------------------
 // schedule command group (spec: docs/scheduled-tasks-spec.md "CLI Surface")
 //
-// Task files live at `~/.config/agent-bridge/schedules/<channel>/<task>.md`
-// (T2: task-file.ts owns the format). The add wizard writes the front matter
-// the scheduler needs; `target` is filled in by sending `/schedule-here
-// <task-name>` in the destination chat (T10), or manually from `/st` output.
-// The prompt body is meant to be edited by hand.
+// Task files live at `~/.config/agent-bridge/schedules/<task-name>.md` — a flat
+// channel-agnostic directory (T2: task-file.ts owns the format). Task names are
+// globally unique (the file name is the unique key). The add wizard writes the
+// front matter the scheduler needs; `target` and `channel` are filled in by
+// sending `/schedule-here <task-name>` in the destination chat. The prompt body
+// is meant to be edited by hand.
 // ---------------------------------------------------------------------------
 
 /** Grammar examples shown in the schedule prompt (spec D4). */
@@ -215,7 +216,7 @@ export function validateTaskNameInput(
     return "Task name must be [a-z0-9-]+ (lowercase letters, digits and hyphens only)";
   }
   if (existingNames.has(value)) {
-    return `A task named "${value}" already exists in this channel`;
+    return `A task named "${value}" already exists.`;
   }
   return null;
 }
@@ -259,28 +260,11 @@ export function buildTaskFileContent(options: {
   return `${frontMatter.join("\n")}\n\n${prompt}\n`;
 }
 
-/** Picks a configured channel, or fails fast with a hint to run `agent-bridge add` first. */
-async function selectScheduleChannel(
-  ctx: ReturnType<typeof createPromptContext>,
-  config: AppConfig,
-): Promise<string> {
-  const names = Object.keys(config.channels).sort();
-  if (names.length === 0) {
-    throw new Error("No channels configured. Run `agent-bridge add` to create a channel first.");
-  }
-  return ctx.select("Select channel", names.map((name) => ({ label: name, value: name })));
-}
-
 /** `agent-bridge schedule add`: interactive task-file creation wizard. */
 async function addScheduleTask(): Promise<void> {
-  const config = await loadConfig();
   const ctx = createPromptContext();
   try {
-    const channel = await selectScheduleChannel(ctx, config);
-    const channelLanguage = config.channels[channel]?.common.language ?? DEFAULT_LOCALE;
-
-    // T1: tasks live in the flat shared schedules directory; the channel
-    // loop stays for the list's channel column (reworked in a later ticket).
+    // T3: tasks are channel-agnostic and globally unique — no channel to pick.
     const existing = await loadAllTasks();
     const existingNames = new Set(existing.map((entry) => entry.task.name));
 
@@ -309,7 +293,7 @@ async function addScheduleTask(): Promise<void> {
     const filePath = path.join(schedulesDir, `${name}.md`);
     await writeFile(
       filePath,
-      buildTaskFileContent({ schedule, timeout, directory, language: channelLanguage }),
+      buildTaskFileContent({ schedule, timeout, directory, language: DEFAULT_LOCALE }),
       "utf8",
     );
 
@@ -322,7 +306,7 @@ async function addScheduleTask(): Promise<void> {
 }
 
 interface ScheduleTaskRow {
-  channel: string;
+  channel: string | undefined;
   task: ScheduleTask;
   errors: string[];
   warnings: string[];
@@ -345,21 +329,13 @@ function formatNextRun(task: ScheduleTask, now: Date): string {
 
 /** `agent-bridge schedule list`: table of every task across all channels. */
 async function listScheduleTasks(): Promise<void> {
-  const config = await loadConfig();
-  const channelNames = Object.keys(config.channels).sort();
-  if (channelNames.length === 0) {
-    console.log("No channels configured. Run `agent-bridge add` to create a channel first.");
-    return;
-  }
-
   const now = new Date();
-  const rows: ScheduleTaskRow[] = [];
-  for (const channel of channelNames) {
-    const loaded = await loadAllTasks();
-    for (const { task, errors, warnings } of loaded) {
-      rows.push({ channel, task, errors, warnings });
-    }
-  }
+  const rows: ScheduleTaskRow[] = (await loadAllTasks()).map(({ task, errors, warnings }) => ({
+    channel: task.channel,
+    task,
+    errors,
+    warnings,
+  }));
 
   if (rows.length === 0) {
     console.log("No scheduled tasks found. Add one with `agent-bridge schedule add`.");
@@ -367,7 +343,7 @@ async function listScheduleTasks(): Promise<void> {
   }
 
   const columns: Array<{ header: string; get: (row: ScheduleTaskRow) => string }> = [
-    { header: "Channel", get: (row) => row.channel },
+    { header: "Channel", get: (row) => row.channel ?? "-" },
     { header: "Task", get: (row) => row.task.name },
     { header: "Schedule", get: (row) => row.task.scheduleRaw ?? "-" },
     { header: "Enabled", get: (row) => (row.task.enabled ? "yes" : "no") },
@@ -387,37 +363,17 @@ async function listScheduleTasks(): Promise<void> {
 
 /**
  * `agent-bridge schedule remove <task-name>`: delete the task file directly,
- * no prompts. Scans every channel for the name; `--channel` disambiguates
- * when several channels own a task with the same name.
+ * no prompts. Task names are globally unique (file name = unique key), so no
+ * channel option or disambiguation is needed — it is a single-file delete.
  */
-async function removeScheduleTask(taskName: string, options: { channel?: string }): Promise<void> {
+async function removeScheduleTask(taskName: string): Promise<void> {
   if (!isValidTaskName(taskName)) {
     throw new Error("Task name must be [a-z0-9-]+ (lowercase letters, digits and hyphens only)");
   }
 
-  const config = await loadConfig();
-  if (options.channel && !config.channels[options.channel]) {
-    throw new Error(`Unknown channel "${options.channel}".`);
-  }
-  const candidates = options.channel ? [options.channel] : Object.keys(config.channels).sort();
-
-  const matches: string[] = [];
-  for (const channel of candidates) {
-    const loaded = await loadAllTasks();
-    if (loaded.some((entry) => entry.task.name === taskName)) {
-      matches.push(channel);
-    }
-  }
-
-  if (matches.length === 0) {
-    throw new Error(
-      `No scheduled task "${taskName}" found${options.channel ? ` in channel "${options.channel}"` : ""}.`,
-    );
-  }
-  if (matches.length > 1) {
-    throw new Error(
-      `Task "${taskName}" exists in multiple channels (${matches.join(", ")}). Use --channel to pick one.`,
-    );
+  const loaded = await loadAllTasks();
+  if (!loaded.some((entry) => entry.task.name === taskName)) {
+    throw new Error(`No scheduled task "${taskName}" found.`);
   }
 
   const filePath = path.join(getSchedulesDir(), `${taskName}.md`);
@@ -483,9 +439,8 @@ export async function runCli(argv = process.argv): Promise<void> {
     .command("remove")
     .description("Remove a scheduled task by name")
     .argument("<task-name>")
-    .option("--channel <name>", "Channel that owns the task (needed only when the name exists in several channels)")
-    .action(async (taskName: string, options: { channel?: string }) => {
-      await removeScheduleTask(taskName, options);
+    .action(async (taskName: string) => {
+      await removeScheduleTask(taskName);
     });
 
   await program.parseAsync(argv);

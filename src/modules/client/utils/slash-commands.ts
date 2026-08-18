@@ -343,6 +343,16 @@ export function formatScheduleRunReply(
     case "task has no valid target":
       return t("client.scheduleRunNoTarget", { name: taskName });
     default:
+      // T2 ownership rejection: `task belongs to channel "X"` (dynamic name).
+      // Prefix-match and extract the channel name; fall back to carrying the
+      // raw reason when it cannot be extracted.
+      if (result.reason.startsWith("task belongs to channel ")) {
+        const channelMatch = /^task belongs to channel "([^"]+)"$/.exec(result.reason);
+        return t("client.scheduleRunWrongChannel", {
+          name: taskName,
+          channel: channelMatch?.[1] ?? result.reason,
+        });
+      }
       return t("client.scheduleRunFailed", { name: taskName, reason: result.reason });
   }
 }
@@ -365,6 +375,8 @@ export function formatScheduleHereReply(
   switch (result.reason) {
     case "task not found":
       return t("client.scheduleHereTaskNotFound", { name: taskName });
+    case "task already bound":
+      return t("client.scheduleHereAlreadyBound", { name: taskName });
     default:
       return t("client.scheduleHereFailed", { name: taskName, reason: result.reason });
   }

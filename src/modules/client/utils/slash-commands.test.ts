@@ -372,6 +372,18 @@ describe("formatScheduleHereReply", () => {
     );
   });
 
+  it("maps the task-already-bound reason to a localized message", () => {
+    const en = getTranslator("en-US");
+    const zh = getTranslator("zh-CN");
+
+    expect(
+      formatScheduleHereReply({ ok: false, reason: "task already bound" }, "report", en),
+    ).toContain("already bound");
+    expect(
+      formatScheduleHereReply({ ok: false, reason: "task already bound" }, "报告", zh),
+    ).toContain("已绑定");
+  });
+
   it("falls back to a generic failure message carrying the raw reason", () => {
     const en = getTranslator("en-US");
 
@@ -421,6 +433,36 @@ describe("formatScheduleRunReply", () => {
     expect(formatScheduleRunReply({ ok: false, reason: "scheduler is not running" }, "x", en)).toContain(
       "scheduler is not running",
     );
+  });
+
+  it("maps a belongs-to-another-channel rejection and extracts the channel name", () => {
+    const en = getTranslator("en-US");
+    const zh = getTranslator("zh-CN");
+
+    expect(
+      formatScheduleRunReply({ ok: false, reason: 'task belongs to channel "other"' }, "report", en),
+    ).toContain('"other"');
+    expect(
+      formatScheduleRunReply({ ok: false, reason: 'task belongs to channel "other"' }, "报告", zh),
+    ).toContain('"other"');
+  });
+
+  it("still shows a wrong-channel message when the channel cannot be extracted", () => {
+    const en = getTranslator("en-US");
+
+    // Prefix-matched but the `^task belongs to channel "([^"]+)"$` regex
+    // cannot extract a channel name, so the raw reason is carried through the
+    // `channelMatch?.[1] ?? result.reason` fallback. This must still render
+    // the wrong-channel wording (distinct from the generic failure message).
+    const reply = formatScheduleRunReply(
+      { ok: false, reason: 'task belongs to channel "unterminated' },
+      "report",
+      en,
+    );
+    expect(reply).toContain("belongs to channel");
+    expect(reply).toContain("Please run it from that channel");
+    expect(reply).toContain('task belongs to channel "unterminated');
+    expect(reply).not.toContain("Failed to trigger");
   });
 });
 
