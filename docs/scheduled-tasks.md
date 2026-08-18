@@ -2,7 +2,7 @@
 
 Scheduled tasks let you run an agent on a recurring schedule without touching a chat manually.
 
-A task is a Markdown file that declares **when** to run (a schedule string), **where** to run (a working directory), **how long** a run may take (a timeout), **which channel owns it** (a channel field), and **where to send the result** (a target chat). When the schedule fires, the bridge creates a **fresh, fully independent agent session**, sends the task's prompt into it, and delivers the agent's final result — or a failure/timeout notice — into the target chat as an ordinary message.
+A task is a Markdown file that declares **when** to run (a schedule string), **where** to run (a working directory), **how long** a run may take (a timeout), **which channel owns it** (a channel field), **where to send the result** (a target chat), and—optionally—**which agent model** to run (a model field). When the schedule fires, the bridge creates a **fresh, fully independent agent session**, sends the task's prompt into it, and delivers the agent's final result — or a failure/timeout notice — into the target chat as an ordinary message.
 
 The most important property is **isolation**: a task run never touches the target chat's own agent session. You can keep chatting in that chat before, during, and after a run and nothing about your session changes. The chat is only used as a delivery address.
 
@@ -19,7 +19,8 @@ The most important property is **isolation**: a task run never touches the targe
    - a task name (lowercase letters, digits and hyphens only, e.g. `daily-report`; names are globally unique — there is no channel selection),
    - a schedule string (validated against the grammar below, re-prompted on error, with examples shown),
    - an optional working directory (blank = the bridge process's current directory),
-   - a timeout (default `10m`).
+   - a timeout (default `10m`),
+   - an optional model (blank = the channel agent config's default model; it is not validated — the CLI can't reach provider model lists, so an invalid value only surfaces when the task runs; see [How a run works](#how-a-run-works) for the exact failure behavior).
 
    It writes a task file with an example prompt body, prints the file path, and prints the targeting instruction.
 
@@ -75,6 +76,7 @@ timeout: 30m
 enabled: true
 channel: feishu-dev
 target: feishu:dm:oc_6f9d408e630098e6dd06bb071d6b60fc
+model: azure-openai-responses/gpt-5.6-terra
 ---
 
 Read the logs in the current directory and produce a summary of
@@ -95,8 +97,9 @@ yesterday's errors.
 | `enabled` | no | `true` | `false` (case-insensitive) pauses the task without deleting the file. Any other value or absence means enabled. |
 | `target` | no | — | Delivery address: the destination chat's clientSessionId. The recommended way to set it initially is `/schedule-here <task-name>` sent in the destination chat; the manual way is to copy the **Chat session ID** line from `/st` in that chat (see [Changing the destination chat](#changing-the-destination-chat)). Required for delivery — without it (or when it fails validation, e.g. a typo or a chat from another channel) the fire is skipped, the skip is logged, and `schedule list` shows `Target: no`. |
 | `channel` | no | — | Owning channel config name, written by `/schedule-here <task-name>` together with `target`. Each channel's scheduler fires on schedule only tasks whose `channel` matches that channel; a task with no `channel` line never fires on schedule (but can still be triggered manually with `/schedule-run`, see below). |
+| `model` | no | — | Optional per-task agent model override. Only this task's own runs use it — the channel's chat sessions are unaffected on pi, and on opencode chat `/new` only gains the same availability check against the channel config model (see the per-task model design spec, `docs/scheduled-task-model-spec.md`). Precedence: task `model` > channel agent config's `model` > env/adapter default. Blank or absent = the channel agent config's model. Parsing only checks for a non-empty string; validity is enforced at fire time by the adapter: **pi** passes it to the pi process as `--model` at spawn (an invalid model makes the process fail at startup), **opencode** runs its availability check against the effective (override-first) model and refuses to create a session. Applies to scheduled fires and `/schedule-run` alike, since both share one fire path. |
 
-`schedule add` writes the front matter with `schedule`, `directory` (only if you entered one) and `timeout`, plus the example prompt body. It does not write `enabled` (absent means enabled), `target` or `channel` — the `target` and `channel` lines are meant to be set with `/schedule-here <task-name>` (or, for later manual edits, pasted from the `/st` output), and the body is meant to be replaced with your real prompt.
+`schedule add` writes the front matter with `schedule`, `directory` (only if you entered one), `timeout` and `model` (only if you entered a non-empty one), plus the example prompt body. It does not write `enabled` (absent means enabled), `target` or `channel` — the `target` and `channel` lines are meant to be set with `/schedule-here <task-name>` (or, for later manual edits, pasted from the `/st` output), and the body is meant to be replaced with your real prompt.
 
 ## Schedule grammar
 
@@ -133,7 +136,7 @@ Semantics:
 
 On every fire the scheduler injects two synthetic events through the same ingress path ordinary chat messages use:
 
-1. a `command.session.new` with the task's working directory (validated; the operator-configured path is trusted, like the cwd fallback),
+1. a `command.session.new` with the task's working directory (validated; the operator-configured path is trusted, like the cwd fallback) and, when the task has a `model` field, that model — the override rides the same event into the agent-session creation, so only this task's run uses it;
 2. a `user.message` with the task's prompt, verbatim.
 
 Both carry a synthetic, run-unique client session id of the form `schedule:<task-name>:<run-seq>`. The core treats it like any other session, with two deliberate exceptions:
@@ -160,6 +163,8 @@ A run ends for exactly one of two reasons:
 2. **Timeout** — the run exceeds the task's `timeout` (default `10m`): the scheduler aborts that run's session and delivers `⏰ Scheduled task "name" timed out.` to the target chat.
 
 Fire-time validation failures behave like failures: if the working directory is invalid or the prompt is empty, **nothing is injected**; the target chat receives `❌ Scheduled task "name" could not start: <detail>` and the fire is logged. If the task has no valid `target`, there is nowhere to deliver to — the fire is skipped and only logged, and `schedule list` shows `Target: no`.
+
+**A typo'd or unavailable `model` is not part of that fire-time check.** It is validated by the adapter when the session is created (pi: passed to the pi process as `--model` at spawn, fail-fast if the process exits; opencode: an availability check that refuses to create the session). When session creation fails, the fire **fails** rather than falling back: the run ends immediately, the target chat receives `❌ Scheduled task "name" failed. <adapter's error detail>`, and a manual `/schedule-run` reports the real reason in its reply. There is no fallback to the channel default model — the follow-up prompt is never sent, so the task cannot silently run on the wrong model. (A task with no valid `target` has nowhere to receive the notice; such a fire is skipped and only logged.) Treat the `model` field as "pin it and verify the first `/schedule-run` succeeded on the intended model" — a typo now fails loudly and visibly instead of silently burning the default model's budget.
 
 ### Hot reload: edits are picked up within 30 seconds
 
@@ -213,7 +218,7 @@ Bind this chat as a task's delivery target in one step — send it **in the chat
 
 | Command | What it does |
 | --- | --- |
-| `agent-bridge schedule add` | Interactive wizard: name the task (globally unique — no channel selection), enter the schedule (validated, with examples), optionally set the working directory and timeout, then write the task file with an example prompt and print the targeting instruction. |
+| `agent-bridge schedule add` | Interactive wizard: name the task (globally unique — no channel selection), enter the schedule (validated, with examples), optionally set the working directory, timeout and a per-task model, then write the task file with an example prompt and print the targeting instruction. |
 | `agent-bridge schedule list` | Table of every task across all channels: Channel, Task, Schedule, Enabled (`yes`/`no`), Target (`yes`/`no`), Next run (computed from the grammar at the current clock) and Status (`ERROR:`/`WARN:` notes such as missing schedule, invalid timeout, empty body, unknown keys). |
 | `agent-bridge schedule remove <task-name>` | Delete the task file directly. Task names are globally unique, so no disambiguation or `--channel` option is needed. |
 

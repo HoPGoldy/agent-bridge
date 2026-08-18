@@ -54,6 +54,7 @@ function makeTask(overrides: Partial<ScheduleTask> & { name: string }): Schedule
     channel: "channel" in overrides ? overrides.channel : "test",
     target: overrides.target,
     prompt: overrides.prompt ?? "do the thing",
+    model: overrides.model,
   };
 }
 
@@ -65,9 +66,9 @@ type MockLogger = { debug: ReturnType<typeof vi.fn>; info: ReturnType<typeof vi.
 
 interface Harness {
   clock: FakeClock;
-  injected: ClientOutputEvent[];
+  dispatched: ClientOutputEvent[];
   delivered: ClientInputEvent[];
-  inject: ReturnType<typeof vi.fn>;
+  dispatchClientEvent: ReturnType<typeof vi.fn>;
   deliver: ReturnType<typeof vi.fn>;
   loadTasks: ReturnType<typeof vi.fn>;
   logger: MockLogger;
@@ -79,10 +80,14 @@ const schedulers: Scheduler[] = [];
 
 function createHarness(options: { tasks?: LoadedTask[]; validateTarget?: (id: string) => boolean } = {}): Harness {
   const clock = new FakeClock();
-  const injected: ClientOutputEvent[] = [];
+  const dispatched: ClientOutputEvent[] = [];
   const delivered: ClientInputEvent[] = [];
-  const inject = vi.fn(async (event: ClientOutputEvent) => {
-    injected.push(event);
+  // The real runner wires dispatchClientEvent to core.input, which never
+  // rejects; the fake mirrors that contract and succeeds by default, so a
+  // fire only proceeds past session.new when the dispatch actually succeeded.
+  const dispatchClientEvent = vi.fn(async (event: ClientOutputEvent) => {
+    dispatched.push(event);
+    return { ok: true } as const;
   });
   const deliver = vi.fn(async (event: ClientInputEvent) => {
     delivered.push(event);
@@ -94,7 +99,7 @@ function createHarness(options: { tasks?: LoadedTask[]; validateTarget?: (id: st
     channelName: "test",
     tickMs: 20,
     now: () => clock.now(),
-    inject,
+    dispatchClientEvent,
     deliver,
     t: getTranslator("en-US"),
     loadTasks,
@@ -102,7 +107,7 @@ function createHarness(options: { tasks?: LoadedTask[]; validateTarget?: (id: st
     ...(options.validateTarget !== undefined ? { validateTarget: options.validateTarget } : {}),
   });
   schedulers.push(scheduler);
-  return { clock, injected, delivered, inject, deliver, loadTasks, logger, tasks, scheduler };
+  return { clock, dispatched, delivered, dispatchClientEvent, deliver, loadTasks, logger, tasks, scheduler };
 }
 
 afterEach(async () => {
@@ -120,15 +125,15 @@ describe("tick loop and hot reload (D8)", () => {
     expect(h.loadTasks).toHaveBeenCalled();
 
     h.clock.advance(30 * 60_000);
-    await waitFor(() => expect(h.injected).toHaveLength(2));
+    await waitFor(() => expect(h.dispatched).toHaveLength(2));
 
-    expect(h.injected[0]).toEqual({
+    expect(h.dispatched[0]).toEqual({
       type: "command.session.new",
       clientSessionId: "schedule:report:1",
       workingDirectory: await realpath(process.cwd()),
       workingDirectorySource: "default",
     });
-    expect(h.injected[1]).toEqual({
+    expect(h.dispatched[1]).toEqual({
       type: "user.message",
       clientSessionId: "schedule:report:1",
       text: "summarize",
@@ -137,7 +142,7 @@ describe("tick loop and hot reload (D8)", () => {
 
     // No re-fire while the clock stands still.
     await sleep(100);
-    expect(h.injected).toHaveLength(2);
+    expect(h.dispatched).toHaveLength(2);
   });
 
   it("does not burst: a delayed tick fires at most once per task", async () => {
@@ -145,12 +150,12 @@ describe("tick loop and hot reload (D8)", () => {
     await h.scheduler.start();
 
     h.clock.advance(3 * 60 * 60_000); // several due intervals at once
-    await waitFor(() => expect(h.injected).toHaveLength(2));
+    await waitFor(() => expect(h.dispatched).toHaveLength(2));
     await sleep(100);
-    expect(h.injected).toHaveLength(2); // exactly one fire despite the backlog
+    expect(h.dispatched).toHaveLength(2); // exactly one fire despite the backlog
 
     h.clock.advance(30 * 60_000); // only the recomputed nextRun triggers again
-    await waitFor(() => expect(h.injected).toHaveLength(4));
+    await waitFor(() => expect(h.dispatched).toHaveLength(4));
   });
 
   it("re-reads the task at fire time, so an edited prompt is used on the next fire", async () => {
@@ -160,13 +165,13 @@ describe("tick loop and hot reload (D8)", () => {
     await h.scheduler.start();
 
     h.clock.advance(30 * 60_000);
-    await waitFor(() => expect(h.injected).toHaveLength(2));
-    expect(h.injected[1]).toEqual({ type: "user.message", clientSessionId: "schedule:report:1", text: "v1" });
+    await waitFor(() => expect(h.dispatched).toHaveLength(2));
+    expect(h.dispatched[1]).toEqual({ type: "user.message", clientSessionId: "schedule:report:1", text: "v1" });
 
     h.tasks[0] = makeLoaded(makeTask({ name: "report", target: TARGET, prompt: "v2" }));
     h.clock.advance(30 * 60_000);
-    await waitFor(() => expect(h.injected).toHaveLength(4));
-    expect(h.injected[3]).toEqual({ type: "user.message", clientSessionId: "schedule:report:2", text: "v2" });
+    await waitFor(() => expect(h.dispatched).toHaveLength(4));
+    expect(h.dispatched[3]).toEqual({ type: "user.message", clientSessionId: "schedule:report:2", text: "v2" });
   });
 
   it("picks up newly added tasks on the next tick", async () => {
@@ -176,8 +181,8 @@ describe("tick loop and hot reload (D8)", () => {
     h.tasks.push(makeLoaded(makeTask({ name: "fresh", target: TARGET })));
     await waitFor(() => expect(h.loadTasks.mock.calls.length).toBeGreaterThanOrEqual(2));
     h.clock.advance(30 * 60_000);
-    await waitFor(() => expect(h.injected).toHaveLength(2));
-    expect(h.injected[0]).toMatchObject({
+    await waitFor(() => expect(h.dispatched).toHaveLength(2));
+    expect(h.dispatched[0]).toMatchObject({
       type: "command.session.new",
       clientSessionId: "schedule:fresh:1",
     });
@@ -187,13 +192,13 @@ describe("tick loop and hot reload (D8)", () => {
     const h = createHarness({ tasks: [makeLoaded(makeTask({ name: "gone", target: TARGET }))] });
     await h.scheduler.start();
     h.clock.advance(30 * 60_000);
-    await waitFor(() => expect(h.injected).toHaveLength(2));
+    await waitFor(() => expect(h.dispatched).toHaveLength(2));
 
     // Delete the task file: no further fires.
     h.tasks.length = 0;
     h.clock.advance(30 * 60_000);
     await sleep(100);
-    expect(h.injected).toHaveLength(2);
+    expect(h.dispatched).toHaveLength(2);
 
     // A disabled task never fires.
     const h2 = createHarness({
@@ -202,7 +207,7 @@ describe("tick loop and hot reload (D8)", () => {
     await h2.scheduler.start();
     h2.clock.advance(30 * 60_000);
     await sleep(100);
-    expect(h2.injected).toEqual([]);
+    expect(h2.dispatched).toEqual([]);
   });
 
   it("re-anchors nextRun when the schedule changes", async () => {
@@ -215,7 +220,7 @@ describe("tick loop and hot reload (D8)", () => {
     await waitFor(() => expect(h.loadTasks.mock.calls.length).toBeGreaterThanOrEqual(2));
     h.clock.advance(30 * 60_000); // due under the old schedule, not the new one
     await sleep(100);
-    expect(h.injected).toEqual([]);
+    expect(h.dispatched).toEqual([]);
   });
 
   it("fires only tasks bound to this channel: other channels and unbound tasks never tick", async () => {
@@ -229,15 +234,15 @@ describe("tick loop and hot reload (D8)", () => {
     await h.scheduler.start();
 
     h.clock.advance(30 * 60_000);
-    await waitFor(() => expect(h.injected).toHaveLength(2));
+    await waitFor(() => expect(h.dispatched).toHaveLength(2));
     await sleep(100);
     // Only the channel-owned task fired — "theirs" and "unbound" were skipped.
-    expect(h.injected.every((event) => event.clientSessionId === "schedule:mine:1")).toBe(true);
+    expect(h.dispatched.every((event) => event.clientSessionId === "schedule:mine:1")).toBe(true);
   });
 });
 
 describe("fire-time validation (D6/D7)", () => {
-  it("injects nothing and delivers a localized error when the working directory is invalid", async () => {
+  it("dispatches nothing and delivers a localized error when the working directory is invalid", async () => {
     const h = createHarness({
       tasks: [
         makeLoaded(
@@ -248,7 +253,7 @@ describe("fire-time validation (D6/D7)", () => {
     await h.scheduler.start();
     const result = await h.scheduler.fire("bad");
     expect(result).toEqual({ ok: false, reason: "invalid working directory: no such file or directory" });
-    expect(h.injected).toEqual([]);
+    expect(h.dispatched).toEqual([]);
     expect(h.delivered).toEqual([
       {
         type: "assistant.message",
@@ -263,7 +268,7 @@ describe("fire-time validation (D6/D7)", () => {
     await h.scheduler.start();
     const result = await h.scheduler.fire("no-target");
     expect(result).toEqual({ ok: false, reason: "task has no valid target" });
-    expect(h.injected).toEqual([]);
+    expect(h.dispatched).toEqual([]);
     expect(h.delivered).toEqual([]);
     expect(h.logger.warn).toHaveBeenCalledWith(expect.stringContaining("no valid target"));
 
@@ -274,7 +279,7 @@ describe("fire-time validation (D6/D7)", () => {
     await h2.scheduler.start();
     const result2 = await h2.scheduler.fire("bad-target");
     expect(result2).toEqual({ ok: false, reason: "task has no valid target" });
-    expect(h2.injected).toEqual([]);
+    expect(h2.dispatched).toEqual([]);
     expect(h2.delivered).toEqual([]);
   });
 
@@ -285,7 +290,7 @@ describe("fire-time validation (D6/D7)", () => {
     await h.scheduler.start();
     const result = await h.scheduler.fire("empty");
     expect(result).toEqual({ ok: false, reason: "task body is empty" });
-    expect(h.injected).toEqual([]);
+    expect(h.dispatched).toEqual([]);
     expect(h.delivered).toEqual([
       {
         type: "assistant.message",
@@ -316,7 +321,7 @@ describe("fire-time validation (D6/D7)", () => {
       ok: false,
       reason: 'task belongs to channel "other"',
     });
-    expect(h.injected).toEqual([]);
+    expect(h.dispatched).toEqual([]);
     expect(h.delivered).toEqual([]);
     expect(h.logger.warn).toHaveBeenCalledWith(expect.stringContaining('belongs to channel "other"'));
   });
@@ -327,8 +332,8 @@ describe("fire-time validation (D6/D7)", () => {
     });
     await h.scheduler.start();
     expect(await h.scheduler.runNow("legacy")).toEqual({ ok: true });
-    expect(h.injected).toHaveLength(2);
-    expect(h.injected[0]).toMatchObject({ type: "command.session.new", clientSessionId: "schedule:legacy:1" });
+    expect(h.dispatched).toHaveLength(2);
+    expect(h.dispatched[0]).toMatchObject({ type: "command.session.new", clientSessionId: "schedule:legacy:1" });
   });
 
   it("fire and runNow share the same success path", async () => {
@@ -336,7 +341,7 @@ describe("fire-time validation (D6/D7)", () => {
     await h.scheduler.start();
     const result = await h.scheduler.runNow("ok");
     expect(result).toEqual({ ok: true });
-    expect(h.injected).toEqual([
+    expect(h.dispatched).toEqual([
       {
         type: "command.session.new",
         clientSessionId: "schedule:ok:1",
@@ -354,6 +359,122 @@ describe("fire-time validation (D6/D7)", () => {
   });
 });
 
+describe("per-task model override (scheduled-task-model spec)", () => {
+  it("dispatches the task's pinned model on the synthetic session.new event", async () => {
+    const h = createHarness({
+      tasks: [
+        makeLoaded(
+          makeTask({ name: "pinned", target: TARGET, model: "azure-openai-responses/gpt-5.6-terra" }),
+        ),
+      ],
+    });
+    await h.scheduler.start();
+    expect(await h.scheduler.fire("pinned")).toEqual({ ok: true });
+    expect(h.dispatched[0]).toEqual({
+      type: "command.session.new",
+      clientSessionId: "schedule:pinned:1",
+      workingDirectory: await realpath(process.cwd()),
+      workingDirectorySource: "default",
+      model: "azure-openai-responses/gpt-5.6-terra",
+    });
+    expect(h.dispatched[1]).toEqual({
+      type: "user.message",
+      clientSessionId: "schedule:pinned:1",
+      text: "do the thing",
+    });
+  });
+
+  it("leaves the model field absent when the task has no pinned model", async () => {
+    const h = createHarness({ tasks: [makeLoaded(makeTask({ name: "plain", target: TARGET }))] });
+    await h.scheduler.start();
+    expect(await h.scheduler.fire("plain")).toEqual({ ok: true });
+    expect("model" in h.dispatched[0]!).toBe(false);
+    expect(h.dispatched[0]).toEqual({
+      type: "command.session.new",
+      clientSessionId: "schedule:plain:1",
+      workingDirectory: await realpath(process.cwd()),
+      workingDirectorySource: "default",
+    });
+  });
+});
+
+describe("dispatch failure (T6)", () => {
+  it("fails the fire when session.new dispatch reports { ok: false }: run ended, no user.message, failure delivered to target", async () => {
+    const h = createHarness({
+      tasks: [makeLoaded(makeTask({ name: "report", target: TARGET, prompt: "summarize" }))],
+    });
+    await h.scheduler.start();
+
+    // A session-creation failure (for example an invalid/unavailable task
+    // model rejected by the adapter) surfaces through the ingress result.
+    h.dispatchClientEvent.mockImplementation(async (event: ClientOutputEvent) => {
+      h.dispatched.push(event);
+      if (event.type === "command.session.new") {
+        return { ok: false, reason: "boom: model not available" };
+      }
+      return { ok: true } as const;
+    });
+
+    const result = await h.scheduler.fire("report");
+    // /schedule-run invokers see the real cause, not a generic message.
+    expect(result).toEqual({ ok: false, reason: "boom: model not available" });
+
+    // The run ended and the user.message was never dispatched: there is no
+    // path to auto-create a model-less session (the pre-T6 silent fallback).
+    expect(h.dispatched).toHaveLength(1);
+    expect(h.dispatched[0]).toMatchObject({ type: "command.session.new" });
+    expect(h.delivered).toEqual([
+      {
+        type: "assistant.message",
+        clientSessionId: TARGET,
+        text: '❌ Scheduled task "report" failed. boom: model not available',
+      },
+    ]);
+
+    // The run has ended: a late completion is an orphan and delivers nothing.
+    h.scheduler.handleOutput({ type: "assistant.message", clientSessionId: "schedule:report:1", text: "late" });
+    expect(h.delivered).toHaveLength(1);
+  });
+
+  it("fails the fire when user.message dispatch reports { ok: false } with the same handling", async () => {
+    const h = createHarness({
+      tasks: [makeLoaded(makeTask({ name: "report", target: TARGET, prompt: "summarize" }))],
+    });
+    await h.scheduler.start();
+
+    h.dispatchClientEvent.mockImplementation(async (event: ClientOutputEvent) => {
+      h.dispatched.push(event);
+      if (event.type === "user.message") {
+        return { ok: false, reason: "boom: prompt rejected" };
+      }
+      return { ok: true } as const;
+    });
+
+    const result = await h.scheduler.fire("report");
+    expect(result).toEqual({ ok: false, reason: "boom: prompt rejected" });
+    expect(h.dispatched).toHaveLength(2);
+    expect(h.delivered).toEqual([
+      {
+        type: "assistant.message",
+        clientSessionId: TARGET,
+        text: '❌ Scheduled task "report" failed. boom: prompt rejected',
+      },
+    ]);
+  });
+
+  it("a task without a valid target still returns { ok: false } with no dispatch and no delivery attempt", async () => {
+    const h = createHarness({ tasks: [makeLoaded(makeTask({ name: "no-target" }))] });
+    await h.scheduler.start();
+    const result = await h.scheduler.fire("no-target");
+    expect(result).toEqual({ ok: false, reason: "task has no valid target" });
+    // The fire validates the target before dispatching, so the dispatch-
+    // failure handler never runs for an unbound task (its no-target branch
+    // is defensive only).
+    expect(h.dispatchClientEvent).not.toHaveBeenCalled();
+    expect(h.delivered).toEqual([]);
+  });
+});
+
 describe("timeout (D5)", () => {
   it("aborts the synthetic session and delivers a localized timeout notice", async () => {
     const h = createHarness({
@@ -363,7 +484,7 @@ describe("timeout (D5)", () => {
     await h.scheduler.runNow("slow");
 
     await waitFor(() => expect(h.delivered).toHaveLength(1));
-    expect(h.injected[2]).toEqual({ type: "command.session.stop", clientSessionId: "schedule:slow:1" });
+    expect(h.dispatched[2]).toEqual({ type: "command.session.stop", clientSessionId: "schedule:slow:1" });
     expect(h.delivered[0]).toEqual({
       type: "assistant.message",
       clientSessionId: TARGET,
@@ -476,7 +597,7 @@ describe("concurrent runs of the same task (D5)", () => {
     expect(await h.scheduler.fire("report")).toEqual({ ok: true });
 
     // Each run got its own run-unique synthetic session id.
-    expect(h.injected.map((e) => e.clientSessionId)).toEqual([
+    expect(h.dispatched.map((e) => e.clientSessionId)).toEqual([
       "schedule:report:1",
       "schedule:report:1",
       "schedule:report:2",
@@ -521,10 +642,10 @@ describe("concurrent runs of the same task (D5)", () => {
     // session and delivers the timeout notice for run 2.
     await waitFor(() => expect(h.delivered).toHaveLength(2));
     expect(
-      h.injected.some((e) => e.type === "command.session.stop" && e.clientSessionId === "schedule:report:2"),
+      h.dispatched.some((e) => e.type === "command.session.stop" && e.clientSessionId === "schedule:report:2"),
     ).toBe(true);
     expect(
-      h.injected.some((e) => e.type === "command.session.stop" && e.clientSessionId === "schedule:report:1"),
+      h.dispatched.some((e) => e.type === "command.session.stop" && e.clientSessionId === "schedule:report:1"),
     ).toBe(false);
     expect(h.delivered[1]).toEqual({
       type: "assistant.message",
@@ -555,7 +676,7 @@ describe("stop() races (SF-2)", () => {
 
     const result = await firePromise;
     expect(result).toEqual({ ok: false, reason: "scheduler is not running" });
-    expect(h.injected).toEqual([]);
+    expect(h.dispatched).toEqual([]);
     expect(h.delivered).toEqual([]);
 
     // Nothing was registered after stop: any event is an orphan.
@@ -564,40 +685,89 @@ describe("stop() races (SF-2)", () => {
     expect(h.logger.info).toHaveBeenCalledWith(expect.stringContaining("orphan"));
   });
 
-  it("stop during the inject await leaves no run record and no timer behind", async () => {
+  it("stop during the dispatch await leaves no run record and no timer behind", async () => {
     const h = createHarness({
       tasks: [makeLoaded(makeTask({ name: "report", target: TARGET, timeoutMs: 50 }))],
     });
     await h.scheduler.start();
 
-    // Hold the fire inside its first inject (the run is already registered).
-    let enteredInject: () => void = () => {};
-    const injectEntered = new Promise<void>((resolve) => {
-      enteredInject = resolve;
+    // Hold the fire inside its first dispatch (the run is already registered).
+    let enteredDispatch: () => void = () => {};
+    const dispatchEntered = new Promise<void>((resolve) => {
+      enteredDispatch = resolve;
     });
-    let releaseInject: () => void = () => {};
-    const injectGate = new Promise<void>((resolve) => {
-      releaseInject = resolve;
+    let releaseDispatch: () => void = () => {};
+    const dispatchGate = new Promise<void>((resolve) => {
+      releaseDispatch = resolve;
     });
-    h.inject.mockImplementation(async (event: ClientOutputEvent) => {
+    h.dispatchClientEvent.mockImplementation(async (event: ClientOutputEvent) => {
       if (event.type === "command.session.new") {
-        enteredInject();
-        await injectGate;
+        enteredDispatch();
+        await dispatchGate;
       }
+      return { ok: true } as const;
     });
 
     const firePromise = h.scheduler.fire("report");
-    await injectEntered; // run registered, session.new in flight
+    await dispatchEntered; // run registered, session.new in flight
     await h.scheduler.stop(); // clears the registered run and its timer
-    releaseInject();
+    releaseDispatch();
 
     expect(await firePromise).toEqual({ ok: true });
 
     // The run's 50 ms timer was cleared by stop(): long past its timeout
-    // there is no stop inject and no timeout notice.
+    // there is no stop dispatch and no timeout notice.
     await sleep(200);
-    expect(h.injected.filter((e) => e.type === "command.session.stop")).toEqual([]);
+    expect(h.dispatched.filter((e) => e.type === "command.session.stop")).toEqual([]);
     expect(h.delivered).toEqual([]);
+  });
+
+  it("delivers nothing when a post-stop dispatch resolves { ok:false } with the gateway reason", async () => {
+    const h = createHarness({
+      tasks: [makeLoaded(makeTask({ name: "report", target: TARGET, timeoutMs: 50 }))],
+    });
+    await h.scheduler.start();
+
+    // Hold the fire inside its first dispatch (the run is already registered),
+    // then let stop() land before the dispatch resolves the way the real core
+    // does after teardown: `{ ok: false, reason: "gateway is not running" }`
+    // (the ingress never rejects). Pre-T6 this same post-stop dispatch was a
+    // silent no-op; the fire must not treat it as a task failure.
+    let enteredDispatch: () => void = () => {};
+    const dispatchEntered = new Promise<void>((resolve) => {
+      enteredDispatch = resolve;
+    });
+    let releaseDispatch: () => void = () => {};
+    const dispatchGate = new Promise<void>((resolve) => {
+      releaseDispatch = resolve;
+    });
+    h.dispatchClientEvent.mockImplementation(async (event: ClientOutputEvent) => {
+      if (event.type === "command.session.new") {
+        enteredDispatch();
+        await dispatchGate;
+      }
+      return { ok: false, reason: "gateway is not running" } as const;
+    });
+
+    const firePromise = h.scheduler.fire("report");
+    await dispatchEntered; // run registered, session.new in flight
+    await h.scheduler.stop();
+    releaseDispatch();
+
+    // The failure is reported to the caller but nothing is delivered: a
+    // post-stop dispatch failure is not a task failure (no spurious
+    // `taskFailed` notice in the target chat).
+    expect(await firePromise).toEqual({ ok: false, reason: "gateway is not running" });
+    expect(h.delivered).toEqual([]);
+
+    // The run was ended: its 50 ms timer never fires (no stop dispatch, no
+    // timeout notice) and any late output is treated as an orphan.
+    await sleep(200);
+    expect(h.dispatched.filter((e) => e.type === "command.session.stop")).toEqual([]);
+    expect(h.delivered).toEqual([]);
+    h.scheduler.handleOutput({ type: "assistant.message", clientSessionId: "schedule:report:1", text: "x" });
+    expect(h.delivered).toEqual([]);
+    expect(h.logger.info).toHaveBeenCalledWith(expect.stringContaining("orphan"));
   });
 });
 
@@ -626,10 +796,11 @@ summarize the logs
     );
 
     const clock = new FakeClock();
-    const injected: ClientOutputEvent[] = [];
+    const dispatched: ClientOutputEvent[] = [];
     const delivered: ClientInputEvent[] = [];
-    const inject = vi.fn(async (event: ClientOutputEvent) => {
-      injected.push(event);
+    const dispatchClientEvent = vi.fn(async (event: ClientOutputEvent) => {
+      dispatched.push(event);
+      return { ok: true } as const;
     });
     const deliver = vi.fn(async (event: ClientInputEvent) => {
       delivered.push(event);
@@ -639,7 +810,7 @@ summarize the logs
       channelName: "test",
       tickMs: 20,
       now: () => clock.now(),
-      inject,
+      dispatchClientEvent,
       deliver,
       t: getTranslator("en-US"),
       schedulesRoot: tempRoot,
@@ -649,14 +820,14 @@ summarize the logs
 
     await scheduler.start();
     clock.advance(30 * 60_000);
-    await waitFor(() => expect(injected).toHaveLength(2));
-    expect(injected[0]).toMatchObject({
+    await waitFor(() => expect(dispatched).toHaveLength(2));
+    expect(dispatched[0]).toMatchObject({
       type: "command.session.new",
       clientSessionId: "schedule:report:1",
       workingDirectory: await realpath(tempRoot),
       workingDirectorySource: "default",
     });
-    expect(injected[1]).toMatchObject({ type: "user.message", text: "summarize the logs" });
+    expect(dispatched[1]).toMatchObject({ type: "user.message", text: "summarize the logs" });
 
     scheduler.handleOutput({ type: "assistant.message", clientSessionId: "schedule:report:1", text: "done!" });
     expect(delivered).toEqual([
@@ -672,14 +843,14 @@ summarize the logs
     );
 
     const clock = new FakeClock();
-    const inject = vi.fn(async () => {});
+    const dispatchClientEvent = vi.fn(async () => ({ ok: true } as const));
     const deliver = vi.fn(async () => {});
     const logger: MockLogger = { debug: vi.fn(), info: vi.fn(), warn: vi.fn(), error: vi.fn() };
     const scheduler = new Scheduler({
       channelName: "test",
       tickMs: 20,
       now: () => clock.now(),
-      inject,
+      dispatchClientEvent,
       deliver,
       t: getTranslator("en-US"),
       schedulesRoot: tempRoot,
@@ -723,14 +894,14 @@ summarize the logs
     );
 
     const clock = new FakeClock();
-    const inject = vi.fn(async () => {});
+    const dispatchClientEvent = vi.fn(async () => ({ ok: true } as const));
     const deliver = vi.fn(async () => {});
     const logger: MockLogger = { debug: vi.fn(), info: vi.fn(), warn: vi.fn(), error: vi.fn() };
     const scheduler = new Scheduler({
       channelName: "test",
       tickMs: 20,
       now: () => clock.now(),
-      inject,
+      dispatchClientEvent,
       deliver,
       t: getTranslator("en-US"),
       schedulesRoot: tempRoot,
@@ -757,14 +928,14 @@ summarize the logs
 
   it("claimTarget reports task not found without a side effect", async () => {
     const clock = new FakeClock();
-    const inject = vi.fn(async () => {});
+    const dispatchClientEvent = vi.fn(async () => ({ ok: true } as const));
     const deliver = vi.fn(async () => {});
     const logger: MockLogger = { debug: vi.fn(), info: vi.fn(), warn: vi.fn(), error: vi.fn() };
     const scheduler = new Scheduler({
       channelName: "test",
       tickMs: 20,
       now: () => clock.now(),
-      inject,
+      dispatchClientEvent,
       deliver,
       t: getTranslator("en-US"),
       schedulesRoot: tempRoot,
@@ -783,14 +954,14 @@ summarize the logs
 
   it("claimTarget finds a file written after the last tick via an immediate load", async () => {
     const clock = new FakeClock();
-    const inject = vi.fn(async () => {});
+    const dispatchClientEvent = vi.fn(async () => ({ ok: true } as const));
     const deliver = vi.fn(async () => {});
     const logger: MockLogger = { debug: vi.fn(), info: vi.fn(), warn: vi.fn(), error: vi.fn() };
     const scheduler = new Scheduler({
       channelName: "test",
       tickMs: 20,
       now: () => clock.now(),
-      inject,
+      dispatchClientEvent,
       deliver,
       t: getTranslator("en-US"),
       schedulesRoot: tempRoot,

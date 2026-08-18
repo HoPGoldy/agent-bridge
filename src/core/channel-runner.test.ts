@@ -333,19 +333,19 @@ describe("runChannel", () => {
     expect(schedulerOptions).toBeDefined();
     expect(schedulerOptions!.channelName).toBe("demo-channel");
 
-    // inject → core.input: synthetic fires enter the core's public ingress.
+    // dispatchClientEvent → core.input: synthetic fires enter the core's public ingress.
     const synthetic: ClientOutputEvent = {
       type: "user.message",
       clientSessionId: "schedule:report:1",
       text: "summarize",
     };
-    await schedulerOptions!.inject({
+    await schedulerOptions!.dispatchClientEvent({
       type: "command.session.new",
       clientSessionId: synthetic.clientSessionId,
       workingDirectory: "/tmp",
       workingDirectorySource: "default",
     });
-    await schedulerOptions!.inject(synthetic);
+    await schedulerOptions!.dispatchClientEvent(synthetic);
     expect(gatewayCoreInput).toHaveBeenCalledTimes(2);
     expect(gatewayCoreInput).toHaveBeenNthCalledWith(1, {
       type: "command.session.new",

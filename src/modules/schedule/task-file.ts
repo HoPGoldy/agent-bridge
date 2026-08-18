@@ -38,6 +38,7 @@ const KNOWN_KEYS = new Set([
   "enabled",
   "target",
   "channel",
+  "model",
 ]);
 
 /** A parsed, validated scheduled task. Invalid tasks are still listed; see {@link LoadedTask.errors}. */
@@ -58,6 +59,13 @@ export interface ScheduleTask {
   target: string | undefined;
   /** Owning channel config name, written by `/schedule-here` alongside `target` (spec D7). */
   channel: string | undefined;
+  /**
+   * Per-task agent model override (design spec `docs/scheduled-task-model-spec.md`);
+   * absent or empty means the channel agent config's model (existing
+   * `config.model ?? PI_MODEL ?? adapter default` resolution is unchanged).
+   * Parsing only checks non-empty-string-when-present — validity is enforced at fire time.
+   */
+  model: string | undefined;
   /** The prompt body (everything after the closing `---`, trimmed). */
   prompt: string;
 }
@@ -141,6 +149,7 @@ export function parseTaskFile(fileName: string, content: string): LoadedTask {
     enabled,
     target: nonEmptyString(fields.target),
     channel: nonEmptyString(fields.channel),
+    model: nonEmptyString(fields.model),
     prompt,
   };
 

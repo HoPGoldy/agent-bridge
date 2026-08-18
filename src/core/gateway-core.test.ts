@@ -787,6 +787,54 @@ describe("GatewayCore", () => {
     });
   });
 
+  it("forwards model from a command.session.new event into createAgentSession options", async () => {
+    const imAdapter = new FakeIMAdapter();
+    const store = makeStore();
+    const createdModels: Array<string | undefined> = [];
+
+    const agentModule = makeFakeModule({
+      create: async (args) => {
+        createdModels.push(args.model);
+        return new FakeAgentAdapter(args.agentSessionId);
+      },
+    });
+
+    const core = new GatewayCore({
+      imAdapter,
+      agentModule,
+      agentConfig: {},
+      agentIdleTimeoutMs: 60_000,
+      channelStateStore: store,
+    });
+    running.push(core);
+    await core.start();
+
+    // A chat-originated /new never sets model → the option is undefined.
+    await imAdapter.emit({
+      type: "command.session.new",
+      clientSessionId: "client-1",
+      workingDirectory: "/tmp/project-a",
+      workingDirectorySource: "user",
+    });
+    await waitFor(() => {
+      expect(createdModels).toHaveLength(1);
+      expect(createdModels[0]).toBeUndefined();
+    });
+
+    // A schedule fire with a pinned model threads it through to the module.
+    await core.input({
+      type: "command.session.new",
+      clientSessionId: "schedule:report:1",
+      workingDirectory: "/tmp/project-a",
+      workingDirectorySource: "default",
+      model: "azure-openai-responses/gpt-5.6-terra",
+    });
+    await waitFor(() => {
+      expect(createdModels).toHaveLength(2);
+      expect(createdModels[1]).toBe("azure-openai-responses/gpt-5.6-terra");
+    });
+  });
+
   it("passes the persisted workingDirectory to resumeAgentSession on restore", async () => {
     const imAdapter = new FakeIMAdapter();
     const store = makeStore({
@@ -2688,12 +2736,52 @@ describe("GatewayCore", () => {
     expect(store.state.agentSessions[agentSessionId]).toBeUndefined();
   });
 
-  it("keeps a first-message schedule:* binding in memory without a state-store write", async () => {
+  it("input() resolves { ok: true } on success for session.new and user.message", async () => {
     const imAdapter = new FakeIMAdapter();
     const store = makeStore();
     const createdAdapters: FakeAgentAdapter[] = [];
 
-    const agentModule = makeFakeModule({ createdAdapters });
+    const core = new GatewayCore({
+      imAdapter,
+      agentModule: makeFakeModule({ createdAdapters }),
+      agentConfig: {},
+      agentIdleTimeoutMs: 60_000,
+      channelStateStore: store,
+    });
+    running.push(core);
+    await core.start();
+
+    await expect(
+      core.input({
+        type: "command.session.new",
+        clientSessionId: "schedule:report:1",
+        workingDirectory: "/tmp/project-a",
+        workingDirectorySource: "default",
+      }),
+    ).resolves.toEqual({ ok: true });
+    await expect(
+      core.input({
+        type: "user.message",
+        clientSessionId: "schedule:report:1",
+        text: "produce the report",
+      }),
+    ).resolves.toEqual({ ok: true });
+    await waitFor(() => expect(createdAdapters).toHaveLength(1));
+  });
+
+  it("surfaces a failed schedule session.new as { ok: false } without delivering to the IM adapter", async () => {
+    const imAdapter = new FakeIMAdapter();
+    const store = makeStore();
+    const createdAdapters: FakeAgentAdapter[] = [];
+
+    // A session creation failure (for example an invalid/unavailable task
+    // model rejected by the adapter) for a schedule:* id.
+    const agentModule = makeFakeModule({
+      createdAdapters,
+      create: async () => {
+        throw new Error("boom: model not available");
+      },
+    });
 
     const core = new GatewayCore({
       imAdapter,
@@ -2705,35 +2793,120 @@ describe("GatewayCore", () => {
     running.push(core);
     await core.start();
 
-    // A user.message with no prior session.new exercises the first-time
-    // binding path (#bindClientToAgent), which must skip the transaction for
-    // schedule:* ids just like the switch path.
-    await core.input({
-      type: "user.message",
+    const result = await core.input({
+      type: "command.session.new",
       clientSessionId: "schedule:report:1",
-      text: "produce the report",
+      workingDirectory: "/tmp/project-a",
+      workingDirectorySource: "default",
+    });
+    expect(result).toEqual({ ok: false, reason: "boom: model not available" });
+
+    // Nothing reached the IM adapter: a schedule:* id cannot be resolved by
+    // any adapter, so the failure surfaces through the ingress result only
+    // (T6) — the scheduler delivers the failure to the task's target chat.
+    expect(imAdapter.outputs).toEqual([]);
+    expect(createdAdapters).toHaveLength(0);
+  });
+
+  it("chat /new failure still delivers the localized notice and input() resolves with { ok: false }", async () => {
+    const imAdapter = new FakeIMAdapter();
+    const store = makeStore();
+    const createdAdapters: FakeAgentAdapter[] = [];
+
+    const agentModule = makeFakeModule({
+      createdAdapters,
+      create: async () => {
+        throw new Error("boom: cannot create");
+      },
     });
 
-    await waitFor(() => {
-      expect(createdAdapters).toHaveLength(1);
-      expect(createdAdapters[0]!.inputs).toEqual([{ type: "user.message", text: "produce the report" }]);
+    const core = new GatewayCore({
+      imAdapter,
+      agentModule,
+      agentConfig: {},
+      agentIdleTimeoutMs: 60_000,
+      channelStateStore: store,
     });
-    expect(store.state.bindings).toEqual({});
+    running.push(core);
+    await core.start();
 
-    // The session is still routable in memory: a follow-up message reaches
-    // the same adapter.
-    await core.input({
-      type: "user.message",
-      clientSessionId: "schedule:report:1",
-      text: "again",
-    });
-    await waitFor(() => {
-      expect(createdAdapters).toHaveLength(1);
-      expect(createdAdapters[0]!.inputs).toEqual([
-        { type: "user.message", text: "produce the report" },
-        { type: "user.message", text: "again" },
-      ]);
-    });
+    // The ingress never rejects — adapters rely on that — and the localized
+    // notice still reaches the chat, unchanged from before T6.
+    await expect(
+      core.input({
+        type: "command.session.new",
+        clientSessionId: "client-1",
+        workingDirectory: "/tmp/project-a",
+        workingDirectorySource: "user",
+      }),
+    ).resolves.toEqual({ ok: false, reason: "boom: cannot create" });
+    expect(
+      imAdapter.outputs.some(
+        (event) =>
+          event.type === "assistant.message" && event.text.includes("Failed to start a new session"),
+      ),
+    ).toBe(true);
+  });
+
+  it("drops a user.message for an unbound schedule:* id instead of auto-creating a session", async () => {
+    const imAdapter = new FakeIMAdapter();
+    const store = makeStore();
+    const createdAdapters: FakeAgentAdapter[] = [];
+    const logSpy = vi.spyOn(console, "warn").mockImplementation(() => {});
+
+    try {
+      const agentModule = makeFakeModule({ createdAdapters });
+
+      const core = new GatewayCore({
+        imAdapter,
+        agentModule,
+        agentConfig: {},
+        agentIdleTimeoutMs: 60_000,
+        channelStateStore: store,
+      });
+      running.push(core);
+      await core.start();
+
+      // A user.message with no prior session.new must never auto-create a
+      // session (T6): schedule:* sessions are created exclusively by their
+      // synthetic session.new (spec D1), and auto-creation would run without
+      // the task's model override. The orphan message is logged and dropped;
+      // the intentional drop counts as handled.
+      await expect(
+        core.input({
+          type: "user.message",
+          clientSessionId: "schedule:report:1",
+          text: "produce the report",
+        }),
+      ).resolves.toEqual({ ok: true });
+      expect(createdAdapters).toHaveLength(0);
+      expect(imAdapter.outputs).toEqual([]);
+      expect(logSpy).toHaveBeenCalledWith(
+        expect.stringContaining("[core]"),
+        expect.stringContaining("dropping user.message for unbound schedule session schedule:report:1"),
+      );
+
+      // A bound schedule session still works: session.new then user.message,
+      // and the binding stays memory-only (spec D1).
+      await core.input({
+        type: "command.session.new",
+        clientSessionId: "schedule:report:1",
+        workingDirectory: "/tmp/project-a",
+        workingDirectorySource: "default",
+      });
+      await core.input({
+        type: "user.message",
+        clientSessionId: "schedule:report:1",
+        text: "produce the report",
+      });
+      await waitFor(() => {
+        expect(createdAdapters).toHaveLength(1);
+        expect(createdAdapters[0]!.inputs).toEqual([{ type: "user.message", text: "produce the report" }]);
+      });
+      expect(store.state.bindings).toEqual({});
+    } finally {
+      logSpy.mockRestore();
+    }
   });
 
   it("deletes the agent session record when a schedule:* runtime is released by the idle timer", async () => {
@@ -2753,6 +2926,14 @@ describe("GatewayCore", () => {
     running.push(core);
     await core.start();
 
+    // Spec D1: schedule sessions are created by their synthetic session.new;
+    // the follow-up user.message then finds the in-memory binding.
+    await core.input({
+      type: "command.session.new",
+      clientSessionId: "schedule:report:1",
+      workingDirectory: "/tmp/project-a",
+      workingDirectorySource: "default",
+    });
     await core.input({
       type: "user.message",
       clientSessionId: "schedule:report:1",
@@ -2827,17 +3008,22 @@ describe("GatewayCore", () => {
     await core.start();
 
     await core.stop();
-    await core.input({
-      type: "user.message",
-      clientSessionId: "client-1",
-      text: "ignored",
-    });
-    await core.input({
-      type: "command.session.new",
-      clientSessionId: "schedule:report:1",
-      workingDirectory: "/tmp/project-a",
-      workingDirectorySource: "default",
-    });
+    // The ingress never rejects: after stop it resolves `{ ok: false }`.
+    await expect(
+      core.input({
+        type: "user.message",
+        clientSessionId: "client-1",
+        text: "ignored",
+      }),
+    ).resolves.toEqual({ ok: false, reason: "gateway is not running" });
+    await expect(
+      core.input({
+        type: "command.session.new",
+        clientSessionId: "schedule:report:1",
+        workingDirectory: "/tmp/project-a",
+        workingDirectorySource: "default",
+      }),
+    ).resolves.toEqual({ ok: false, reason: "gateway is not running" });
 
     // No runtime was created and nothing was delivered: the shutdown guard
     // applies to the public ingress exactly as it does to adapter messages.

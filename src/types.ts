@@ -21,6 +21,15 @@ export type ClientOutputEvent =
        * bridge process cwd), which is trusted and never allowlist-checked.
        */
       workingDirectorySource: ClientWorkingDirectorySource;
+      /**
+       * Per-task agent model override (design spec
+       * `docs/scheduled-task-model-spec.md`). Only the scheduler's synthetic
+       * fire injection (spec D1) sets this — chat-originated `/new` never does,
+       * so chat sessions are unaffected. The gateway forwards it to the agent
+       * module's create-session options; adapters resolve the effective model
+       * with precedence task override > channel config > env/adapter default.
+       */
+      model?: string;
     }
   | {
       type: "command.session.compact";
@@ -206,6 +215,14 @@ export interface ChannelCommonContext extends ChannelCommonConfig {
   channelName: string;
 }
 
+/**
+ * Outcome of the core's client-output ingress (`GatewayCore.input`): normal
+ * completion resolves `{ ok: true }`, any handler failure resolves
+ * `{ ok: false, reason }` with the underlying error message. The ingress
+ * never rejects — adapters and the scheduler rely on that contract (T6).
+ */
+export type IngressResult = { ok: true } | { ok: false; reason: string };
+
 /** Outcome of a manual task trigger (`/schedule-run`, spec D7a). */
 export type ScheduleRunResult = { ok: true } | { ok: false; reason: string };
 
@@ -311,6 +328,17 @@ export interface AgentModule<TConfig = unknown, TState extends object = Record<s
      * enforcement applies (local realpath for Pi, lexical-only for OpenCode).
      */
     allowedWorkingDirectoryRoots?: string[];
+    /**
+     * Optional per-task model override (design spec
+     * `docs/scheduled-task-model-spec.md`): set only for task-run sessions
+     * created through the scheduler's synthetic `command.session.new`;
+     * chat-originated `/new` never sets it. The effective model is resolved
+     * by the adapter with precedence override > channel config > env/adapter
+     * default. The pi-coding-agent module applies it at spawn (T2); opencode
+     * ignores it until T3. Resume is intentionally untouched: task sessions
+     * never resume.
+     */
+    model?: string;
   }): Promise<AgentAdapter>;
   /**
    * Restores an adapter for an existing persisted agent session from its

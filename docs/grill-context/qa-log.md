@@ -81,3 +81,35 @@
 问题：解绑的判定依据（补充确认）？
 
 用户回答：（本轮总结时提出）`/schedule-here` 判"已绑定"的依据是 `target` 或 `channel` 任一非空，拒绝并提示先解绑。
+
+---
+
+## 2026-08-18 定时任务支持 per-task 模型指定
+
+问题：模型指定的作用范围——只做定时任务 per-task，还是通用 per-session 覆盖？
+
+用户回答：只做定时任务 per-task（任务文件加 `model:` 字段，只影响任务创建的独立会话）。通用 per-session 已存在（聊天内 `/model` 命令），不需要重做。
+
+---
+
+问题：任务里写的模型无效/不可用时的表现？
+
+用户回答：fail-fast——该次运行直接失败，把"模型不可用"作为失败通知投递到目标聊天，不做回落（不用静默 fallback，不在扫描阶段校验）。
+
+---
+
+问题：`schedule add` 交互向导是否加模型输入步骤？
+
+用户回答：加一步可选输入，留空表示用 channel 默认模型。（CLI 不做模型有效性校验，写错靠 fire 时 fail-fast 兜底。）
+
+---
+
+问题：`schedule list` 是否加 Model 列？
+
+用户回答：不加，想看模型就打开任务文件。（list 保持现状。）
+
+---
+
+问题：会话创建失败如何回传给 Scheduler（T6 设计讨论，含用户提问后澄清：inject === core.input 的直接 await，core 入口吞错误导致异常传播不可行）？
+
+用户回答：不用异常。core 吞错误没问题，但 input/inject 的返回值从 `Promise<void>` 改为返回结果对象（`{ ok: true } | { ok: false; reason: string }`）：正常创建返回 ok:true；失败返回 ok:false + 原因。adapter 调用方忽略返回值（fire-and-forget 不变），scheduler 检查返回值决定是否继续注入 user.message、结束 run 并投递失败通知。另：`inject` 命名不佳，需改为更语义化的名字。

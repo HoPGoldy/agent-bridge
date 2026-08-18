@@ -109,6 +109,16 @@ export interface OpenCodeAgentAdapterOptions {
     | AgentSessionStateApi<OpenCodeAgentSessionStateV1>;
   /** Channel-level OpenCode configuration. Never mutated. */
   config: OpenCodeAgentConfig;
+  /**
+   * Optional per-task model override (design spec
+   * `docs/scheduled-task-model-spec.md`): set only for scheduler task-run
+   * sessions; chat-originated sessions never carry it. Resolved with
+   * precedence override > channel `config.model`, applied on the create path
+   * only (`#startCreate`) — resume never receives it (task sessions never
+   * resume). The module already validated format and availability against the
+   * effective model before constructing the adapter.
+   */
+  model?: string;
   /** Channel name; part of the directory-scoped runtime cache key. */
   channelName: string;
   /**
@@ -148,6 +158,7 @@ export class OpenCodeAgentAdapter implements AgentAdapter, OpenCodeRuntimeAdapte
     | { mode: "create"; sessionState: NewAgentSessionStateApi<OpenCodeAgentSessionStateV1> }
     | { mode: "resume"; sessionState: AgentSessionStateApi<OpenCodeAgentSessionStateV1> };
   readonly #config: OpenCodeAgentConfig;
+  readonly #modelOverride?: string;
   readonly #channelName: string;
   readonly #workingDirectory?: string;
   readonly #workingDirectorySource?: "user" | "default";
@@ -192,6 +203,7 @@ export class OpenCodeAgentAdapter implements AgentAdapter, OpenCodeRuntimeAdapte
             sessionState: options.sessionState as AgentSessionStateApi<OpenCodeAgentSessionStateV1>,
           };
     this.#config = options.config;
+    this.#modelOverride = options.model;
     this.#channelName = options.channelName;
     this.#workingDirectory = options.workingDirectory;
     this.#workingDirectorySource = options.workingDirectorySource;
@@ -259,7 +271,14 @@ export class OpenCodeAgentAdapter implements AgentAdapter, OpenCodeRuntimeAdapte
     }
     const { sessionState } = this.#handle;
     const { directory, source } = this.#resolveCreateDirectory();
-    const effective = { ...this.#config, directory };
+    // The effective model is the per-task override when present, else the
+    // channel config model — createSession, state init and
+    // currentModelFromSessionData all observe the same effective value.
+    const effective = {
+      ...this.#config,
+      directory,
+      ...(this.#modelOverride !== undefined ? { model: this.#modelOverride } : {}),
+    };
     const runtime = this.#getRuntime(this.#channelName, effective);
     this.#runtime = runtime;
     const session = await runtime.api.createSession({

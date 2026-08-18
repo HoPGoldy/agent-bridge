@@ -376,8 +376,20 @@ export function createOpenCodeAgentModule(
      * working-directory policy, provider session creation, state
      * initialization and runtime registration inside `start()`.
      */
-    async createAgentSession({ config, common, agentSessionId, sessionState, workingDirectory, workingDirectorySource, allowedWorkingDirectoryRoots }) {
+    async createAgentSession({ config, common, agentSessionId, sessionState, workingDirectory, workingDirectorySource, allowedWorkingDirectoryRoots, model }) {
       logger.info(`creating agent session ${agentSessionId} for channel ${common.channelName}`);
+      // Per-task model override (design spec `docs/scheduled-task-model-spec.md`):
+      // the effective model is the task override when present, else the channel
+      // config model. Absent (or empty) override means the channel model, so
+      // chat-originated sessions — which never set the override — keep the
+      // existing resolution unchanged. Fail-fast: an invalid or unavailable
+      // effective model throws here, before any session is created, with no
+      // silent fallback to the channel default.
+      const override = model?.trim() || undefined;
+      const effectiveModel = override ?? config.model;
+      if (effectiveModel) {
+        await assertModelAvailable(effectiveModel, await apiFactory(config).getProviders());
+      }
       return new OpenCodeAgentAdapter({
         agentSessionId,
         mode: "create",
@@ -387,6 +399,7 @@ export function createOpenCodeAgentModule(
         ...(workingDirectory !== undefined ? { workingDirectory } : {}),
         ...(workingDirectorySource !== undefined ? { workingDirectorySource } : {}),
         ...(allowedWorkingDirectoryRoots !== undefined ? { allowedWorkingDirectoryRoots } : {}),
+        ...(override !== undefined ? { model: override } : {}),
         getRuntime,
       });
     },

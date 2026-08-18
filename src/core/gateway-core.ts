@@ -8,6 +8,7 @@ import type {
   ClientOutputEvent,
   ClientWorkingDirectorySource,
   GatewayCoreOptions,
+  IngressResult,
 } from "../types";
 import { createAgentSessionStateRegistry } from "../config/agent-session-state";
 import { createInMemoryChannelStateStore } from "../config/channel-state";
@@ -68,7 +69,7 @@ export class GatewayCore {
    * agent create is still pending) so no runtime leaks and no binding save is
    * enqueued after the drain. Each tracked promise never rejects.
    */
-  readonly #inFlightHandlers = new Set<Promise<void>>();
+  readonly #inFlightHandlers = new Set<Promise<IngressResult>>();
   #started = false;
 
   constructor({
@@ -111,41 +112,47 @@ export class GatewayCore {
 
   /**
    * Public ingress for synthetic client-output events (spec D2): the
-   * scheduler fires task runs by injecting `command.session.new` and
+   * scheduler fires task runs by dispatching `command.session.new` and
    * `user.message` here. Events travel the exact same path as
    * adapter-delivered messages — the same shutdown guard, error capture and
    * in-flight tracking — so task sessions behave like ordinary sessions in
-   * every respect except the `schedule:*` divert below.
+   * every respect except the `schedule:*` divert below. Never rejects: a
+   * failed handler resolves `{ ok: false, reason }` with the underlying
+   * error message, so the scheduler can fail the whole fire instead of
+   * letting the follow-up `user.message` auto-create a model-less session
+   * (T6).
    */
-  async input(event: ClientOutputEvent): Promise<void> {
-    await this.#processClientOutput(event);
+  async input(event: ClientOutputEvent): Promise<IngressResult> {
+    return this.#processClientOutput(event);
   }
 
   /**
    * Shared client-output ingress used by both the adapter callback in
    * `start()` and the public `input()`: reject once stop has begun, track
    * every handler until it settles, and never let a failing handler produce
-   * an unhandled rejection. A single implementation keeps the two entry
-   * points from drifting apart.
+   * an unhandled rejection — a failing handler resolves `{ ok: false, reason }`
+   * instead. A single implementation keeps the two entry points from
+   * drifting apart.
    */
-  async #processClientOutput(event: ClientOutputEvent): Promise<void> {
+  async #processClientOutput(event: ClientOutputEvent): Promise<IngressResult> {
     // Reject new client output once stop has begun: the adapter may still
     // deliver events while it is shutting down, and those must not start
     // any new work after we have decided to stop.
-    if (!this.#started) return;
+    if (!this.#started) return { ok: false, reason: "gateway is not running" };
 
     // The handled promise never rejects, so a failing handler can never
     // produce an unhandled rejection; the adapter still awaits it so per-
     // channel backpressure and ordering are preserved.
-    const handled = this.#handleClientOutput(event).then(
-      () => undefined,
+    const handled: Promise<IngressResult> = this.#handleClientOutput(event).then(
+      (result) => result,
       (error: unknown) => {
         this.#logger.error("failed to process client output event:", error);
+        return { ok: false, reason: error instanceof Error ? error.message : String(error) };
       },
     );
     this.#inFlightHandlers.add(handled);
     try {
-      await handled;
+      return await handled;
     } finally {
       this.#inFlightHandlers.delete(handled);
     }
@@ -198,41 +205,59 @@ export class GatewayCore {
     }
   }
 
-  async #handleClientOutput(event: ClientOutputEvent): Promise<void> {
+  async #handleClientOutput(event: ClientOutputEvent): Promise<IngressResult> {
     if (event.type === "command.session.new") {
-      await this.#handleSessionNew(event.clientSessionId, event.workingDirectory, event.workingDirectorySource);
-      return;
+      return this.#handleSessionNew(
+        event.clientSessionId,
+        event.workingDirectory,
+        event.workingDirectorySource,
+        event.model,
+      );
     }
 
     if (event.type === "command.session.compact") {
       await this.#handleSessionCompact(event.clientSessionId);
-      return;
+      return { ok: true };
     }
 
     if (event.type === "command.session.stop") {
       await this.#handleSessionStop(event.clientSessionId);
-      return;
+      return { ok: true };
     }
 
     if (event.type === "command.session.status") {
       await this.#handleSessionStatus(event.clientSessionId);
-      return;
+      return { ok: true };
     }
 
     if (event.type === "command.session.model.list") {
       await this.#handleSessionModelList(event.clientSessionId);
-      return;
+      return { ok: true };
     }
 
     if (event.type === "command.session.model.set") {
       await this.#handleSessionModelSet(event.clientSessionId, event.target);
-      return;
+      return { ok: true };
     }
 
     await this.#handleUserMessage(event.clientSessionId, event.text);
+    return { ok: true };
   }
 
   async #handleUserMessage(clientSessionId: string, text: string): Promise<void> {
+    // Defensive invariant (spec D1/T6): a `schedule:*` session is created
+    // exclusively by its synthetic `command.session.new` — the scheduler
+    // always dispatches session.new first and stops on failure. A
+    // `user.message` for an unbound `schedule:*` id must never auto-create a
+    // session: that path would run without the task's model override (the
+    // pre-T6 silent fallback). Log and drop; the intentional drop counts as
+    // handled (`{ ok: true }`).
+    if (this.#isSyntheticScheduleSession(clientSessionId) && !this.#clientToAgentSession.has(clientSessionId)) {
+      this.#logger.warn(
+        `dropping user.message for unbound schedule session ${clientSessionId}`,
+      );
+      return;
+    }
     const runtime = await this.#getOrCreateActiveRuntime(clientSessionId);
     this.#touchRuntime(runtime);
     await runtime.agentAdapter.input({
@@ -417,7 +442,8 @@ export class GatewayCore {
     clientSessionId: string,
     workingDirectory: string,
     workingDirectorySource: ClientWorkingDirectorySource,
-  ): Promise<void> {
+    model?: string,
+  ): Promise<IngressResult> {
     // Transactional switch: create and start the new runtime (and its state
     // record) first so a failed creation never tears down the previous
     // session, its binding, or its runtime.
@@ -426,16 +452,23 @@ export class GatewayCore {
       newRuntime = await this.#createRuntimeForClient(clientSessionId, {
         workingDirectory,
         workingDirectorySource,
+        model,
       });
     } catch (error) {
       const detail = error instanceof Error ? error.message : String(error);
       this.#logger.error(`failed to create new agent session for ${clientSessionId}:`, error);
-      await this.#deliverClientInput({
-        type: "assistant.message",
-        clientSessionId,
-        text: this.#t("gateway.failedToStartNewSession", { detail }),
-      });
-      return;
+      if (!this.#isSyntheticScheduleSession(clientSessionId)) {
+        // Chat-originated `/new` keeps its localized failure notice (T6: for
+        // `schedule:*` ids the adapters cannot resolve the id and would drop
+        // the notice anyway — the failure surfaces through the ingress
+        // result instead, and the scheduler delivers it to the task target).
+        await this.#deliverClientInput({
+          type: "assistant.message",
+          clientSessionId,
+          text: this.#t("gateway.failedToStartNewSession", { detail }),
+        });
+      }
+      return { ok: false, reason: detail };
     }
 
     const previousAgentSessionId = this.#clientToAgentSession.get(clientSessionId);
@@ -451,12 +484,14 @@ export class GatewayCore {
       const detail = error instanceof Error ? error.message : String(error);
       this.#logger.error(`failed to persist the new binding for ${clientSessionId}:`, error);
       await this.#cleanupNewRuntime(newRuntime);
-      await this.#deliverClientInput({
-        type: "assistant.message",
-        clientSessionId,
-        text: this.#t("gateway.failedToStartNewSession", { detail }),
-      });
-      return;
+      if (!this.#isSyntheticScheduleSession(clientSessionId)) {
+        await this.#deliverClientInput({
+          type: "assistant.message",
+          clientSessionId,
+          text: this.#t("gateway.failedToStartNewSession", { detail }),
+        });
+      }
+      return { ok: false, reason: detail };
     }
 
     if (previousAgentSessionId) {
@@ -485,6 +520,8 @@ export class GatewayCore {
         text: this.#t("gateway.startedNewSession", { workingDirectory }),
       });
     }
+
+    return { ok: true };
   }
 
   async #deliverClientInput(event: ClientInputEvent): Promise<void> {
@@ -589,7 +626,11 @@ export class GatewayCore {
    */
   async #createRuntimeForClient(
     clientSessionId: string,
-    options?: { workingDirectory?: string; workingDirectorySource?: ClientWorkingDirectorySource },
+    options?: {
+      workingDirectory?: string;
+      workingDirectorySource?: ClientWorkingDirectorySource;
+      model?: string;
+    },
   ): Promise<AgentRuntime> {
     const agentSessionId = `${this.#agentModule.type}:${randomUUID()}`;
     const sessionState = await this.#agentSessionStateRegistry.reserve({
@@ -612,6 +653,7 @@ export class GatewayCore {
         ...(options?.workingDirectorySource !== undefined
           ? { workingDirectorySource: options.workingDirectorySource }
           : {}),
+        ...(options?.model !== undefined ? { model: options.model } : {}),
         ...(this.#allowedWorkingDirectoryRoots !== undefined
           ? { allowedWorkingDirectoryRoots: this.#allowedWorkingDirectoryRoots }
           : {}),

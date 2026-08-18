@@ -13,6 +13,7 @@ const adapterOptions: Array<{
   sessionState?: unknown;
   workingDirectory?: string;
   allowedWorkingDirectoryRoots?: string[];
+  model?: string;
 }> = [];
 
 // The module falls back to process.env.PI_MODEL when no model is configured
@@ -40,6 +41,7 @@ vi.mock("./adapter/pi-coding-agent-adapter", () => ({
       sessionState?: unknown;
       workingDirectory?: string;
       allowedWorkingDirectoryRoots?: string[];
+      model?: string;
     }) {
       adapterOptions.push(options);
     }
@@ -243,6 +245,47 @@ describe("Pi coding agent module working directory", () => {
         extraArgs: ["--thinking", "high"],
       }),
     );
+  });
+
+  it("applies the task model override with precedence override > config.model > PI_MODEL", async () => {
+    const { handle: taskHandle } = await reserveHandle("pi-coding-agent:task-override");
+    const { handle: configHandle } = await reserveHandle("pi-coding-agent:config-model");
+    const { handle: envHandle } = await reserveHandle("pi-coding-agent:env-model");
+    const previous = process.env.PI_MODEL;
+    process.env.PI_MODEL = "env/model";
+
+    try {
+      // Task override beats config.model.
+      await piCodingAgentModule.createAgentSession({
+        config: { model: "config/model" },
+        common,
+        agentSessionId: "pi-coding-agent:task-override",
+        sessionState: taskHandle,
+        model: "task/model",
+      });
+      expect(adapterOptions.at(-1)?.model).toBe("task/model");
+
+      // config.model beats the env fallback when no override is given.
+      await piCodingAgentModule.createAgentSession({
+        config: { model: "config/model" },
+        common,
+        agentSessionId: "pi-coding-agent:config-model",
+        sessionState: configHandle,
+      });
+      expect(adapterOptions.at(-1)?.model).toBe("config/model");
+
+      // PI_MODEL applies only when neither override nor config sets a model.
+      await piCodingAgentModule.createAgentSession({
+        config: {},
+        common,
+        agentSessionId: "pi-coding-agent:env-model",
+        sessionState: envHandle,
+      });
+      expect(adapterOptions.at(-1)?.model).toBe("env/model");
+    } finally {
+      if (previous === undefined) delete process.env.PI_MODEL;
+      else process.env.PI_MODEL = previous;
+    }
   });
 
   it("applies env fallbacks for bin, sessionDir and extraArgs", async () => {

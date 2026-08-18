@@ -15,6 +15,7 @@ const input = vi.fn(async (label: string) => {
   }
   if (label === "Working directory (optional, blank = bridge cwd)") return "";
   if (label === "Timeout (default 10m)") return "10m";
+  if (label === "Model (optional, blank = channel default)") return "";
   throw new Error(`unexpected input prompt: ${label}`);
 });
 const select = vi.fn(async (label: string) => {
@@ -237,6 +238,27 @@ describe("schedule wizard validators", () => {
     expect(blankDir).not.toContain("directory:");
   });
 
+  it("buildTaskFileContent keeps model between timeout and directory in the front matter", async () => {
+    const { buildTaskFileContent } = await import("./cli");
+    const content = buildTaskFileContent({
+      schedule: "daily 09:00",
+      timeout: "30m",
+      directory: "~/reports",
+      model: "azure-openai-responses/gpt-5.6-terra",
+    });
+    let prev = -1;
+    for (const needle of [
+      "schedule: daily 09:00",
+      "timeout: 30m",
+      "model: azure-openai-responses/gpt-5.6-terra",
+      "directory: ~/reports",
+    ]) {
+      const idx = content.indexOf(needle);
+      expect(idx).toBeGreaterThan(prev);
+      prev = idx;
+    }
+  });
+
   it("buildTaskFileContent localizes the example prompt by language", async () => {
     const { buildTaskFileContent } = await import("./cli");
     const en = buildTaskFileContent({
@@ -265,11 +287,12 @@ describe("schedule wizard validators", () => {
     );
     const { buildTaskFileContent } = await import("./cli");
 
-    // Full form: schedule + directory + timeout must round-trip field-for-field.
+    // Full form: schedule + directory + timeout + model must round-trip field-for-field.
     const full = buildTaskFileContent({
       schedule: "daily 09:00",
       timeout: "30m",
       directory: "~/reports",
+      model: "azure-openai-responses/gpt-5.6-terra",
     });
     const fullLoaded = parseTaskFile("daily-report.md", full);
     expect(fullLoaded.errors).toEqual([]);
@@ -280,6 +303,7 @@ describe("schedule wizard validators", () => {
       schedule: { type: "daily", hour: 9, minute: 0 },
       directory: "~/reports",
       timeoutMs: 30 * 60_000,
+      model: "azure-openai-responses/gpt-5.6-terra",
       enabled: true,
     });
 
@@ -315,6 +339,7 @@ describe("runCli schedule add", () => {
   beforeEach(() => {
     resetPromptMocks();
     delete inputOverrides["Working directory (optional, blank = bridge cwd)"];
+    delete inputOverrides["Model (optional, blank = channel default)"];
     mkdir.mockClear();
     writeFile.mockClear();
     loadAllTasks.mockClear();
@@ -335,6 +360,7 @@ describe("runCli schedule add", () => {
       "input:Schedule (examples: every 5m, daily 09:00, weekly mon 09:00, monthly 15 09:00)",
       "input:Working directory (optional, blank = bridge cwd)",
       "input:Timeout (default 10m)",
+      "input:Model (optional, blank = channel default)",
     ]);
     expect(loadAllTasks).toHaveBeenCalledWith();
     expect(mkdir).toHaveBeenCalledWith("/tmp/schedules", { recursive: true });
@@ -344,6 +370,8 @@ describe("runCli schedule add", () => {
     expect(content).toContain("schedule: daily 09:00");
     expect(content).toContain("timeout: 10m");
     expect(content).not.toContain("directory:");
+    // Blank model answer writes no model: line.
+    expect(content).not.toContain("model:");
     // The example prompt is channel-agnostic and always DEFAULT_LOCALE (English).
     expect(content).toContain("Tell me what time it is right now, in one sentence.");
     expect(content).not.toContain("告诉我现在几点了");
@@ -369,6 +397,32 @@ describe("runCli schedule add", () => {
 
     const [, content] = writeFile.mock.calls[0] as [string, string, string];
     expect(content).toContain("directory: /data/reports");
+  });
+
+  it("writes a model: line when a model is answered", async () => {
+    inputOverrides["Model (optional, blank = channel default)"] =
+      "azure-openai-responses/gpt-5.6-terra";
+    const { runCli } = await import("./cli");
+    try {
+      await runCli(["node", "agent-bridge", "schedule", "add"]);
+    } finally {
+      // no-op; logs not needed here
+    }
+
+    const [, content] = writeFile.mock.calls[0] as [string, string, string];
+    expect(content).toContain("model: azure-openai-responses/gpt-5.6-terra");
+  });
+
+  it("omits the model: line when the model answer is blank", async () => {
+    const { runCli } = await import("./cli");
+    try {
+      await runCli(["node", "agent-bridge", "schedule", "add"]);
+    } finally {
+      // no-op; logs not needed here
+    }
+
+    const [, content] = writeFile.mock.calls[0] as [string, string, string];
+    expect(content).not.toContain("model:");
   });
 
   it("writes the English (default locale) example prompt regardless of channel language", async () => {

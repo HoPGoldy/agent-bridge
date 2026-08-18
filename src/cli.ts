@@ -243,15 +243,21 @@ export function buildTaskFileContent(options: {
   schedule: string;
   timeout: string;
   directory?: string;
+  model?: string;
   language?: LocaleCode;
 }): string {
   const frontMatter = [
     "---",
     `schedule: ${options.schedule}`,
+    `timeout: ${options.timeout}`,
+    // Key order is stable (schedule, timeout, model, directory) so snapshots
+    // and the T2 parser stay predictable. Values are bare, like `directory`.
+    ...(options.model !== undefined && options.model !== ""
+      ? [`model: ${options.model}`]
+      : []),
     ...(options.directory !== undefined && options.directory !== ""
       ? [`directory: ${options.directory}`]
       : []),
-    `timeout: ${options.timeout}`,
     "---",
   ];
   const prompt = getTranslatorForCommon({ language: options.language ?? DEFAULT_LOCALE })(
@@ -288,12 +294,19 @@ async function addScheduleTask(): Promise<void> {
       validate: validateTimeoutInput,
     });
 
+    // Blank = the channel agent config's model (existing resolution unchanged).
+    // Deliberately not validated — the CLI cannot reach provider model lists;
+    // a typo fails fast at fire time (spec failure semantics).
+    const model = await ctx.input("Model (optional, blank = channel default)", {
+      placeholder: "Example: azure-openai-responses/gpt-5.6-terra",
+    });
+
     const schedulesDir = getSchedulesDir();
     await mkdir(schedulesDir, { recursive: true });
     const filePath = path.join(schedulesDir, `${name}.md`);
     await writeFile(
       filePath,
-      buildTaskFileContent({ schedule, timeout, directory, language: DEFAULT_LOCALE }),
+      buildTaskFileContent({ schedule, timeout, directory, model, language: DEFAULT_LOCALE }),
       "utf8",
     );
 

@@ -402,6 +402,58 @@ describe("OpenCodeAgentAdapter", () => {
     await adapter.stop();
   });
 
+  it("applies the create-mode model override over the channel config model", async () => {
+    const api = createApi();
+    const runtime = new OpenCodeRuntime({ api });
+    const sessionState = createSessionState();
+    const adapter = new OpenCodeAgentAdapter({
+      agentSessionId: "opencode:ses-1",
+      mode: "create",
+      sessionState,
+      config: { baseUrl: "http://127.0.0.1:4096", agent: "build", model: "anthropic/claude-sonnet" },
+      channelName: "test-channel",
+      model: "azure/gpt-5",
+      getRuntime: () => runtime,
+    });
+    await adapter.start(vi.fn());
+
+    // The task override wins over the channel config model in createSession,
+    // state init and currentModelFromSessionData (same effective value).
+    expect(api.createSession).toHaveBeenCalledWith({
+      title: "agent-bridge:test-channel",
+      agent: "build",
+      model: { providerID: "azure", modelID: "gpt-5" },
+    });
+    expect(sessionState.initialize).toHaveBeenCalledWith({
+      version: 1,
+      openCodeSessionId: "ses-1",
+      workingDirectory: process.cwd(),
+      workingDirectorySource: "bridge-default",
+    });
+    await adapter.stop();
+  });
+
+  it("ignores any model override on resume (task sessions never resume)", async () => {
+    const api = createApi();
+    const runtime = new OpenCodeRuntime({ api });
+    const adapter = new OpenCodeAgentAdapter({
+      agentSessionId: "opencode:ses-1",
+      mode: "resume",
+      sessionState: createSessionState(),
+      config: { baseUrl: "http://127.0.0.1:4096", agent: "build", model: "anthropic/claude-sonnet" },
+      channelName: "test-channel",
+      model: "azure/gpt-5",
+      getRuntime: () => runtime,
+    });
+    await adapter.start(vi.fn());
+
+    // Resume restores the persisted session and never creates one, so the
+    // override (create-only) has no effect.
+    expect(api.createSession).not.toHaveBeenCalled();
+    expect(api.getSession).toHaveBeenCalledWith("ses-1");
+    await adapter.stop();
+  });
+
   it("compacts and aborts only the current session", async () => {
     const { adapter, api } = createAdapter();
     const output = vi.fn();

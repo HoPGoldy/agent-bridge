@@ -26,15 +26,21 @@
  *   clientSessionId (spec D1), plus fire-time validation of the target and
  *   working directory (spec D6/D7).
  *
- * All external interaction goes through the injected callbacks: `inject`
- * (synthetic client-output events — the runner wires it to the core's input
- * path), `deliver` (egress events to a task's `target` chat) and `t` (the
- * per-channel translator). The runner diverts `schedule:*` agent output into
- * {@link Scheduler.handleOutput}. This module deliberately knows nothing
- * about the agent adapter or the core; T4/T5 wire it up.
+ * All external interaction goes through the injected callbacks:
+ * `dispatchClientEvent` (synthetic client-output events — the runner wires
+ * it to the core's input path), `deliver` (egress events to a task's
+ * `target` chat) and `t` (the per-channel translator). The runner diverts
+ * `schedule:*` agent output into {@link Scheduler.handleOutput}. This module
+ * deliberately knows nothing about the agent adapter or the core; T4/T5 wire
+ * it up.
  */
 
-import type { ClientInputEvent, ClientOutputEvent, ScheduleHereResult } from "../../types";
+import type {
+  ClientInputEvent,
+  ClientOutputEvent,
+  IngressResult,
+  ScheduleHereResult,
+} from "../../types";
 import type { Translator } from "../../i18n";
 import { createLogger, type Logger } from "../../core/logger";
 import { validateWorkingDirectory } from "../client/utils/working-directory";
@@ -59,8 +65,15 @@ export interface SchedulerOptions {
   channelName: string;
   tickMs?: number;
   now?: () => Date;
-  /** Synthetic client-output events for a fire (session.new + user.message). */
-  inject: (event: ClientOutputEvent) => Promise<void>;
+  /**
+   * Dispatches a synthetic client-output event (`session.new` +
+   * `user.message`) into the core's ingress during a fire, returning the
+   * ingress result. The core never rejects: a failed session creation
+   * resolves `{ ok: false, reason }`, and the fire must stop right there
+   * instead of letting the follow-up `user.message` auto-create a model-less
+   * session (T6).
+   */
+  dispatchClientEvent: (event: ClientOutputEvent) => Promise<IngressResult>;
   /** Egress events delivered to a task's `target` chat (result/failure/notice). */
   deliver: (event: ClientInputEvent) => Promise<void>;
   /** Per-channel translator, e.g. `getTranslatorForCommon(common)`. */
@@ -100,7 +113,7 @@ export class Scheduler {
   readonly #channelName: string;
   readonly #tickMs: number;
   readonly #now: () => Date;
-  readonly #inject: (event: ClientOutputEvent) => Promise<void>;
+  readonly #dispatchClientEvent: (event: ClientOutputEvent) => Promise<IngressResult>;
   readonly #deliver: (event: ClientInputEvent) => Promise<void>;
   readonly #t: Translator;
   readonly #validateTarget?: (clientSessionId: string) => boolean;
@@ -126,7 +139,7 @@ export class Scheduler {
     this.#channelName = options.channelName;
     this.#tickMs = options.tickMs ?? DEFAULT_TICK_MS;
     this.#now = options.now ?? (() => new Date());
-    this.#inject = options.inject;
+    this.#dispatchClientEvent = options.dispatchClientEvent;
     this.#deliver = options.deliver;
     this.#t = options.t;
     this.#validateTarget = options.validateTarget;
@@ -241,9 +254,9 @@ export class Scheduler {
 
   /**
    * Runs the task through the exact same path as a scheduled fire (spec
-   * D7a): reloads the task file, validates target/directory/prompt, injects
-   * the two synthetic events and registers a timeout-bounded run. The
-   * localized error reply for the triggering chat is the caller's job.
+   * D7a): reloads the task file, validates target/directory/prompt,
+   * dispatches the two synthetic events and registers a timeout-bounded run.
+   * The localized error reply for the triggering chat is the caller's job.
    */
   async runNow(taskName: string): Promise<FireResult> {
     return this.#fire(taskName);
@@ -364,9 +377,9 @@ export class Scheduler {
       return { ok: false, reason: "task body is empty" };
     }
 
-    // Register the run (with its own timeout timer) BEFORE injecting: the
+    // Register the run (with its own timeout timer) BEFORE dispatching: the
     // run id must exist before any output can arrive, so a failure that
-    // surfaces during the inject window is still attributed to this run.
+    // surfaces during the dispatch window is still attributed to this run.
     // SF-2: if stop() landed while we were awaiting validation, no run and
     // no timer may be created.
     const sessionId = this.#registerRun(task);
@@ -375,30 +388,77 @@ export class Scheduler {
       return { ok: false, reason: "scheduler is not running" };
     }
 
-    // Inject the two synthetic events in order (spec D1).
+    // Dispatch the two synthetic events in order (spec D1). The core's
+    // ingress never rejects: a session-creation failure (for example an
+    // invalid/unavailable task `model`) resolves `{ ok: false, reason }`, and
+    // the fire must stop right there — the follow-up `user.message` would
+    // otherwise auto-create a session without the task's model override (the
+    // pre-T6 silent fallback). The try/catch stays as defensive handling for
+    // mocked or future dispatchers that throw.
     try {
-      await this.#inject({
+      const sessionResult = await this.#dispatchClientEvent({
         type: "command.session.new",
         clientSessionId: sessionId,
         workingDirectory: directoryValidation.directory,
         workingDirectorySource: "default",
+        // Per-task model override (design spec `docs/scheduled-task-model-spec.md`):
+        // only present when the task pins one; absent stays undefined so the
+        // channel config model resolution is unchanged.
+        ...(task.model !== undefined ? { model: task.model } : {}),
       });
-      await this.#inject({
+      if (!sessionResult.ok) {
+        return await this.#failFire(task, sessionId, sessionResult.reason);
+      }
+
+      const messageResult = await this.#dispatchClientEvent({
         type: "user.message",
         clientSessionId: sessionId,
         text: task.prompt,
       });
+      if (!messageResult.ok) {
+        return await this.#failFire(task, sessionId, messageResult.reason);
+      }
     } catch (error) {
       // The session may or may not exist at this point; either way the run
       // record must not outlive a failed fire (no stale timeout timer, no
       // post-failure result delivery). If session.new had landed, the core
       // idle timeout reclaims the orphaned session.
       this.#endRun(sessionId);
-      this.#logger.error(`[schedule] failed to inject synthetic events for "${taskName}":`, error);
-      return { ok: false, reason: "failed to inject synthetic events" };
+      this.#logger.error(`[schedule] failed to dispatch synthetic events for "${taskName}":`, error);
+      return { ok: false, reason: "failed to dispatch synthetic events" };
     }
 
     return { ok: true };
+  }
+
+  /**
+   * Ends a run whose synthetic dispatch failed (T6): clears the run record
+   * and delivers a localized task-failed notice with the real reason to the
+   * task's `target` when bound — mirroring handleOutput's error branch. The
+   * returned reason carries the underlying message so `/schedule-run`
+   * invokers see the real cause (`scheduleRunFailed` prints `{{reason}}`).
+   */
+  async #failFire(task: ScheduleTask, sessionId: string, reason: string): Promise<FireResult> {
+    this.#endRun(sessionId);
+    this.#logger.warn(`[schedule] fire of "${task.name}" failed: ${reason}`);
+    // Stop-race (SF-2): a dispatch that was in flight across a stop resolves
+    // `{ ok: false, reason: "gateway is not running" }` — the core ingress
+    // never rejects, even after teardown. That is not a task failure: the
+    // "stop ⇒ no delivery" contract means nothing may be delivered to the
+    // target chat after stop(), so the notice is skipped and only the run ends.
+    if (!this.#started) {
+      return { ok: false, reason };
+    }
+    const target = task.target;
+    if (target === undefined) {
+      // Nowhere to deliver to (defensive: #fire validates the target before
+      // dispatching, so this is unreachable through the public API).
+      this.#logger.warn(`[schedule] task "${task.name}" has no target to deliver its failure to`);
+      return { ok: false, reason };
+    }
+    const base = this.#t("schedule.taskFailed", { name: task.name });
+    await this.#deliverToTarget(target, `${base} ${reason}`);
+    return { ok: false, reason };
   }
 
   async #tick(): Promise<void> {
@@ -521,7 +581,7 @@ export class Scheduler {
     // Abort this run's own session. NOTE: the shared event type has no
     // `command.session.abort`; `command.session.stop` is the equivalent core
     // command (it calls agentAdapter.abort()).
-    await this.#injectSafe({
+    await this.#dispatchSafe({
       type: "command.session.stop",
       clientSessionId: sessionId,
     });
@@ -535,11 +595,11 @@ export class Scheduler {
     this.#runs.delete(sessionId);
   }
 
-  async #injectSafe(event: ClientOutputEvent): Promise<void> {
+  async #dispatchSafe(event: ClientOutputEvent): Promise<void> {
     try {
-      await this.#inject(event);
+      await this.#dispatchClientEvent(event);
     } catch (error) {
-      this.#logger.error("[schedule] failed to inject synthetic event:", error);
+      this.#logger.error("[schedule] failed to dispatch synthetic event:", error);
     }
   }
 

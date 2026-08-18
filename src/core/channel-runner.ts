@@ -30,7 +30,7 @@ export async function runChannel({ channelName, channelConfig, defaults }: RunCh
   // The scheduler and the core reference each other through injected
   // callbacks, so the scheduler is declared first and assigned once both
   // sides exist: the core diverts `schedule:*` agent output to the scheduler
-  // (spec D2), the scheduler injects synthetic fires into the core's input
+  // (spec D2), the scheduler dispatches synthetic fires into the core's input
   // path and delivers egress to the client adapter (spec D1/D9). The adapter
   // gets `onScheduleRun` before either exists; by the time it can fire
   // (after start), the scheduler is assigned.
@@ -69,7 +69,7 @@ export async function runChannel({ channelName, channelConfig, defaults }: RunCh
 
   scheduler = new Scheduler({
     channelName,
-    inject: (event) => core.input(event),
+    dispatchClientEvent: (event) => core.input(event),
     deliver: (event) => imAdapter.input(event),
     validateTarget: clientModule.validateSessionId,
     t: getTranslatorForCommon(common),

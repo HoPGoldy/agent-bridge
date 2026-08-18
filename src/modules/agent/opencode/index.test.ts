@@ -1,10 +1,10 @@
 import { describe, expect, it, vi } from "vitest";
-import type { Session } from "@opencode-ai/sdk/v2/types";
+import type { Provider, Session } from "@opencode-ai/sdk/v2/types";
 import type { AgentSessionRecord, ConfigCollectContext, OpenCodeAgentConfig } from "../../../types";
 import { createAgentSessionStateRegistry } from "../../../config/agent-session-state";
 import { createInMemoryChannelStateStore } from "../../../config/channel-state";
 import { createOpenCodeAgentModule, openCodeAgentSessionStateCodec } from "./index";
-import type { OpenCodeApi } from "./adapter/opencode-api";
+import type { OpenCodeApi, OpenCodeProviderList } from "./adapter/opencode-api";
 
 type OpenCodeModule = ReturnType<typeof createOpenCodeAgentModule>;
 
@@ -34,6 +34,52 @@ function createApi(overrides: Partial<OpenCodeApi> = {}): OpenCodeApi {
       await new Promise<void>((resolve) => signal.addEventListener("abort", () => resolve(), { once: true }));
     }),
     ...overrides,
+  };
+}
+
+/**
+ * Minimal connected provider for the module-level model availability check
+ * (mirrors the adapter test's provider fixture; only `id` and the model keys
+ * are read by `assertModelAvailable`).
+ */
+function provider(providerID: string, modelID: string): Provider {
+  return {
+    id: providerID,
+    name: providerID,
+    source: "config",
+    env: [],
+    options: {},
+    models: {
+      [modelID]: {
+        id: modelID,
+        providerID,
+        api: { id: modelID, url: "", npm: "" },
+        name: modelID,
+        capabilities: {
+          temperature: true,
+          reasoning: true,
+          attachment: true,
+          toolcall: true,
+          input: { text: true, audio: false, image: true, video: false, pdf: true },
+          output: { text: true, audio: false, image: false, video: false, pdf: false },
+          interleaved: false,
+        },
+        cost: { input: 0, output: 0, cache: { read: 0, write: 0 } },
+        limit: { context: 200_000, output: 8_192 },
+        status: "active",
+        options: {},
+        headers: {},
+        release_date: "2025-01-01",
+      },
+    },
+  };
+}
+
+function providersApi(...entries: Array<[string, string]>): OpenCodeProviderList {
+  return {
+    all: entries.map(([providerID, modelID]) => provider(providerID, modelID)),
+    connected: entries.map(([providerID]) => providerID),
+    default: {},
   };
 }
 
@@ -147,6 +193,7 @@ describe("OpenCode agent module", () => {
 
   it("creates and resumes OpenCode sessions with core-owned ids and provider ids in state", async () => {
     const api = createApi({
+      getProviders: vi.fn(async () => providersApi(["anthropic", "sonnet"])),
       createSession: vi.fn(async () => ({ id: "session-1", model: { providerID: "anthropic", id: "sonnet" } }) as Session),
       getSession: vi.fn(async () => ({ id: "session-1" }) as Session),
     });
@@ -218,7 +265,9 @@ describe("OpenCode agent module", () => {
       const module = createOpenCodeAgentModule({
         apiFactory: (config) => {
           apiConfigs.push(config);
-          const api = createApi();
+          const api = createApi({
+            getProviders: vi.fn(async () => providersApi(["anthropic", "sonnet"])),
+          });
           apis.push(api);
           return api;
         },
@@ -241,9 +290,12 @@ describe("OpenCode agent module", () => {
       await adapter.start(vi.fn());
       await adapter.stop();
 
-      expect(apiConfigs).toHaveLength(1);
-      expect(apiConfigs[0]?.directory).toBe("/srv/project-a");
-      expect(apis[0]?.createSession).toHaveBeenCalledWith({
+      expect(apiConfigs).toHaveLength(2);
+      // The first api is the module-level availability check for the
+      // configured model; the second is the runtime's api for this session's
+      // effective config (channel model + working-directory override).
+      expect(apiConfigs[1]?.directory).toBe("/srv/project-a");
+      expect(apis[1]?.createSession).toHaveBeenCalledWith({
         title: "agent-bridge:test",
         agent: undefined,
         model: { providerID: "anthropic", modelID: "sonnet" },
@@ -443,6 +495,110 @@ describe("OpenCode agent module", () => {
       expect(apis[1]?.getSession).toHaveBeenCalledWith("session-1");
       expect(apis[1]?.getMessages).toHaveBeenCalledWith("session-1", 50);
       expect(config.directory).toBeUndefined();
+    });
+  });
+
+  describe("per-task model override", () => {
+    it("applies the task model override over the channel config model", async () => {
+      const api = createApi({
+        getProviders: vi.fn(async () => providersApi(["anthropic", "sonnet"], ["azure", "gpt"])),
+      });
+      const module = createOpenCodeAgentModule({ apiFactory: () => api });
+      const config = { baseUrl: "http://127.0.0.1:4096", model: "anthropic/sonnet" };
+
+      const { handle } = await reserveHandle(module, "opencode:task-override");
+      const adapter = await module.createAgentSession({
+        config,
+        common,
+        agentSessionId: "opencode:task-override",
+        sessionState: handle,
+        model: "azure/gpt",
+      });
+      await adapter.start(vi.fn());
+
+      // The override wins: the adapter creates the provider session with it.
+      expect(api.createSession).toHaveBeenCalledWith({
+        title: "agent-bridge:test",
+        agent: undefined,
+        model: { providerID: "azure", modelID: "gpt" },
+      });
+      await adapter.stop();
+    });
+
+    it("fails fast on a malformed task model override", async () => {
+      const api = createApi();
+      const module = createOpenCodeAgentModule({ apiFactory: () => api });
+
+      const { handle } = await reserveHandle(module, "opencode:task-bad-format");
+      await expect(
+        module.createAgentSession({
+          config: { baseUrl: "http://127.0.0.1:4096", model: "anthropic/sonnet" },
+          common,
+          agentSessionId: "opencode:task-bad-format",
+          sessionState: handle,
+          model: "not-a-model",
+        }),
+      ).rejects.toThrow(/provider\/modelID/);
+      // Nothing was created: the format check throws before any provider
+      // session could be made.
+      expect(api.createSession).not.toHaveBeenCalled();
+    });
+
+    it("fails fast when the task model override is unavailable from connected providers", async () => {
+      const api = createApi(); // empty provider list: nothing is connected
+      const module = createOpenCodeAgentModule({ apiFactory: () => api });
+
+      const { handle } = await reserveHandle(module, "opencode:task-unavailable");
+      await expect(
+        module.createAgentSession({
+          config: { baseUrl: "http://127.0.0.1:4096" },
+          common,
+          agentSessionId: "opencode:task-unavailable",
+          sessionState: handle,
+          model: "anthropic/sonnet",
+        }),
+      ).rejects.toThrow(/not available from a connected provider/);
+      expect(api.createSession).not.toHaveBeenCalled();
+    });
+
+    it("keeps the channel config model when no override is given (empty override included)", async () => {
+      const api = createApi({
+        getProviders: vi.fn(async () => providersApi(["anthropic", "sonnet"])),
+      });
+      const module = createOpenCodeAgentModule({ apiFactory: () => api });
+      const config = { baseUrl: "http://127.0.0.1:4096", model: "anthropic/sonnet" };
+
+      const { handle } = await reserveHandle(module, "opencode:no-override");
+      const adapter = await module.createAgentSession({
+        config,
+        common,
+        agentSessionId: "opencode:no-override",
+        sessionState: handle,
+      });
+      await adapter.start(vi.fn());
+      expect(api.createSession).toHaveBeenCalledWith({
+        title: "agent-bridge:test",
+        agent: undefined,
+        model: { providerID: "anthropic", modelID: "sonnet" },
+      });
+      await adapter.stop();
+
+      // An empty override behaves exactly like none: the channel model applies.
+      const { handle: emptyHandle } = await reserveHandle(module, "opencode:empty-override");
+      const empty = await module.createAgentSession({
+        config,
+        common,
+        agentSessionId: "opencode:empty-override",
+        sessionState: emptyHandle,
+        model: "",
+      });
+      await empty.start(vi.fn());
+      expect(api.createSession).toHaveBeenLastCalledWith({
+        title: "agent-bridge:test",
+        agent: undefined,
+        model: { providerID: "anthropic", modelID: "sonnet" },
+      });
+      await empty.stop();
     });
   });
 

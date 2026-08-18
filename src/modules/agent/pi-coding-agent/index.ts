@@ -139,6 +139,11 @@ function buildAdapterOptions(
     workingDirectory?: string;
     workingDirectorySource?: "user" | "default";
     allowedWorkingDirectoryRoots?: string[];
+    /**
+     * Per-task model override (design spec `docs/scheduled-task-model-spec.md`);
+     * resolved with precedence override > channel config > env/adapter default.
+     */
+    model?: string;
   },
 ): PiCodingAgentAdapterOptions {
   return {
@@ -157,7 +162,11 @@ function buildAdapterOptions(
       process.env.PI_SESSION_DIR ??
       path.join(os.homedir(), ".config", "agent-bridge", "pi-sessions"),
     bin: config.bin ?? process.env.PI_BIN ?? "pi",
-    model: config.model ?? process.env.PI_MODEL,
+    // Precedence (spec): task override > channel config.model > PI_MODEL env
+    // fallback. Absent override keeps the existing resolution byte-identical
+    // for chat sessions. An invalid override fails the pi process at spawn
+    // (fail-fast, per the spec — no silent fallback).
+    model: options.model ?? config.model ?? process.env.PI_MODEL,
     extraArgs: config.extraArgs ?? parseExtraArgs(process.env.PI_RPC_EXTRA_ARGS),
   };
 }
@@ -194,7 +203,7 @@ export const piCodingAgentModule: AgentModule<PiCodingAgentConfig, PiCodingAgent
   sessionStateCodec: piCodingAgentSessionStateCodec,
   createConfigCollector: createPiCodingAgentConfigCollector,
 
-  async createAgentSession({ config, common, agentSessionId, sessionState, workingDirectory, workingDirectorySource, allowedWorkingDirectoryRoots }) {
+  async createAgentSession({ config, common, agentSessionId, sessionState, workingDirectory, workingDirectorySource, allowedWorkingDirectoryRoots, model }) {
     logger.info(`creating agent session ${agentSessionId} for channel ${common.channelName}`);
     return new PiCodingAgentAdapter(
       buildAdapterOptions(config, agentSessionId, sessionState, {
@@ -202,6 +211,7 @@ export const piCodingAgentModule: AgentModule<PiCodingAgentConfig, PiCodingAgent
         workingDirectory,
         workingDirectorySource,
         allowedWorkingDirectoryRoots,
+        model,
       }),
     );
   },

@@ -99,6 +99,43 @@ describe("parseTaskFile", () => {
     expect(bare.warnings).toEqual([]);
   });
 
+  it("parses the model field: missing, empty, quoted and bare values", () => {
+    // Missing → undefined (task falls back to the channel agent config's model).
+    const absent = parseTaskFile(
+      "no-model.md",
+      "---\nschedule: daily 09:00\n---\nBody.\n",
+    );
+    expect(absent.task.model).toBeUndefined();
+    expect(absent.errors).toEqual([]);
+    expect(absent.warnings).toEqual([]);
+
+    // Empty / whitespace-only value → undefined, no parse error.
+    for (const raw of ["model:", 'model: ""', "model:   "]) {
+      const empty = parseTaskFile(
+        "empty-model.md",
+        `---\nschedule: daily 09:00\n${raw}\n---\nBody.\n`,
+      );
+      expect(empty.task.model).toBeUndefined();
+      expect(empty.errors).toEqual([]);
+    }
+
+    // Quoted value → quotes stripped.
+    const quoted = parseTaskFile(
+      "quoted-model.md",
+      "---\nschedule: daily 09:00\nmodel: 'azure-openai-responses/gpt-5.6-terra'\n---\nBody.\n",
+    );
+    expect(quoted.task.model).toBe("azure-openai-responses/gpt-5.6-terra");
+    expect(quoted.errors).toEqual([]);
+
+    // Bare value, no warnings.
+    const bare = parseTaskFile(
+      "bare-model.md",
+      "---\nschedule: daily 09:00\nmodel: azure-openai-responses/gpt-5.6-terra\n---\nBody.\n",
+    );
+    expect(bare.task.model).toBe("azure-openai-responses/gpt-5.6-terra");
+    expect(bare.warnings).toEqual([]);
+  });
+
   it("treats a file without front matter as an all-body prompt and flags the missing schedule", () => {
     const content = "Just a prompt, no front matter at all.\nSecond line.\n";
     const { task, errors, warnings } = parseTaskFile("nofm.md", content);
@@ -608,6 +645,41 @@ channel: feishu-dev`,
     );
     expect(updated.match(/target:/g)).toHaveLength(1);
     expect(updated.match(/channel:/g)).toHaveLength(1);
+  });
+
+  it("preserves an existing model: line byte-exactly when binding", async () => {
+    const original = `---
+schedule: daily 09:00
+model: azure-openai-responses/gpt-5.6-terra
+---
+
+Body.
+`;
+    await writeFile(path.join(tmpRoot, "model.md"), original, "utf8");
+
+    const result = await bindTask(
+      "model",
+      { target: "feishu:dm:oc_123", channel: "feishu-dev" },
+      tmpRoot,
+    );
+    expect(result).toEqual({ ok: true });
+
+    const updated = await readTaskFile("model");
+    expect(updated).toBe(
+      `---
+schedule: daily 09:00
+model: azure-openai-responses/gpt-5.6-terra
+target: feishu:dm:oc_123
+channel: feishu-dev
+---
+
+Body.
+`,
+    );
+    // The model line survives verbatim and still parses.
+    const { task, errors } = parseTaskFile("model.md", updated);
+    expect(errors).toEqual([]);
+    expect(task.model).toBe("azure-openai-responses/gpt-5.6-terra");
   });
 
   it("returns an error result for a missing task file without throwing", async () => {

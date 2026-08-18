@@ -27,7 +27,7 @@ The task run is completely isolated from the target chat's own session: a user c
 
 The scheduler fires by injecting two synthetic events through the normal ingress path:
 
-1. `command.session.new` — `workingDirectory` from the task file (validated, see D6), `workingDirectorySource: "default"` (operator-configured paths are trusted, like the cwd fallback; the agent-side allowlist does not apply).
+1. `command.session.new` — `workingDirectory` from the task file (validated, see D6), `workingDirectorySource: "default"` (operator-configured paths are trusted, like the cwd fallback; the agent-side allowlist does not apply), and, when the task pins one, a `model` override that rides the event into `createAgentSession` (see the per-task model design spec, `docs/scheduled-task-model-spec.md`).
 2. `user.message` — the Markdown body of the task file, verbatim.
 
 Both events carry a **synthetic clientSessionId** of the form `schedule:<task-name>:<run-seq>` (task names are globally unique, so the id is globally unique; the run sequence makes every run's id unique). The core treats it like any other client session — binding, session lifecycle, abort, and shutdown-on-stop all work unchanged — with two deliberate exceptions (see the Component Map): `schedule:*` bindings are kept **in memory only** (a unique id per run would otherwise grow the state file forever, and resume semantics are meaningless for ephemeral runs), and the "started a new session" confirmation is **suppressed** for them (it would be mistaken for the task result). The id never collides with a real chat's clientSessionId, so **the target chat's own session binding is never touched**.
@@ -66,6 +66,7 @@ timeout: 30m
 enabled: true
 channel: feishu-dev
 target: feishu:dm:oc_6f9d408e630098e6dd06bb071d6b60fc
+model: azure-openai-responses/gpt-5.6-terra
 ---
 
 Read the logs in the current directory and produce a summary of
@@ -86,6 +87,7 @@ Front matter keys:
 | `enabled` | no | `true` | `false` pauses the task without deleting it |
 | `target` | no | — | Delivery address: the clientSessionId of the destination chat, copied from `/st` in that chat or set by `/schedule-here` (D7). Missing/invalid → fire skipped, logged, shown by `schedule list` |
 | `channel` | no | — | Owning channel config name, written by `/schedule-here` alongside `target` (D7). A scheduler fires on schedule only tasks whose `channel` equals its own name; a task with no `channel` never fires on schedule |
+| `model` | no | — | Optional per-task agent model override (design spec `docs/scheduled-task-model-spec.md`): only this task's own runs use it — the channel's chat sessions are unaffected on pi, and on opencode chat `/new` only gains the same `assertModelAvailable` check against the channel config model (one extra provider round-trip; see the design spec). Precedence: task `model` > channel agent config's `model` > env/adapter default. Blank or absent = the channel agent config's model. Parsing only checks for a non-empty string; validity is enforced at fire time by the adapter: **pi** passes it to the pi process as `--model` at spawn (an invalid model makes the process fail at startup), **opencode** runs its availability check against the effective (override-first) model and refuses to create a session. Applies to scheduled fires and `/schedule-run` alike, since both share one fire path. |
 
 ### D4. Schedule grammar (simplified, zero-dependency)
 
@@ -116,7 +118,8 @@ A manual trigger (`/schedule-run`, D7a) behaves identically to a scheduled fire 
 Synthetic events bypass the client adapters, so the adapters' `/new <path>` pre-validation does not apply. The scheduler therefore reuses the shared `validateWorkingDirectory` util before injecting:
 
 - Invalid `directory` or empty prompt → **nothing is injected**; handled per D2 (error to the target chat + log).
-- Failures *after* injection (agent spawn failure, model errors, ...) already surface as error events and are diverted/delivered per D2 — no extra machinery.
+- Failures *after* injection that surface as **agent output** (run-time agent errors, ...) are diverted/delivered per D2.
+- **Per-task `model` validation is NOT part of this fire-time check.** It happens inside the adapters when `createAgentSession` runs (pi: at spawn via `--model`, fail-fast when the process exits; opencode: `assertModelAvailable` on the effective model, throws before any session is created). When the model is invalid/unavailable the session-new dispatch resolves `{ ok: false, reason }` (the core ingress never rejects), the scheduler **ends the run without dispatching the follow-up `user.message`**, delivers a `schedule.taskFailed` notice with the adapter's error detail to the task's `target` chat, and reports the real reason to `/schedule-run` — there is **no fallback** to the channel default model (T6; see `docs/scheduled-task-model-spec.md` §Failure semantics). Chat-originated `/new` failures keep their localized notice in the chat, unchanged.
 
 ### D7. Targeting a chat: `/schedule-here` for the initial bind, `target` + `/st` for edits
 
@@ -204,7 +207,8 @@ Wizard steps for `add`:
 2. Schedule string (validated against the grammar, re-prompt on error, with examples shown).
 3. Working directory (optional; blank = bridge cwd). Not validated against the filesystem here — validation happens at fire time (D6), since the bridge may run elsewhere.
 4. Timeout (duration string, default `10m`).
-5. Writes the file with a localized example prompt body (a trivial time-telling task, in the CLI's default locale — no channel is selected to localize by), then prints the file path and the targeting instruction: *"Edit the file to set your prompt. To choose the destination chat, send `/schedule-here <task-name>` in that chat (later changes: `/st` shows the chat session ID for manual `target` edits)."*
+5. Model (optional; blank = the channel agent config's default model. The CLI does not validate it — it cannot reach the provider's model list; an invalid model is fail-fast rejected by the adapter when the session is created, which fails the whole fire: the run ends, a `schedule.taskFailed` notice with the error detail is delivered to the task's `target` chat, and there is no fallback to the default model (see D6). A non-empty value is written as the `model:` line).
+6. Writes the file with a localized example prompt body (a trivial time-telling task, in the CLI's default locale — no channel is selected to localize by), then prints the file path and the targeting instruction: *"Edit the file to set your prompt. To choose the destination chat, send `/schedule-here <task-name>` in that chat (later changes: `/st` shows the chat session ID for manual `target` edits)."*
 
 ## Component Map
 
@@ -212,14 +216,16 @@ Wizard steps for `add`:
 | --- | --- |
 | `src/config/paths` (or `channel-state.ts`) | Add `SCHEDULES_DIR` |
 | `src/modules/schedule/grammar.ts` | Schedule parser + `nextRun(schedule, from)` |
-| `src/modules/schedule/task-file.ts` | Front-matter subset parser, task loader/validator (incl. `target` shape per client module) |
-| `src/modules/schedule/scheduler.ts` | Tick loop, task table sync, run registry, fire injection, timeout enforcement |
+| `src/modules/schedule/task-file.ts` | Front-matter subset parser, task loader/validator (incl. `target` shape per client module; parses optional `model`, non-empty-string-when-present, no load-time validation) |
+| `src/types.ts` | `command.session.new` gains optional `model`; `AgentModule.createAgentSession` options gain optional `model` |
+| `src/modules/schedule/scheduler.ts` | Tick loop, task table sync, run registry, fire injection (rides `model` onto the synthetic `command.session.new`), timeout enforcement |
 | `src/core/gateway-core.ts` | Public `input(event)` ingress for synthetic events; divert `schedule:*` output to the scheduler instead of the IM adapter |
 | `src/core/channel-runner.ts` | Own/START/STOP scheduler; wire scheduler ↔ core; expose `runNow` to the client adapter |
 | `src/modules/client/utils/slash-commands.ts` | Parse `/schedule-run <name>` (adapter-local command, never reaches the core) |
 | `src/modules/client/utils/status-markdown.ts` | Render one extra `/st` line: the chat's clientSessionId ("Chat session ID") |
 | 3 IM adapters | Handle `/schedule-run` via injected callback + localized replies |
-| `src/cli.ts` + `src/config/prompt.ts` | `schedule add/list/remove` |
+| `src/modules/agent/*` | pi-coding-agent: passes `model ?? config.model ?? PI_MODEL` to the pi process at spawn; opencode: asserts the effective (override-first) model and creates the provider session with it |
+| `src/cli.ts` + `src/config/prompt.ts` | `schedule add/list/remove` (+ optional Model wizard step)
 | `src/i18n/index.ts` | `/st` chat-session-ID label, task result header, task failure/timeout notices, `/schedule-run` replies, CLI strings |
 | `docs/scheduled-tasks.md` | User documentation (grammar, file format, targeting via `/st`, isolation semantics) |
 
