@@ -1,4 +1,4 @@
-import { mkdir, mkdtemp, readFile, readdir, realpath, rm, writeFile } from "node:fs/promises";
+import { mkdtemp, readFile, readdir, realpath, rm, writeFile } from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
@@ -48,6 +48,10 @@ function makeTask(overrides: Partial<ScheduleTask> & { name: string }): Schedule
     directory: overrides.directory,
     timeoutMs: overrides.timeoutMs ?? DEFAULT_TIMEOUT_MS,
     enabled: overrides.enabled ?? true,
+    // T2: harness tasks belong to the scheduler's channel ("test") unless
+    // the test overrides `channel` (a deliberate `undefined` means an unbound
+    // / legacy task).
+    channel: "channel" in overrides ? overrides.channel : "test",
     target: overrides.target,
     prompt: overrides.prompt ?? "do the thing",
   };
@@ -213,6 +217,23 @@ describe("tick loop and hot reload (D8)", () => {
     await sleep(100);
     expect(h.injected).toEqual([]);
   });
+
+  it("fires only tasks bound to this channel: other channels and unbound tasks never tick", async () => {
+    const h = createHarness({
+      tasks: [
+        makeLoaded(makeTask({ name: "mine", channel: "test", target: TARGET })),
+        makeLoaded(makeTask({ name: "theirs", channel: "other", target: TARGET })),
+        makeLoaded(makeTask({ name: "unbound", channel: undefined, target: TARGET })),
+      ],
+    });
+    await h.scheduler.start();
+
+    h.clock.advance(30 * 60_000);
+    await waitFor(() => expect(h.injected).toHaveLength(2));
+    await sleep(100);
+    // Only the channel-owned task fired — "theirs" and "unbound" were skipped.
+    expect(h.injected.every((event) => event.clientSessionId === "schedule:mine:1")).toBe(true);
+  });
 });
 
 describe("fire-time validation (D6/D7)", () => {
@@ -280,6 +301,34 @@ describe("fire-time validation (D6/D7)", () => {
     expect(await h.scheduler.fire("missing")).toEqual({ ok: false, reason: "task not found" });
     expect(await h.scheduler.fire("off")).toEqual({ ok: false, reason: "task is disabled" });
     expect(await h.scheduler.runNow("missing")).toEqual({ ok: false, reason: "task not found" });
+  });
+
+  it("refuses to fire a task belonging to another channel, naming that channel", async () => {
+    const h = createHarness({
+      tasks: [makeLoaded(makeTask({ name: "theirs", channel: "other", target: TARGET }))],
+    });
+    await h.scheduler.start();
+    expect(await h.scheduler.fire("theirs")).toEqual({
+      ok: false,
+      reason: 'task belongs to channel "other"',
+    });
+    expect(await h.scheduler.runNow("theirs")).toEqual({
+      ok: false,
+      reason: 'task belongs to channel "other"',
+    });
+    expect(h.injected).toEqual([]);
+    expect(h.delivered).toEqual([]);
+    expect(h.logger.warn).toHaveBeenCalledWith(expect.stringContaining('belongs to channel "other"'));
+  });
+
+  it("fires a legacy task with no channel field via runNow when it has a valid target (status quo)", async () => {
+    const h = createHarness({
+      tasks: [makeLoaded(makeTask({ name: "legacy", channel: undefined, target: TARGET }))],
+    });
+    await h.scheduler.start();
+    expect(await h.scheduler.runNow("legacy")).toEqual({ ok: true });
+    expect(h.injected).toHaveLength(2);
+    expect(h.injected[0]).toMatchObject({ type: "command.session.new", clientSessionId: "schedule:legacy:1" });
   });
 
   it("fire and runNow share the same success path", async () => {
@@ -562,13 +611,12 @@ describe("integration with the real task-file loader", () => {
   });
 
   it("loads a task file from disk, fires it on schedule, and delivers the result", async () => {
-    const channelDir = path.join(tempRoot, "test");
-    await mkdir(channelDir, { recursive: true });
     await writeFile(
-      path.join(channelDir, "report.md"),
+      path.join(tempRoot, "report.md"),
       `---
 schedule: every 30m
 directory: ${tempRoot}
+channel: test
 target: ${TARGET}
 ---
 
@@ -616,11 +664,9 @@ summarize the logs
     ]);
   });
 
-  it("claims a target for an existing task by writing the target line, and rebinds on a second claim", async () => {
-    const channelDir = path.join(tempRoot, "test");
-    await mkdir(channelDir, { recursive: true });
+  it("binds an unbound task by writing the target and channel lines, and refuses a rebind", async () => {
     await writeFile(
-      path.join(channelDir, "report.md"),
+      path.join(tempRoot, "report.md"),
       "---\nschedule: every 30m\n---\nsummarize\n",
       "utf8",
     );
@@ -644,20 +690,72 @@ summarize the logs
     await scheduler.start(); // initial tick populates the task table
 
     expect(await scheduler.claimTarget("report", TARGET)).toEqual({ ok: true });
-    const content = await readFile(path.join(channelDir, "report.md"), "utf8");
+    const content = await readFile(path.join(tempRoot, "report.md"), "utf8");
+    // An unbound task is bound with both lines in one atomic write (T2).
     expect(content).toContain(`target: ${TARGET}`);
+    expect(content).toContain("channel: test");
     expect(content.match(/target:/g)).toHaveLength(1);
+    expect(content.match(/channel:/g)).toHaveLength(1);
 
-    // A second claim (rebind) replaces the line.
-    expect(await scheduler.claimTarget("report", "feishu:dm:oc_other")).toEqual({ ok: true });
-    const content2 = await readFile(path.join(channelDir, "report.md"), "utf8");
-    expect(content2).toContain("target: feishu:dm:oc_other");
-    expect(content2.match(/target:/g)).toHaveLength(1);
-    expect(content2).not.toContain(TARGET);
+    // A bound task is refused: unbinding is a manual file edit, not a command.
+    expect(await scheduler.claimTarget("report", "feishu:dm:oc_other")).toEqual({
+      ok: false,
+      reason: "task already bound",
+    });
+    const content2 = await readFile(path.join(tempRoot, "report.md"), "utf8");
+    expect(content2).toContain(`target: ${TARGET}`);
+    expect(content2).not.toContain("feishu:dm:oc_other");
+    expect(logger.warn).toHaveBeenCalledWith(expect.stringContaining("already bound"));
+  });
+
+  it("refuses to bind a task that already has a target or a channel", async () => {
+    // Only `target` set: manually bound, already claimed by someone.
+    await writeFile(
+      path.join(tempRoot, "has-target.md"),
+      "---\nschedule: every 30m\ntarget: feishu:dm:oc_someone\n---\nbody\n",
+      "utf8",
+    );
+    // Only `channel` set: owned by another channel, not this one.
+    await writeFile(
+      path.join(tempRoot, "has-channel.md"),
+      "---\nschedule: every 30m\nchannel: other\n---\nbody\n",
+      "utf8",
+    );
+
+    const clock = new FakeClock();
+    const inject = vi.fn(async () => {});
+    const deliver = vi.fn(async () => {});
+    const logger: MockLogger = { debug: vi.fn(), info: vi.fn(), warn: vi.fn(), error: vi.fn() };
+    const scheduler = new Scheduler({
+      channelName: "test",
+      tickMs: 20,
+      now: () => clock.now(),
+      inject,
+      deliver,
+      t: getTranslator("en-US"),
+      schedulesRoot: tempRoot,
+      logger,
+    });
+    schedulers.push(scheduler);
+    await scheduler.start();
+
+    expect(await scheduler.claimTarget("has-target", TARGET)).toEqual({
+      ok: false,
+      reason: "task already bound",
+    });
+    expect(await scheduler.claimTarget("has-channel", TARGET)).toEqual({
+      ok: false,
+      reason: "task already bound",
+    });
+
+    // Nothing was overwritten on disk.
+    const targetContent = await readFile(path.join(tempRoot, "has-target.md"), "utf8");
+    expect(targetContent).toContain("target: feishu:dm:oc_someone");
+    expect(targetContent).not.toContain("channel: test");
+    expect(logger.warn).toHaveBeenCalledWith(expect.stringContaining("already bound"));
   });
 
   it("claimTarget reports task not found without a side effect", async () => {
-    const channelDir = path.join(tempRoot, "test");
     const clock = new FakeClock();
     const inject = vi.fn(async () => {});
     const deliver = vi.fn(async () => {});
@@ -680,12 +778,10 @@ summarize the logs
       reason: "task not found",
     });
     // Nothing new was written to the directory.
-    expect(await readdir(channelDir).catch(() => [] as string[])).toEqual([]);
+    expect(await readdir(tempRoot).catch(() => [] as string[])).toEqual([]);
   });
 
   it("claimTarget finds a file written after the last tick via an immediate load", async () => {
-    const channelDir = path.join(tempRoot, "test");
-    await mkdir(channelDir, { recursive: true });
     const clock = new FakeClock();
     const inject = vi.fn(async () => {});
     const deliver = vi.fn(async () => {});
@@ -706,13 +802,13 @@ summarize the logs
 
     // The file appears after the last tick...
     await writeFile(
-      path.join(channelDir, "late.md"),
+      path.join(tempRoot, "late.md"),
       "---\nschedule: daily 09:00\n---\nBody.\n",
       "utf8",
     );
     // ...and claimTarget finds it through the immediate-load fallback.
     expect(await scheduler.claimTarget("late", TARGET)).toEqual({ ok: true });
-    const content = await readFile(path.join(channelDir, "late.md"), "utf8");
+    const content = await readFile(path.join(tempRoot, "late.md"), "utf8");
     expect(content).toContain(`target: ${TARGET}`);
   });
 });

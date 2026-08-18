@@ -7,6 +7,13 @@
  *   re-scans the flat schedules directory through `loadAllTasks` and
  *   re-syncs the in-memory task table, so added/edited/deleted/disabled tasks
  *   take effect on the next tick;
+ * - ownership filtering (T2): every scheduler scans all task files, but the
+ *   tick fires only tasks whose front-matter `channel` equals this channel's
+ *   config name. Tasks owned by other channels and unbound tasks (no
+ *   `channel`) are never fired on schedule. The in-memory table still
+ *   mirrors every task because target-claiming must resolve any task by
+ *   name; fire-time validation additionally refuses tasks bound to another
+ *   channel for `/schedule-run` and the timed tick alike;
  * - due-time evaluation (`now >= nextRun`, at most one fire per task per
  *   tick, no bursting) and next-run recomputation (spec D4/D8);
  * - the run registry: one record per run, keyed by the run-unique synthetic
@@ -70,7 +77,7 @@ export interface SchedulerOptions {
    * Tests inject a fake, or point {@link SchedulerOptions.schedulesRoot} at a
    * temporary directory.
    */
-  loadTasks?: (channelName: string, schedulesRoot?: string) => Promise<LoadedTask[]>;
+  loadTasks?: (schedulesRoot?: string) => Promise<LoadedTask[]>;
   /** Overridable schedules root (defaults to the shared `SCHEDULES_DIR`). */
   schedulesRoot?: string;
 }
@@ -98,7 +105,7 @@ export class Scheduler {
   readonly #t: Translator;
   readonly #validateTarget?: (clientSessionId: string) => boolean;
   readonly #logger: Logger;
-  readonly #loadTasks: (channelName: string, schedulesRoot?: string) => Promise<LoadedTask[]>;
+  readonly #loadTasks: (schedulesRoot?: string) => Promise<LoadedTask[]>;
   readonly #schedulesRoot?: string;
 
   /** In-memory task table, re-synced from disk on every tick (spec D8). */
@@ -124,10 +131,10 @@ export class Scheduler {
     this.#t = options.t;
     this.#validateTarget = options.validateTarget;
     this.#logger = options.logger ?? createLogger("schedule");
-    // T1: the task-file layer is channel-agnostic now; the per-channel
-    // loader signature is kept for the injected override, and the default
-    // delegates to the flat loader (channel name ignored).
-    this.#loadTasks = options.loadTasks ?? ((_channelName, schedulesRoot) => loadAllTasks(schedulesRoot));
+    // T1: the task-file layer is channel-agnostic; the loader scans the flat
+    // shared directory (ownership lives in each task's `channel` front-matter
+    // field, not in the directory layout).
+    this.#loadTasks = options.loadTasks ?? ((schedulesRoot) => loadAllTasks(schedulesRoot));
     this.#schedulesRoot = options.schedulesRoot;
   }
 
@@ -253,15 +260,18 @@ export class Scheduler {
    * name into the task file's `target`/`channel` front-matter lines in a
    * single atomic write. The task must exist — resolved from the in-memory
    * task table, falling back to an immediate directory load so a file
-   * written after the last tick is still claimable. Unknown task or a write
-   * failure returns `{ ok: false, reason }`; the localized reply for the
-   * triggering chat is the caller's job.
+   * written after the last tick is still claimable. A task that is already
+   * bound (`target` or `channel` set, judged against the latest file
+   * content) is refused with "task already bound": unbinding is a manual/AI
+   * file edit — there is no command for it. Unknown task or a write failure
+   * returns `{ ok: false, reason }`; the localized reply for the triggering
+   * chat is the caller's job.
    */
   async claimTarget(taskName: string, clientSessionId: string): Promise<ScheduleHereResult> {
     let exists = this.#tasks.has(taskName);
     if (!exists) {
       try {
-        const loaded = await this.#loadTasks(this.#channelName, this.#schedulesRoot);
+        const loaded = await this.#loadTasks(this.#schedulesRoot);
         exists = loaded.some((entry) => entry.task.name === taskName);
       } catch (error) {
         this.#logger.error(
@@ -274,6 +284,15 @@ export class Scheduler {
     if (!exists) {
       this.#logger.warn(`[schedule] task "${taskName}" not found; nothing to claim`);
       return { ok: false, reason: "task not found" };
+    }
+    // Binding check against the latest file content (T2): a task is bound
+    // when its front matter carries a `target` or a `channel` (either line
+    // is written at bind time). Bound tasks must be unbound — by editing
+    // the file manually — before they can be claimed again.
+    const latest = await this.#loadTaskFresh(taskName);
+    if (latest !== undefined && (latest.target !== undefined || latest.channel !== undefined)) {
+      this.#logger.warn(`[schedule] task "${taskName}" is already bound; refusing to rebind`);
+      return { ok: false, reason: "task already bound" };
     }
     return bindTask(
       taskName,
@@ -296,6 +315,20 @@ export class Scheduler {
     if (!task.enabled) {
       this.#logger.warn(`[schedule] task "${taskName}" is disabled; skipping fire`);
       return { ok: false, reason: "task is disabled" };
+    }
+
+    // Ownership check (T2): a task bound to another channel is refused here
+    // — this adapter cannot deliver to its target chat, so injecting would
+    // only start a run with nowhere for the result to go. `runNow` and the
+    // timed tick share this path, so both get the same rejection. A task
+    // with no `channel` field (legacy/manual binding) is not refused here:
+    // it keeps the existing target validation below, and the tick loop
+    // already excludes it from scheduled firing.
+    if (task.channel !== undefined && task.channel !== this.#channelName) {
+      this.#logger.warn(
+        `[schedule] task "${taskName}" belongs to channel "${task.channel}"; skipping fire`,
+      );
+      return { ok: false, reason: `task belongs to channel "${task.channel}"` };
     }
 
     const target = task.target;
@@ -373,7 +406,7 @@ export class Scheduler {
     const now = this.#now();
     let loaded: LoadedTask[];
     try {
-      loaded = await this.#loadTasks(this.#channelName, this.#schedulesRoot);
+      loaded = await this.#loadTasks(this.#schedulesRoot);
     } catch (error) {
       this.#logger.error("[schedule] failed to load scheduled tasks:", error);
       return;
@@ -384,6 +417,11 @@ export class Scheduler {
       // SF-2: a stop() that landed mid-tick must not start new fires.
       if (!this.#started) return;
       const { task } = row;
+      // Ownership filter (T2): only tasks bound to this channel fire on
+      // schedule. Tasks owned by other channels and unbound tasks (no
+      // `channel`) are skipped, nextRun untouched. The table still mirrors
+      // every task because `claimTarget`'s existence check needs it.
+      if (task.channel !== this.#channelName) continue;
       if (!task.enabled || task.schedule === null || row.nextRun === null) continue;
       if (now.getTime() >= row.nextRun.getTime()) {
         const result = await this.#fire(taskName);
@@ -440,7 +478,7 @@ export class Scheduler {
   async #loadTaskFresh(taskName: string): Promise<ScheduleTask | undefined> {
     let loaded: LoadedTask[];
     try {
-      loaded = await this.#loadTasks(this.#channelName, this.#schedulesRoot);
+      loaded = await this.#loadTasks(this.#schedulesRoot);
     } catch (error) {
       this.#logger.error(`[schedule] failed to load task "${taskName}":`, error);
       return undefined;
