@@ -19,7 +19,7 @@ The task run is completely isolated from the target chat's own session: a user c
 - No streaming of task progress into the chat — only the final result (or a failure notice) is delivered.
 - No full cron-expression syntax (see "Rejected Alternatives").
 - No IM-side task management beyond `/schedule-run` (listing/removal happen via CLI; targeting is just editing the file).
-- No tasks spanning multiple channels; a task belongs to exactly one channel.
+- No tasks spanning multiple channels; a task belongs to **at most one** channel — the one named in its front-matter `channel` field (a task with no `channel` belongs to none and never fires on schedule).
 
 ## Key Design Decisions
 
@@ -30,7 +30,7 @@ The scheduler fires by injecting two synthetic events through the normal ingress
 1. `command.session.new` — `workingDirectory` from the task file (validated, see D6), `workingDirectorySource: "default"` (operator-configured paths are trusted, like the cwd fallback; the agent-side allowlist does not apply).
 2. `user.message` — the Markdown body of the task file, verbatim.
 
-Both events carry a **synthetic clientSessionId** of the form `schedule:<task-name>:<run-seq>` (scoped per channel, since each channel runs its own scheduler/runner; the run sequence makes every run's id unique). The core treats it like any other client session — binding, session lifecycle, abort, and shutdown-on-stop all work unchanged — with two deliberate exceptions (see the Component Map): `schedule:*` bindings are kept **in memory only** (a unique id per run would otherwise grow the state file forever, and resume semantics are meaningless for ephemeral runs), and the "started a new session" confirmation is **suppressed** for them (it would be mistaken for the task result). The id never collides with a real chat's clientSessionId, so **the target chat's own session binding is never touched**.
+Both events carry a **synthetic clientSessionId** of the form `schedule:<task-name>:<run-seq>` (task names are globally unique, so the id is globally unique; the run sequence makes every run's id unique). The core treats it like any other client session — binding, session lifecycle, abort, and shutdown-on-stop all work unchanged — with two deliberate exceptions (see the Component Map): `schedule:*` bindings are kept **in memory only** (a unique id per run would otherwise grow the state file forever, and resume semantics are meaningless for ephemeral runs), and the "started a new session" confirmation is **suppressed** for them (it would be mistaken for the task result). The id never collides with a real chat's clientSessionId, so **the target chat's own session binding is never touched**.
 
 ### D2. Result delivery borrows the client adapter's egress path
 
@@ -56,7 +56,7 @@ The scheduler injects its synthetic events through a new public `GatewayCore.inp
 
 ### D3. Tasks are Markdown files with front matter
 
-Location: `~/.config/agent-bridge/schedules/<channel>/<task-name>.md`.
+Location: `~/.config/agent-bridge/schedules/<task-name>.md` — a **flat, channel-agnostic shared directory** (all channels' tasks live side by side; ownership lives in each task's `channel` front-matter field, not in the directory layout). The legacy per-channel `schedules/<channel>/` layout is no longer read and there is no migration: old files simply stop being scheduled.
 
 ```markdown
 ---
@@ -64,6 +64,7 @@ schedule: daily 09:00
 directory: ~/reports
 timeout: 30m
 enabled: true
+channel: feishu-dev
 target: feishu:dm:oc_6f9d408e630098e6dd06bb071d6b60fc
 ---
 
@@ -73,7 +74,7 @@ yesterday's errors. (This is the example prompt — replace it.)
 
 - Front matter is a **flat `key: value` subset** parsed by a small in-repo parser (no YAML dependency). Rules: one key per line, `key: value`, values are bare strings (surrounding quotes stripped), `#` comments and blank lines allowed, unknown keys → warning, malformed file → task disabled and reported by `schedule list`.
 - The body (everything after the closing `---`, trimmed) is the prompt. It must be non-empty at fire time, otherwise the fire fails per D2.
-- The file name (without `.md`) is the task key within the channel: lowercase `[a-z0-9-]+`, enforced by the CLI wizard.
+- The file name (without `.md`) is the task's **globally unique** key: lowercase `[a-z0-9-]+`, enforced by the CLI wizard.
 
 Front matter keys:
 
@@ -83,7 +84,8 @@ Front matter keys:
 | `directory` | no | bridge process cwd | Working directory of the new session (`~` expanded, relative → bridge cwd, canonicalized at fire time) |
 | `timeout` | no | `10m` | Max run duration (`<n>m` / `<n>h`); the run is killed when exceeded (D5) |
 | `enabled` | no | `true` | `false` pauses the task without deleting it |
-| `target` | yes | — | Delivery address: the clientSessionId of the destination chat, copied from `/st` in that chat (D7) |
+| `target` | no | — | Delivery address: the clientSessionId of the destination chat, copied from `/st` in that chat or set by `/schedule-here` (D7). Missing/invalid → fire skipped, logged, shown by `schedule list` |
+| `channel` | no | — | Owning channel config name, written by `/schedule-here` alongside `target` (D7). A scheduler fires on schedule only tasks whose `channel` equals its own name; a task with no `channel` never fires on schedule |
 
 ### D4. Schedule grammar (simplified, zero-dependency)
 
@@ -107,7 +109,7 @@ Every fire unconditionally starts a **fresh, fully isolated run**; runs never in
 
 Consequence to document: if the schedule interval is shorter than the timeout (e.g. `every 1m` with `timeout: 30m`), several runs of the same task can be alive concurrently. Because each run has its own synthetic session id, they are genuinely isolated (results can never cross), but concurrency costs resources — the docs recommend choosing an interval comfortably larger than the expected run duration.
 
-A manual trigger (`/schedule-run`, D7a) behaves identically to a scheduled fire — it starts a fresh run, no special-casing.
+A manual trigger (`/schedule-run`, D7a) behaves identically to a scheduled fire — it starts a fresh run through the same fire path, no special-casing; the only difference is which tasks each path selects: the tick filters by `channel`, while `runNow` can also fire a task that has no `channel` (see D7a/D8).
 
 ### D6. Validation and failure behavior at fire time
 
@@ -120,9 +122,11 @@ Synthetic events bypass the client adapters, so the adapters' `/new <path>` pre-
 
 Problem: IM chat/session IDs (`feishu:dm:oc_6f9d...`) are not user-guessable, so the destination chat needs a discovery path.
 
-**Initial setup — `/schedule-here <task-name>`**: right after `schedule add`, the user goes to the intended destination chat and sends `/schedule-here <task-name>`. The client adapter handles it locally and calls the injected `onScheduleHere(taskName, clientSessionId)`; the bridge then **writes the chat's clientSessionId into the task file's `target` field** (a surgical front-matter edit — only the `target` line is inserted/replaced; the prompt body and other fields are untouched) and replies a localized confirmation naming the task. Unknown task name → localized error reply. The write is atomic; the hot-reload tick picks the change up like any other edit.
+**Initial setup — `/schedule-here <task-name>`**: right after `schedule add`, the user goes to the intended destination chat and sends `/schedule-here <task-name>`. The client adapter handles it locally and calls the injected `onScheduleHere(taskName, clientSessionId)`; the bridge then **writes two front-matter lines into the task file: `target` (the chat's clientSessionId) and `channel` (this channel's config name)** (a surgical front-matter edit — only those two lines are inserted/replaced; the prompt body and other fields are untouched) and replies a localized confirmation naming the task. Unknown task name → localized error reply. The write is atomic; the hot-reload tick picks the change up like any other edit.
 
-**Later changes — manual**: the **`/st` reply's "Chat session ID" line** (the event envelope's `clientSessionId`, previously undisplayed) lets the user copy any chat's id and edit the `target` line by hand. Rebind = edit the line; unbind = delete it.
+**Already bound → refused**: a task is considered bound when its file carries a `target` **or** a `channel` line (either is written at bind time). `/schedule-here` on a bound task is refused with the localized "already bound" reply (reason `task already bound`) — silently overwriting an existing binding would let anyone redirect a task's delivery, so rebinding is deliberately a manual edit. There is **no `/schedule-unbind` command** and no reason to add one: unbinding is a low-frequency management operation and the task file is the single source of truth — deleting the two lines is the unbind (per the "low-frequency management ops → AI edits the file" principle).
+
+**Later changes — manual**: the **`/st` reply's "Chat session ID" line** (the event envelope's `clientSessionId`, previously undisplayed) lets the user copy any chat's id and edit the `target` line by hand. To move a bound task: edit the file (`target` → the new chat's id, `channel` → its channel config name), or delete both lines to unbind and then run `/schedule-here` again in the new chat. Unbind = delete both lines.
 
 - There is still **no runtime binding state and no channel-state schema change** — the task file remains the single source of truth; `/schedule-here` is only a convenient way to write one line into it.
 - At fire time the scheduler validates `target` with the client module's session-id parser (e.g. `parseFeishuSessionId`). Missing/malformed → fire skipped + logged + `schedule list` shows the problem (there is nowhere to deliver an error to).
@@ -132,13 +136,18 @@ Problem: IM chat/session IDs (`feishu:dm:oc_6f9d...`) are not user-guessable, so
 
 So a task can be verified end-to-end right after setting `target` instead of waiting for the schedule: the adapter handles `/schedule-run <task-name>` locally and calls the scheduler's `runNow(taskName)`, which performs exactly the same fire path as a scheduled trigger (fresh isolated run, timeout-bounded, result delivered to the target chat). Unknown/disabled/no-target task → localized error reply. Any chat of the channel may trigger any of its tasks; the result always goes to the task's `target`.
 
+**Ownership check shared with `fire`**: `runNow` and the timed tick share one fire path (`#fire`), so both enforce the same ownership rule — a task bound to a **different** channel (`channel` set to anything else) is refused with reason `task belongs to channel "X"` and the localized "Please run it from that channel" reply. A task with **no `channel`** (a legacy/manual file) is *not* refused by the ownership check: it passes to the ordinary target validation, so it can still be triggered manually from any channel whose target validation accepts its `target` — but the tick loop never selects it for scheduled firing (see D8).
+
 IM-side schedule commands are **flat** (`schedule-run`), never `command + subcommand` — see `docs/grill-context/principles.md`.
 
 The stored `target` is only a delivery address for D2 — the runner passes it verbatim into the egress event; the client adapter already knows how to resolve it to a chat. It grants no control over the chat's own session.
 
 ### D8. Hot reload by tick polling
 
-The scheduler wakes on a short fixed tick (30 s), re-scans the channel's task directory, and re-syncs its in-memory task table:
+The scheduler wakes on a short fixed tick (30 s), re-scans the **shared flat schedules directory** (all channels' task files), and re-syncs its in-memory task table. The table mirrors **every** task — ownership is decided at fire-selection time, not at load time:
+
+- **Scheduled firing is filtered by the task's `channel` field**: only tasks whose `channel` equals this channel's config name fire on schedule; tasks owned by other channels and unbound tasks (no `channel`) are skipped, with `nextRun` left untouched.
+- **Target claiming** (`/schedule-here`) can resolve any task by name regardless of ownership — task names are globally unique, so the existence check needs the full table.
 
 - Edited body → used on the next fire (the file is read at fire time).
 - Edited front matter → effective on the next tick; no channel restart needed.
@@ -147,14 +156,14 @@ The scheduler wakes on a short fixed tick (30 s), re-scans the channel's task di
 
 ### D9. Runtime placement
 
-One `Scheduler` instance per channel, owned by `ChannelRunner`, started/stopped with the channel. Stopping a channel clears timers; in-flight task sessions shut down through the normal core teardown (they are ordinary sessions behind synthetic ids). Missed fires while stopped are not made up.
+One `Scheduler` instance per channel, owned by `ChannelRunner`, started/stopped with the channel; each instance scans the shared directory and fires on schedule only the tasks whose `channel` matches its own name (see D8). Stopping a channel clears timers; in-flight task sessions shut down through the normal core teardown (they are ordinary sessions behind synthetic ids). Missed fires while stopped are not made up.
 
 ## Architecture
 
 ```mermaid
 graph LR
   subgraph CLI
-    ADD[agent-bridge schedule add] -->|writes| F[schedules/&lt;channel&gt;/&lt;task&gt;.md]
+    ADD[agent-bridge schedule add] -->|writes| F[schedules/&lt;task&gt;.md]
     LS[agent-bridge schedule list] -->|reads| F
   end
   subgraph Bridge process per channel
@@ -178,25 +187,24 @@ graph LR
 ~/.config/agent-bridge/
   config.json
   session-bindings/<channel>.json      # unchanged (v3)
-  schedules/<channel>/<task>.md        # new
+  schedules/<task>.md                  # new — flat, channel-agnostic; ownership lives in each task's `channel` front matter
 ```
 
 ## CLI Surface
 
 ```
-agent-bridge schedule add       # interactive wizard
-agent-bridge schedule list      # all channels: name, schedule, target set?, enabled?, next run (computed from the grammar)
-agent-bridge schedule remove <task-name>   # direct delete; --channel <name> disambiguates when several channels own the name
+agent-bridge schedule add       # interactive wizard — no channel selection (task names are globally unique)
+agent-bridge schedule list      # global list: Channel, Task, Schedule, Enabled, Target, Next run (computed from the grammar), Status
+agent-bridge schedule remove <task-name>   # direct delete — no --channel option (task names are globally unique)
 ```
 
 Wizard steps for `add`:
 
-1. Pick an existing channel.
-2. Task name (slug-validated).
-3. Schedule string (validated against the grammar, re-prompt on error, with examples shown).
-4. Working directory (optional; blank = bridge cwd). Not validated against the filesystem here — validation happens at fire time (D6), since the bridge may run elsewhere.
-5. Timeout (duration string, default `10m`).
-6. Writes the file with a localized example prompt body (a trivial time-telling task, localized to the selected channel's configured `common.language`), then prints the file path and the targeting instruction: *"Edit the file to set your prompt. To choose the destination chat, send `/schedule-here <task-name>` in that chat (later changes: `/st` shows the chat session ID for manual `target` edits)."*
+1. Task name (slug-validated, globally unique — no channel selection).
+2. Schedule string (validated against the grammar, re-prompt on error, with examples shown).
+3. Working directory (optional; blank = bridge cwd). Not validated against the filesystem here — validation happens at fire time (D6), since the bridge may run elsewhere.
+4. Timeout (duration string, default `10m`).
+5. Writes the file with a localized example prompt body (a trivial time-telling task, in the CLI's default locale — no channel is selected to localize by), then prints the file path and the targeting instruction: *"Edit the file to set your prompt. To choose the destination chat, send `/schedule-here <task-name>` in that chat (later changes: `/st` shows the chat session ID for manual `target` edits)."*
 
 ## Component Map
 
@@ -222,7 +230,8 @@ Wizard steps for `add`:
 - **`target` copied from a different channel / typo'd** → fails the client module's session-id parse at load/fire time; fire skipped, logged, shown by `schedule list`.
 - **Task file deleted while a run is in flight** → run completes and delivers normally; no future fires.
 - **Target chat deleted IM-side** → delivery fails through the existing egress error handling and is logged.
-- **Two channels, same task name** → independent (files, state, and synthetic session ids are per-channel).
+- **Two channels, same task name** → impossible by construction: task names are globally unique (one file per name). A task belongs to the channel named in its `channel` field, and each channel's scheduler fires only its own tasks.
+- **Task with no `channel` (legacy/manual file)** → never fires on schedule (every scheduler's tick skips it), but it can still be triggered manually via `/schedule-run` from any channel whose target validation accepts its `target`; the ownership check refuses only tasks bound to a different channel.
 - **Channel restarted mid-run** → the ephemeral session is torn down like any session; the run is lost (no resume in phase 1). `schedule:*` bindings live in memory only, so a restart leaves no residue in the state file.
 - **Clock jumps / DST** → `nextRun` recomputes from wall clock every tick; `daily 09:00` fires at the next local 09:00 whatever happened in between. A fire is considered due when `now >= nextRun`; at most one fire per task per tick (no bursting).
 - **Result is empty or only whitespace** → deliver a localized "task finished with no output" notice instead of silence.

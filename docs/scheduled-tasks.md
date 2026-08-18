@@ -2,7 +2,7 @@
 
 Scheduled tasks let you run an agent on a recurring schedule without touching a chat manually.
 
-A task is a Markdown file that declares **when** to run (a schedule string), **where** to run (a working directory), **how long** a run may take (a timeout), and **where to send the result** (a target chat). When the schedule fires, the bridge creates a **fresh, fully independent agent session**, sends the task's prompt into it, and delivers the agent's final result — or a failure/timeout notice — into the target chat as an ordinary message.
+A task is a Markdown file that declares **when** to run (a schedule string), **where** to run (a working directory), **how long** a run may take (a timeout), **which channel owns it** (a channel field), and **where to send the result** (a target chat). When the schedule fires, the bridge creates a **fresh, fully independent agent session**, sends the task's prompt into it, and delivers the agent's final result — or a failure/timeout notice — into the target chat as an ordinary message.
 
 The most important property is **isolation**: a task run never touches the target chat's own agent session. You can keep chatting in that chat before, during, and after a run and nothing about your session changes. The chat is only used as a delivery address.
 
@@ -16,8 +16,7 @@ The most important property is **isolation**: a task run never touches the targe
 
    The wizard asks, in order:
 
-   - which configured channel the task belongs to,
-   - a task name (lowercase letters, digits and hyphens only, e.g. `daily-report`),
+   - a task name (lowercase letters, digits and hyphens only, e.g. `daily-report`; names are globally unique — there is no channel selection),
    - a schedule string (validated against the grammar below, re-prompted on error, with examples shown),
    - an optional working directory (blank = the bridge process's current directory),
    - a timeout (default `10m`).
@@ -32,7 +31,7 @@ The most important property is **isolation**: a task run never touches the targe
    /schedule-here daily-report
    ```
 
-   The adapter binds that chat as the task's delivery target: it writes the chat's client session id into the task file's `target` line and replies `Task "daily-report" will send its results to this chat.` No copying or manual editing is needed. (To change the destination later, see [Changing the destination chat](#changing-the-destination-chat).)
+   The adapter binds that chat as the task's delivery target: it writes the chat's client session id into the task file's `target` line and this channel's config name into the `channel` line, then replies `Task "daily-report" will send its results to this chat.` No copying or manual editing is needed. (A task that is already bound — its file has a `target` or `channel` line — is refused; see [Changing the destination chat](#changing-the-destination-chat) to move it.)
 
 4. Verify it end-to-end immediately instead of waiting for the schedule:
 
@@ -44,7 +43,7 @@ The most important property is **isolation**: a task run never touches the targe
 
 ### Changing the destination chat
 
-To point a task at a different chat later, send `/schedule-here <task-name>` again in the new chat — it overwrites the `target` line. The manual alternative is to copy the chat's session id:
+A bound task cannot be rebound with `/schedule-here` (it is refused with `Task "daily-report" is already bound to a chat.`), so moving a task to another chat is a two-step operation: unbind it first — remove the `target` and `channel` lines from the front matter (ask the AI in its current bound chat to edit the file, or edit by hand — there is no `/schedule-unbind` command) — then send `/schedule-here <task-name>` in the new chat. If you prefer to edit by hand instead, change the `target` line to the new chat's session id (and the `channel` line if the new chat belongs to a different channel). To copy a chat's session id:
 
 1. Send `/st` in the chat that should receive the result. The status reply includes a **Chat session ID** line:
 
@@ -58,13 +57,13 @@ Either change is effective on the next 30 s tick — no channel restart needed.
 
 ## Task file format
 
-Tasks live at:
+Tasks live in a single flat directory shared by all channels:
 
 ```
-~/.config/agent-bridge/schedules/<channel>/<task-name>.md
+~/.config/agent-bridge/schedules/<task-name>.md
 ```
 
-The task name is the file name without `.md` and must match `[a-z0-9-]+` (lowercase letters, digits and hyphens). The channel name is percent-encoded in the directory name, mirroring the `session-bindings` directory. Files whose names are not valid task names are skipped with a warning.
+Task names are **globally unique** across all channels: the file name (without `.md`) is the task's key and must match `[a-z0-9-]+` (lowercase letters, digits and hyphens). The owning channel is recorded in the front-matter `channel` field (see below), not in the directory layout. Files whose names are not valid task names are skipped with a warning. Legacy per-channel subdirectories (`schedules/<channel>/`) are no longer read and are not migrated.
 
 The file is front matter plus a prompt body:
 
@@ -74,6 +73,7 @@ schedule: daily 09:00
 directory: ~/reports
 timeout: 30m
 enabled: true
+channel: feishu-dev
 target: feishu:dm:oc_6f9d408e630098e6dd06bb071d6b60fc
 ---
 
@@ -94,8 +94,9 @@ yesterday's errors.
 | `timeout` | no | `10m` | Max run duration: `<n>s`, `<n>m` or `<n>h` (e.g. `90s`, `10m`, `1h`). The run is killed when exceeded and the target chat receives a timeout notice. An invalid value is listed as an error and the default is used. |
 | `enabled` | no | `true` | `false` (case-insensitive) pauses the task without deleting the file. Any other value or absence means enabled. |
 | `target` | no | — | Delivery address: the destination chat's clientSessionId. The recommended way to set it initially is `/schedule-here <task-name>` sent in the destination chat; the manual way is to copy the **Chat session ID** line from `/st` in that chat (see [Changing the destination chat](#changing-the-destination-chat)). Required for delivery — without it (or when it fails validation, e.g. a typo or a chat from another channel) the fire is skipped, the skip is logged, and `schedule list` shows `Target: no`. |
+| `channel` | no | — | Owning channel config name, written by `/schedule-here <task-name>` together with `target`. Each channel's scheduler fires on schedule only tasks whose `channel` matches that channel; a task with no `channel` line never fires on schedule (but can still be triggered manually with `/schedule-run`, see below). |
 
-`schedule add` writes the front matter with `schedule`, `directory` (only if you entered one) and `timeout`, plus the example prompt body. It does not write `enabled` (absent means enabled) or `target` — the `target` line is meant to be set with `/schedule-here <task-name>` (or, for later manual edits, pasted from the `/st` output), and the body is meant to be replaced with your real prompt.
+`schedule add` writes the front matter with `schedule`, `directory` (only if you entered one) and `timeout`, plus the example prompt body. It does not write `enabled` (absent means enabled), `target` or `channel` — the `target` and `channel` lines are meant to be set with `/schedule-here <task-name>` (or, for later manual edits, pasted from the `/st` output), and the body is meant to be replaced with your real prompt.
 
 ## Schedule grammar
 
@@ -162,10 +163,10 @@ Fire-time validation failures behave like failures: if the working directory is 
 
 ### Hot reload: edits are picked up within 30 seconds
 
-The scheduler re-scans the channel's task directory on a short fixed tick (30 s) and re-syncs its in-memory table:
+Every channel's scheduler re-scans the shared schedules directory (all channels' tasks) on a short fixed tick (30 s) and re-syncs its in-memory table. Each scheduler fires on schedule only the tasks whose front-matter `channel` matches that channel — tasks owned by other channels, and tasks with no `channel` line, are never fired on schedule by it:
 
 - **Edited prompt body** → the file is re-read at fire time, so the new body is used on the next fire.
-- **Edited front matter** (schedule, timeout, directory, enabled, target) → effective on the next tick; no channel restart needed.
+- **Edited front matter** (schedule, timeout, directory, enabled, target, channel) → effective on the next tick; no channel restart needed.
 - **New or deleted files** → tasks appear/disappear on the next tick. Deleting a file mid-run does not interrupt the in-flight run.
 - There is no file-system watching; 30 s polling is cheap and predictable.
 
@@ -192,6 +193,7 @@ Trigger a task immediately, in any chat of the channel:
 - The command is handled locally by the client adapter and never reaches the core. The command name is case-insensitive and the task name is normalized to lowercase, so `/schedule-run DailyReport` triggers the `dailyreport` task.
 - The task name must match `[a-z0-9-]+`; anything else (including a missing name) gets a usage hint.
 - The trigger chat is only the *request* origin — the result always goes to the task's `target`. Any chat of the channel may trigger any of its tasks.
+- The trigger is refused for a task bound to a **different** channel: `Scheduled task "daily-report" belongs to channel "wecom-main". Please run it from that channel.` A task with no `channel` line (a legacy/manual file) is not refused — it can still be triggered manually from any channel whose target validation accepts its `target`.
 - The run is identical to a scheduled fire: a fresh, isolated, timeout-bounded run.
 - The trigger chat receives a localized reply: "Task "name" has been triggered. The result will be sent to its target chat." on success, or a specific reply when the task is unknown, disabled, or has no valid target chat, or a generic failure message with the reason.
 
@@ -204,23 +206,23 @@ Bind this chat as a task's delivery target in one step — send it **in the chat
 ```
 
 - The command is handled locally by the client adapter and never reaches the core. The command name is case-insensitive and the task name is normalized to lowercase, so `/schedule-here DailyReport` binds the `dailyreport` task.
-- On success the chat's `clientSessionId` is written into the task file's `target` line and the chat receives `Task "daily-report" will send its results to this chat.`; when the task is unknown the reply is `Scheduled task "daily-report" was not found.`, and any other failure replies with a generic failure message carrying the reason.
-- The task name must match `[a-z0-9-]+`; anything else (including a missing name) gets a usage hint. Re-binding in a chat (the same or a different task) simply overwrites the `target` line.
+- On success the chat's `clientSessionId` is written into the task file's `target` line, together with this channel's config name in the `channel` line, and the chat receives `Task "daily-report" will send its results to this chat.`; when the task is unknown the reply is `Scheduled task "daily-report" was not found.`, and any other failure replies with a generic failure message carrying the reason.
+- The task name must match `[a-z0-9-]+`; anything else (including a missing name) gets a usage hint. A task that is already bound — its file has a `target` or a `channel` line — is refused: `Task "daily-report" is already bound to a chat. To rebind it, remove the target/channel lines from its task file (ask the AI in its current bound chat, or edit the file manually).` There is no `/schedule-unbind` command: unbinding is an intentional file edit.
 
 ## CLI
 
 | Command | What it does |
 | --- | --- |
-| `agent-bridge schedule add` | Interactive wizard: pick a channel, name the task, enter the schedule (validated, with examples), optionally set the working directory and timeout, then write the task file with an example prompt and print the targeting instruction. |
+| `agent-bridge schedule add` | Interactive wizard: name the task (globally unique — no channel selection), enter the schedule (validated, with examples), optionally set the working directory and timeout, then write the task file with an example prompt and print the targeting instruction. |
 | `agent-bridge schedule list` | Table of every task across all channels: Channel, Task, Schedule, Enabled (`yes`/`no`), Target (`yes`/`no`), Next run (computed from the grammar at the current clock) and Status (`ERROR:`/`WARN:` notes such as missing schedule, invalid timeout, empty body, unknown keys). |
-| `agent-bridge schedule remove <task-name>` | Delete the task file directly. If several channels own a task with that name, disambiguate with `--channel <name>`. |
+| `agent-bridge schedule remove <task-name>` | Delete the task file directly. Task names are globally unique, so no disambiguation or `--channel` option is needed. |
 
 Task files are plain Markdown: diffable, git-trackable, and hot-reloaded — there is no runtime binding state and no channel-state schema change.
 
 ## Troubleshooting
 
 **The task fired but nothing arrived in the chat — did I set `target` wrong?**
-Send `/schedule-here <task-name>` again *in the destination chat*; if you edit `target` by hand, it must be the exact **Chat session ID** line from `/st` sent *in that chat*. A typo, a chat id from another channel (the platform prefix won't match, e.g. a `wecom:` id in a feishu task), or a missing line all mean the fire is skipped and only logged. Run `agent-bridge schedule list` — the `Target` column shows `no` for such tasks, and `schedule-run` replies "has no valid target chat configured".
+Send `/schedule-here <task-name>` again *in the destination chat*; if you edit `target` by hand, it must be the exact **Chat session ID** line from `/st` sent *in that chat*. A typo, a chat id from another channel (the platform prefix won't match, e.g. a `wecom:` id in a feishu task), or a missing line all mean the fire is skipped and only logged. Run `agent-bridge schedule list` — the `Target` column shows `no` for such tasks, and `schedule-run` replies "has no valid target chat configured". Note that `/schedule-here` only binds a task that is not yet bound — to re-point an already bound task, remove its `target`/`channel` lines first.
 
 **The target chat was deleted IM-side.**
 Delivery goes through the normal egress path, so a deleted chat fails like any other send failure: it is logged by the bridge (the task run itself has already completed or timed out). Fix the `target` line and the next fire delivers normally.
@@ -230,9 +232,10 @@ Check in order:
 
 1. `agent-bridge schedule list` — is the task listed? Is `Enabled` `yes`? Is `Next run` a real time rather than "invalid schedule"? Are there `ERROR:`/`WARN:` notes in `Status`?
 2. Is `target` set (`Target: yes`)? Without it the fire is silently skipped by design.
-3. Was the change recent? Front matter edits and new/deleted files take effect on the next 30 s tick; the prompt body is read at fire time.
-4. Is the channel running? A stopped channel never fires, and missed fires are not made up on restart.
-5. Check the bridge's logs — fire failures, invalid-directory skips, no-target skips and delivery errors are logged under the `[schedule]` scope.
+3. Is the task's `Channel` column set to a running channel? Only tasks whose `channel` line matches a channel fire on schedule — an unbound task (no `channel` line) never fires; bind it with `/schedule-here` first.
+4. Was the change recent? Front matter edits and new/deleted files take effect on the next 30 s tick; the prompt body is read at fire time.
+5. Is the channel running? A stopped channel never fires, and missed fires are not made up on restart.
+6. Check the bridge's logs — fire failures, invalid-directory skips, no-target skips and delivery errors are logged under the `[schedule]` scope.
 
 **I moved the result to another chat.**
-Send `/schedule-here <task-name>` in the new chat, or edit the `target` line manually; it is effective on the next tick. No restart needed. Unbinding = delete the line (the task then skips fires and `schedule list` shows `Target: no`).
+Unbind the task first — remove the `target` and `channel` lines from the file (there is no `/schedule-unbind` command) — then send `/schedule-here <task-name>` in the new chat; or edit the `target` (and `channel`) line manually. The change is effective on the next tick; no restart needed. A task with no `target`/`channel` lines skips fires and `schedule list` shows `Target: no`.
