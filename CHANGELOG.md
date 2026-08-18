@@ -2,6 +2,15 @@
 
 All notable changes to this project will be documented in this file. See [commit-and-tag-version](https://github.com/absolute-version/commit-and-tag-version) for commit guidelines.
 
+## [0.8.1](https://github.com/HoPGoldy/agent-bridge/compare/v0.8.0...v0.8.1) (2026-08-18)
+
+
+### Features
+
+* drop channel selection from schedule CLI and add binding replies ([f1daedf](https://github.com/HoPGoldy/agent-bridge/commit/f1daedfd778c95b10a361b479a093aec10c94618))
+* flatten scheduled task storage and add channel front-matter field ([070b4a1](https://github.com/HoPGoldy/agent-bridge/commit/070b4a15897bebe9f264b8f5ff7f2bb9daabd3a0))
+* scope scheduled task firing and binding to the owning channel ([bb8bb0e](https://github.com/HoPGoldy/agent-bridge/commit/bb8bb0e74b4e83d229c8565676800aafbff5b3df))
+
 ## [0.8.0](https://github.com/HoPGoldy/agent-bridge/compare/v0.7.1...v0.8.0) (2026-08-17)
 
 
