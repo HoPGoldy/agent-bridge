@@ -25,7 +25,7 @@ import { nextRun, parseSchedule, parseTimeout } from "./modules/schedule/grammar
 import {
   getSchedulesDir,
   isValidTaskName,
-  loadChannelTasks,
+  loadAllTasks,
   type ScheduleTask,
 } from "./modules/schedule/task-file";
 
@@ -279,7 +279,9 @@ async function addScheduleTask(): Promise<void> {
     const channel = await selectScheduleChannel(ctx, config);
     const channelLanguage = config.channels[channel]?.common.language ?? DEFAULT_LOCALE;
 
-    const existing = await loadChannelTasks(channel);
+    // T1: tasks live in the flat shared schedules directory; the channel
+    // loop stays for the list's channel column (reworked in a later ticket).
+    const existing = await loadAllTasks();
     const existingNames = new Set(existing.map((entry) => entry.task.name));
 
     const name = await ctx.input("Task name", {
@@ -302,7 +304,7 @@ async function addScheduleTask(): Promise<void> {
       validate: validateTimeoutInput,
     });
 
-    const schedulesDir = getSchedulesDir(channel);
+    const schedulesDir = getSchedulesDir();
     await mkdir(schedulesDir, { recursive: true });
     const filePath = path.join(schedulesDir, `${name}.md`);
     await writeFile(
@@ -353,7 +355,7 @@ async function listScheduleTasks(): Promise<void> {
   const now = new Date();
   const rows: ScheduleTaskRow[] = [];
   for (const channel of channelNames) {
-    const loaded = await loadChannelTasks(channel);
+    const loaded = await loadAllTasks();
     for (const { task, errors, warnings } of loaded) {
       rows.push({ channel, task, errors, warnings });
     }
@@ -401,7 +403,7 @@ async function removeScheduleTask(taskName: string, options: { channel?: string 
 
   const matches: string[] = [];
   for (const channel of candidates) {
-    const loaded = await loadChannelTasks(channel);
+    const loaded = await loadAllTasks();
     if (loaded.some((entry) => entry.task.name === taskName)) {
       matches.push(channel);
     }
@@ -418,7 +420,7 @@ async function removeScheduleTask(taskName: string, options: { channel?: string 
     );
   }
 
-  const filePath = path.join(getSchedulesDir(matches[0]!), `${taskName}.md`);
+  const filePath = path.join(getSchedulesDir(), `${taskName}.md`);
   await unlink(filePath);
   console.log(`Deleted ${filePath}`);
 }

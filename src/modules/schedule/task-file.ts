@@ -2,13 +2,15 @@
  * Scheduled task Markdown files: front-matter subset parser, task loader and
  * validator (spec D3/D6).
  *
- * Files live at `~/.config/agent-bridge/schedules/<channel>/<task-name>.md`
- * where the task name is the file name without `.md` and must match
- * `[a-z0-9-]+`. Front matter is a flat `key: value` subset (no YAML
- * dependency): one key per line, values are bare strings with surrounding
- * quotes stripped, `#` comment lines and blank lines are ignored, unknown
- * keys produce warnings. A file that does not start with a `---` line has no
- * front matter: the whole file is the prompt body.
+ * Files live at `~/.config/agent-bridge/schedules/<task-name>.md` — a flat
+ * shared directory (channel-agnostic); the owning channel config name is
+ * recorded in the front-matter `channel` field, written by `/schedule-here`
+ * together with `target`. The task name is the file name without `.md` and
+ * must match `[a-z0-9-]+`. Front matter is a flat `key: value` subset (no
+ * YAML dependency): one key per line, values are bare strings with
+ * surrounding quotes stripped, `#` comment lines and blank lines are
+ * ignored, unknown keys produce warnings. A file that does not start with a
+ * `---` line has no front matter: the whole file is the prompt body.
  *
  * Parsing never throws for bad content: every file becomes a {@link LoadedTask}
  * whose `errors`/`warnings` are surfaced by the CLI's `schedule list`. Tasks
@@ -29,7 +31,14 @@ export const DEFAULT_TIMEOUT_MS = 10 * 60_000;
 /** Task names are the `.md` file names without the extension (spec D3). */
 const TASK_NAME_RE = /^[a-z0-9-]+$/;
 
-const KNOWN_KEYS = new Set(["schedule", "directory", "timeout", "enabled", "target"]);
+const KNOWN_KEYS = new Set([
+  "schedule",
+  "directory",
+  "timeout",
+  "enabled",
+  "target",
+  "channel",
+]);
 
 /** A parsed, validated scheduled task. Invalid tasks are still listed; see {@link LoadedTask.errors}. */
 export interface ScheduleTask {
@@ -47,6 +56,8 @@ export interface ScheduleTask {
   enabled: boolean;
   /** Delivery address — the destination chat's clientSessionId, when set (spec D7). */
   target: string | undefined;
+  /** Owning channel config name, written by `/schedule-here` alongside `target` (spec D7). */
+  channel: string | undefined;
   /** The prompt body (everything after the closing `---`, trimmed). */
   prompt: string;
 }
@@ -64,15 +75,12 @@ export function isValidTaskName(name: string): boolean {
 }
 
 /**
- * Absolute directory holding one channel's task files. The channel name is
- * percent-encoded, mirroring `getChannelStateStorePath`'s handling of channel
- * names in file paths.
+ * Absolute directory holding every task file — the flat, channel-agnostic
+ * shared schedules directory. The legacy per-channel `schedules/<channel>/`
+ * subdirectories are ignored entirely.
  */
-export function getSchedulesDir(
-  channelName: string,
-  schedulesRoot: string = SCHEDULES_DIR,
-): string {
-  return path.join(schedulesRoot, encodeURIComponent(channelName));
+export function getSchedulesDir(schedulesRoot: string = SCHEDULES_DIR): string {
+  return path.join(schedulesRoot);
 }
 
 /**
@@ -132,6 +140,7 @@ export function parseTaskFile(fileName: string, content: string): LoadedTask {
     timeoutMs,
     enabled,
     target: nonEmptyString(fields.target),
+    channel: nonEmptyString(fields.channel),
     prompt,
   };
 
@@ -139,22 +148,22 @@ export function parseTaskFile(fileName: string, content: string): LoadedTask {
 }
 
 /**
- * Scans one channel's schedule directory and parses every `.md` task file.
+ * Scans the flat schedules directory and parses every `.md` task file.
  *
- * Files whose names are not valid task names (`[a-z0-9-]+`) are skipped with a
- * warning; non-`.md` entries are ignored. A missing directory is not an error:
- * it yields an empty list. Results are sorted by task name for deterministic
- * display.
+ * Only top-level `.md` files are read: subdirectories — e.g. the legacy
+ * per-channel `schedules/<channel>/` layout — are ignored entirely. Files
+ * whose names are not valid task names (`[a-z0-9-]+`) are skipped with a
+ * warning; non-`.md` entries are ignored. A missing directory is not an
+ * error: it yields an empty list. Results are sorted by task name for
+ * deterministic display.
  *
- * @param channelName Channel whose task directory is scanned.
  * @param schedulesRoot Overridable root (defaults to {@link SCHEDULES_DIR});
  *   tests point this at a temporary directory.
  */
-export async function loadChannelTasks(
-  channelName: string,
+export async function loadAllTasks(
   schedulesRoot: string = SCHEDULES_DIR,
 ): Promise<LoadedTask[]> {
-  const dir = getSchedulesDir(channelName, schedulesRoot);
+  const dir = getSchedulesDir(schedulesRoot);
   let entries: Dirent[];
   try {
     entries = await readdir(dir, { withFileTypes: true });
@@ -248,37 +257,38 @@ function nonEmptyString(value: string | undefined): string | undefined {
   return trimmed === "" ? undefined : trimmed;
 }
 
-/** Outcome of writing a task's `target` field (`/schedule-here`, spec D7). */
-export type SetTaskTargetResult = { ok: true } | { ok: false; reason: string };
+/** Outcome of binding a task to a channel + delivery target (`/schedule-here`, spec D7). */
+export type BindTaskResult = { ok: true } | { ok: false; reason: string };
 
 /**
- * Writes `clientSessionId` into the task file's `target` front-matter field
- * (spec D7, `/schedule-here`): the surgical, single-line edit that binds a
- * chat as the task's delivery target.
+ * Writes `binding.target` (a chat's clientSessionId) and `binding.channel`
+ * (the channel config name) into the task file's front matter (spec D7,
+ * `/schedule-here`): the surgical, two-line edit that binds a chat as the
+ * task's delivery target. Both lines are written in a single atomic pass.
  *
- * Rules: an existing `target:` line is replaced in place; a file with front
- * matter but no `target` line gets one inserted just before the closing
- * `---`; a file without front matter gets a new front matter block containing
- * only the target line prepended to the head. In every case the body and all
- * other lines are preserved byte-for-byte (the inserted text uses the file's
- * own line endings). The write is atomic: a temporary sibling file is written
- * and renamed over the target (same-directory temp + rename, mirroring the
- * channel-state commit).
+ * Rules: an existing `target:`/`channel:` line is replaced in place; a file
+ * with front matter but no such line gets one inserted just before the
+ * closing `---`; a file without front matter gets a new front matter block
+ * containing only the two lines prepended to the head; an unterminated front
+ * matter block gets the lines appended to the end. In every case the body
+ * and all other lines are preserved byte-for-byte (the inserted text uses
+ * the file's own line endings). The write is atomic: a temporary sibling
+ * file is written and renamed over the target (same-directory temp +
+ * rename, mirroring the channel-state commit).
  *
  * Never throws for the expected failures: a missing file or an invalid task
  * name returns an error result (callers reply to the triggering chat).
  */
-export async function setTaskTarget(
-  channelName: string,
+export async function bindTask(
   taskName: string,
-  clientSessionId: string,
+  binding: { target: string; channel: string },
   schedulesRoot: string = SCHEDULES_DIR,
-): Promise<SetTaskTargetResult> {
+): Promise<BindTaskResult> {
   if (!isValidTaskName(taskName)) {
     return { ok: false, reason: "invalid task name" };
   }
 
-  const filePath = path.join(getSchedulesDir(channelName, schedulesRoot), `${taskName}.md`);
+  const filePath = path.join(getSchedulesDir(schedulesRoot), `${taskName}.md`);
   let content: string;
   try {
     content = await readFile(filePath, "utf8");
@@ -290,7 +300,7 @@ export async function setTaskTarget(
   }
 
   try {
-    await writeFileAtomic(filePath, applyTargetLine(content, clientSessionId));
+    await writeFileAtomic(filePath, applyBinding(content, binding));
   } catch (error) {
     return { ok: false, reason: `failed to write task file: ${(error as Error).message}` };
   }
@@ -298,16 +308,19 @@ export async function setTaskTarget(
 }
 
 /**
- * Returns `content` with the `target` front-matter field set to
- * `clientSessionId`, applying the {@link setTaskTarget} replacement rules.
- * The returned text differs from the input only where the target line lives.
+ * Returns `content` with the front-matter fields in `binding` set to their
+ * values, applying the {@link bindTask} replacement rules. The returned text
+ * differs from the input only where the bound lines live.
  */
-function applyTargetLine(content: string, clientSessionId: string): string {
+function applyBinding(content: string, binding: { target: string; channel: string }): string {
   // Split/join with the file's own line endings so untouched bytes survive
   // verbatim (a lone stray newline inside a line is left in place).
   const eol = content.includes("\r\n") ? "\r\n" : "\n";
   const lines = content.split(eol);
-  const targetLine = `target: ${clientSessionId}`;
+  const entries: Array<[string, string]> = [
+    ["target", binding.target],
+    ["channel", binding.channel],
+  ];
 
   // Front matter starts with a `---` delimiter line.
   if (lines[0]?.trim() === "---") {
@@ -320,27 +333,35 @@ function applyTargetLine(content: string, clientSessionId: string): string {
     }
     if (closeIndex === -1) {
       // Unterminated block: the parser treats the rest of the file as front
-      // matter, so appending the target line keeps the file's semantics (an
-      // empty body) unchanged.
-      lines.push(targetLine);
+      // matter, so appending the lines keeps the file's semantics (an empty
+      // body) unchanged.
+      lines.push(...entries.map(([key, value]) => `${key}: ${value}`));
       return lines.join(eol);
     }
 
-    for (let i = 1; i < closeIndex; i++) {
-      const colon = lines[i].indexOf(":");
-      const key = colon === -1 ? lines[i].trim() : lines[i].slice(0, colon).trim();
-      if (key === "target") {
-        lines[i] = targetLine;
-        return lines.join(eol);
+    const missing: string[] = [];
+    for (const [key, value] of entries) {
+      const line = `${key}: ${value}`;
+      let replaced = false;
+      for (let i = 1; i < closeIndex; i++) {
+        const colon = lines[i].indexOf(":");
+        const fieldKey = colon === -1 ? lines[i].trim() : lines[i].slice(0, colon).trim();
+        if (fieldKey === key) {
+          lines[i] = line;
+          replaced = true;
+          break;
+        }
       }
+      if (!replaced) missing.push(line);
     }
-
-    lines.splice(closeIndex, 0, targetLine);
+    if (missing.length > 0) {
+      lines.splice(closeIndex, 0, ...missing);
+    }
     return lines.join(eol);
   }
 
-  // No front matter: prepend a minimal block containing only the target line.
-  return `---${eol}${targetLine}${eol}---${eol}${content}`;
+  // No front matter: prepend a minimal block containing only the bound lines.
+  return `---${eol}${entries.map(([key, value]) => `${key}: ${value}`).join(eol)}${eol}---${eol}${content}`;
 }
 
 /** Same-directory temp file + rename commit, mirroring the channel-state store. */

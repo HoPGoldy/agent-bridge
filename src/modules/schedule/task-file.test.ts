@@ -2,13 +2,14 @@ import { mkdir, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+import { SCHEDULES_DIR } from "../../config/channel-state";
 import {
   DEFAULT_TIMEOUT_MS,
+  bindTask,
   getSchedulesDir,
   isValidTaskName,
-  loadChannelTasks,
+  loadAllTasks,
   parseTaskFile,
-  setTaskTarget,
 } from "./task-file";
 
 const WELL_FORMED = `---
@@ -17,6 +18,7 @@ directory: ~/reports
 timeout: 30m
 enabled: true
 target: feishu:dm:oc_6f9d408e630098e6dd06bb071d6b60fc
+channel: feishu-dev
 ---
 
 Read the logs and produce a summary of yesterday's errors.
@@ -46,6 +48,7 @@ describe("parseTaskFile", () => {
       timeoutMs: 30 * 60_000,
       enabled: true,
       target: "feishu:dm:oc_6f9d408e630098e6dd06bb071d6b60fc",
+      channel: "feishu-dev",
       prompt: "Read the logs and produce a summary of yesterday's errors.",
     });
   });
@@ -60,7 +63,40 @@ describe("parseTaskFile", () => {
     expect(task.enabled).toBe(true);
     expect(task.directory).toBeUndefined();
     expect(task.target).toBeUndefined();
+    expect(task.channel).toBeUndefined();
     expect(task.schedule).toEqual({ type: "every", intervalMs: 30 * 60_000 });
+  });
+
+  it("parses the channel field: missing, empty and quoted values", () => {
+    // Missing → undefined (task not yet bound via /schedule-here).
+    const unbound = parseTaskFile("unbound.md", "---\nschedule: daily 09:00\n---\nBody.\n");
+    expect(unbound.task.channel).toBeUndefined();
+    expect(unbound.errors).toEqual([]);
+    expect(unbound.warnings).toEqual([]);
+
+    // Empty value → undefined.
+    const empty = parseTaskFile(
+      "empty-channel.md",
+      "---\nschedule: daily 09:00\nchannel:\n---\nBody.\n",
+    );
+    expect(empty.task.channel).toBeUndefined();
+    expect(empty.errors).toEqual([]);
+
+    // Quoted value → quotes stripped.
+    const quoted = parseTaskFile(
+      "quoted-channel.md",
+      "---\nschedule: daily 09:00\nchannel: 'feishu-dev'\n---\nBody.\n",
+    );
+    expect(quoted.task.channel).toBe("feishu-dev");
+    expect(quoted.errors).toEqual([]);
+
+    // Bare value, no warnings.
+    const bare = parseTaskFile(
+      "bare-channel.md",
+      "---\nschedule: daily 09:00\nchannel: feishu-dev\n---\nBody.\n",
+    );
+    expect(bare.task.channel).toBe("feishu-dev");
+    expect(bare.warnings).toEqual([]);
   });
 
   it("treats a file without front matter as an all-body prompt and flags the missing schedule", () => {
@@ -78,6 +114,7 @@ schedule: "daily 09:00"
 directory: '~/quoted dir'
 timeout: "20m"
 target: 'feishu:dm:oc_123'
+channel: "feishu-dev"
 ---
 
 Body.
@@ -88,6 +125,7 @@ Body.
     expect(task.directory).toBe("~/quoted dir");
     expect(task.timeoutMs).toBe(20 * 60_000);
     expect(task.target).toBe("feishu:dm:oc_123");
+    expect(task.channel).toBe("feishu-dev");
   });
 
   it("ignores blank lines and # comment lines in front matter", () => {
@@ -183,13 +221,14 @@ Body.
     expect(errors[0]).toContain("task body is empty");
   });
 
-  it("treats empty target and directory values as unset", () => {
+  it("treats empty target, channel and directory values as unset", () => {
     const { task, errors } = parseTaskFile(
       "empties.md",
-      "---\nschedule: daily 09:00\ntarget:\ndirectory:   \n---\nBody.\n",
+      "---\nschedule: daily 09:00\ntarget:\nchannel:   \ndirectory:   \n---\nBody.\n",
     );
     expect(errors).toEqual([]);
     expect(task.target).toBeUndefined();
+    expect(task.channel).toBeUndefined();
     expect(task.directory).toBeUndefined();
   });
 
@@ -241,15 +280,9 @@ Body.
   });
 });
 
-describe("loadChannelTasks", () => {
+describe("loadAllTasks", () => {
   const tmpDirs: string[] = [];
   let warnSpy: ReturnType<typeof vi.spyOn>;
-
-  async function makeChannelDir(root: string, channel: string): Promise<string> {
-    const dir = path.join(root, encodeURIComponent(channel));
-    await mkdir(dir, { recursive: true });
-    return dir;
-  }
 
   beforeEach(() => {
     warnSpy = vi.spyOn(console, "warn").mockImplementation(() => {});
@@ -262,39 +295,55 @@ describe("loadChannelTasks", () => {
     }
   });
 
-  it("loads every .md file in the channel directory, sorted by name", async () => {
+  it("loads every .md file in the flat schedules directory, sorted by name", async () => {
     const root = await mkdtemp(path.join(os.tmpdir(), "agent-bridge-schedules-"));
     tmpDirs.push(root);
-    const dir = await makeChannelDir(root, "test");
     await writeFile(
-      path.join(dir, "b-task.md"),
+      path.join(root, "b-task.md"),
       "---\nschedule: daily 09:00\n---\nBody B.\n",
       "utf8",
     );
     await writeFile(
-      path.join(dir, "a-task.md"),
-      "---\nschedule: every 5m\ntimeout: 1h\nenabled: false\n---\nBody A.\n",
+      path.join(root, "a-task.md"),
+      "---\nschedule: every 5m\ntimeout: 1h\nenabled: false\nchannel: feishu-dev\n---\nBody A.\n",
       "utf8",
     );
 
-    const results = await loadChannelTasks("test", root);
+    const results = await loadAllTasks(root);
     expect(results.map((r) => r.task.name)).toEqual(["a-task", "b-task"]);
     expect(results[0].task.timeoutMs).toBe(3_600_000);
     expect(results[0].task.enabled).toBe(false);
+    expect(results[0].task.channel).toBe("feishu-dev");
     expect(results[1].task.prompt).toBe("Body B.");
     expect(results.every((r) => r.errors.length === 0)).toBe(true);
+    expect(warnSpy).not.toHaveBeenCalled();
+  });
+
+  it("ignores the legacy per-channel subdirectories entirely", async () => {
+    const root = await mkdtemp(path.join(os.tmpdir(), "agent-bridge-schedules-"));
+    tmpDirs.push(root);
+    await writeFile(path.join(root, "flat.md"), "---\nschedule: daily 09:00\n---\nFlat.\n", "utf8");
+
+    // Legacy layout: schedules/<channel>/<task>.md — must be ignored.
+    const legacy = path.join(root, "feishu-dev");
+    await mkdir(legacy, { recursive: true });
+    await writeFile(path.join(legacy, "old.md"), "---\nschedule: daily 09:00\n---\nOld.\n", "utf8");
+    await writeFile(path.join(legacy, "deeper.md"), "---\nschedule: daily 09:00\n---\nDeep.\n", "utf8");
+
+    const results = await loadAllTasks(root);
+    expect(results.map((r) => r.task.name)).toEqual(["flat"]);
+    expect(results[0].task.prompt).toBe("Flat.");
     expect(warnSpy).not.toHaveBeenCalled();
   });
 
   it("skips files whose names are not valid task names and warns", async () => {
     const root = await mkdtemp(path.join(os.tmpdir(), "agent-bridge-schedules-"));
     tmpDirs.push(root);
-    const dir = await makeChannelDir(root, "test");
-    await writeFile(path.join(dir, "good.md"), "---\nschedule: daily 09:00\n---\nBody.\n", "utf8");
-    await writeFile(path.join(dir, "Bad Name.md"), "---\nschedule: daily 09:00\n---\nBody.\n", "utf8");
-    await writeFile(path.join(dir, "README.md"), "---\nschedule: daily 09:00\n---\nBody.\n", "utf8");
+    await writeFile(path.join(root, "good.md"), "---\nschedule: daily 09:00\n---\nBody.\n", "utf8");
+    await writeFile(path.join(root, "Bad Name.md"), "---\nschedule: daily 09:00\n---\nBody.\n", "utf8");
+    await writeFile(path.join(root, "README.md"), "---\nschedule: daily 09:00\n---\nBody.\n", "utf8");
 
-    const results = await loadChannelTasks("test", root);
+    const results = await loadAllTasks(root);
     expect(results.map((r) => r.task.name)).toEqual(["good"]);
     expect(warnSpy).toHaveBeenCalledTimes(2);
     for (const call of warnSpy.mock.calls) {
@@ -303,15 +352,14 @@ describe("loadChannelTasks", () => {
     }
   });
 
-  it("ignores non-.md files and directories inside the channel directory", async () => {
+  it("ignores non-.md files and directories inside the schedules directory", async () => {
     const root = await mkdtemp(path.join(os.tmpdir(), "agent-bridge-schedules-"));
     tmpDirs.push(root);
-    const dir = await makeChannelDir(root, "test");
-    await writeFile(path.join(dir, "task.md"), "---\nschedule: daily 09:00\n---\nBody.\n", "utf8");
-    await writeFile(path.join(dir, "notes.txt"), "not a task", "utf8");
-    await mkdir(path.join(dir, "subdir"));
+    await writeFile(path.join(root, "task.md"), "---\nschedule: daily 09:00\n---\nBody.\n", "utf8");
+    await writeFile(path.join(root, "notes.txt"), "not a task", "utf8");
+    await mkdir(path.join(root, "subdir"));
 
-    const results = await loadChannelTasks("test", root);
+    const results = await loadAllTasks(root);
     expect(results.map((r) => r.task.name)).toEqual(["task"]);
     expect(warnSpy).not.toHaveBeenCalled();
   });
@@ -319,32 +367,28 @@ describe("loadChannelTasks", () => {
   it("collects per-file errors for the CLI to display", async () => {
     const root = await mkdtemp(path.join(os.tmpdir(), "agent-bridge-schedules-"));
     tmpDirs.push(root);
-    const dir = await makeChannelDir(root, "test");
-    await writeFile(path.join(dir, "broken.md"), "no front matter, just a prompt", "utf8");
+    await writeFile(path.join(root, "broken.md"), "no front matter, just a prompt", "utf8");
 
-    const results = await loadChannelTasks("test", root);
+    const results = await loadAllTasks(root);
     expect(results).toHaveLength(1);
     expect(results[0].task.name).toBe("broken");
     expect(results[0].errors).toEqual(['missing required front matter key "schedule"']);
     expect(results[0].task.prompt).toBe("no front matter, just a prompt");
   });
 
-  it("returns an empty array when the channel directory does not exist", async () => {
+  it("returns an empty array when the schedules directory does not exist", async () => {
     const root = await mkdtemp(path.join(os.tmpdir(), "agent-bridge-schedules-"));
     tmpDirs.push(root);
-    await expect(loadChannelTasks("ghost", root)).resolves.toEqual([]);
+    await expect(loadAllTasks(path.join(root, "missing"))).resolves.toEqual([]);
     expect(warnSpy).not.toHaveBeenCalled();
   });
 });
 
-describe("setTaskTarget", () => {
+describe("bindTask", () => {
   let tmpRoot: string;
-  let dir: string;
 
   beforeEach(async () => {
-    tmpRoot = await mkdtemp(path.join(os.tmpdir(), "agent-bridge-settarget-"));
-    dir = path.join(tmpRoot, "test");
-    await mkdir(dir, { recursive: true });
+    tmpRoot = await mkdtemp(path.join(os.tmpdir(), "agent-bridge-bindtask-"));
   });
 
   afterEach(async () => {
@@ -352,14 +396,15 @@ describe("setTaskTarget", () => {
   });
 
   async function readTaskFile(taskName: string): Promise<string> {
-    return readFile(path.join(dir, `${taskName}.md`), "utf8");
+    return readFile(path.join(tmpRoot, `${taskName}.md`), "utf8");
   }
 
-  it("replaces an existing target line in place, preserving the rest byte-for-byte", async () => {
+  it("replaces existing target and channel lines in place, preserving the rest byte-for-byte", async () => {
     const original = `---
 # keep this comment
 schedule: daily 09:00
 target: feishu:dm:oc_old
+channel: old-chan
 # comment with trailing spaces${"  "}
 
 timeout: 5m
@@ -369,12 +414,11 @@ Body line 1
 
 Body line 2 with 中文 🎉 and trailing spaces${"  "}
 `;
-    await writeFile(path.join(dir, "payroll.md"), original, "utf8");
+    await writeFile(path.join(tmpRoot, "payroll.md"), original, "utf8");
 
-    const result = await setTaskTarget(
-      "test",
+    const result = await bindTask(
       "payroll",
-      "feishu:dm:oc_6f9d408e630098e6dd06bb071d6b60fc",
+      { target: "feishu:dm:oc_6f9d408e630098e6dd06bb071d6b60fc", channel: "feishu-dev" },
       tmpRoot,
     );
     expect(result).toEqual({ ok: true });
@@ -385,6 +429,7 @@ Body line 2 with 中文 🎉 and trailing spaces${"  "}
 # keep this comment
 schedule: daily 09:00
 target: feishu:dm:oc_6f9d408e630098e6dd06bb071d6b60fc
+channel: feishu-dev
 # comment with trailing spaces${"  "}
 
 timeout: 5m
@@ -395,13 +440,14 @@ Body line 1
 Body line 2 with 中文 🎉 and trailing spaces${"  "}
 `,
     );
-    // The parsed task now carries the new target.
+    // The parsed task now carries the new binding.
     const { task } = parseTaskFile("payroll.md", updated);
     expect(task.target).toBe("feishu:dm:oc_6f9d408e630098e6dd06bb071d6b60fc");
+    expect(task.channel).toBe("feishu-dev");
     expect(task.prompt).toBe("Body line 1\n\nBody line 2 with 中文 🎉 and trailing spaces");
   });
 
-  it("inserts a target line just before the closing --- when none exists", async () => {
+  it("inserts missing target and channel lines just before the closing --- when neither exists", async () => {
     const original = `---
 # a comment
 schedule: daily 09:00
@@ -412,9 +458,13 @@ timeout: 5m
 
 Body.
 `;
-    await writeFile(path.join(dir, "report.md"), original, "utf8");
+    await writeFile(path.join(tmpRoot, "report.md"), original, "utf8");
 
-    const result = await setTaskTarget("test", "report", "feishu:group:oc_123", tmpRoot);
+    const result = await bindTask(
+      "report",
+      { target: "feishu:group:oc_123", channel: "feishu-dev" },
+      tmpRoot,
+    );
     expect(result).toEqual({ ok: true });
 
     const updated = await readTaskFile("report");
@@ -426,6 +476,7 @@ schedule: daily 09:00
 # another comment
 timeout: 5m
 target: feishu:group:oc_123
+channel: feishu-dev
 ---
 
 Body.
@@ -434,20 +485,56 @@ Body.
     const { task, errors } = parseTaskFile("report.md", updated);
     expect(errors).toEqual([]);
     expect(task.target).toBe("feishu:group:oc_123");
+    expect(task.channel).toBe("feishu-dev");
     expect(task.prompt).toBe("Body.");
   });
 
-  it("creates a front matter block containing only the target line when the file has none", async () => {
-    const original = "Just a prompt with <&>\"'\` chars and 中文.\nSecond line   \n";
-    await writeFile(path.join(dir, "raw.md"), original, "utf8");
+  it("replaces an existing line and inserts the other when only one is present", async () => {
+    const original = `---
+schedule: daily 09:00
+channel: old-chan
+---
 
-    const result = await setTaskTarget("test", "raw", "wecom:dm:oc_xyz", tmpRoot);
+Body.
+`;
+    await writeFile(path.join(tmpRoot, "mixed.md"), original, "utf8");
+
+    const result = await bindTask(
+      "mixed",
+      { target: "feishu:dm:oc_abc", channel: "feishu-dev" },
+      tmpRoot,
+    );
+    expect(result).toEqual({ ok: true });
+
+    const updated = await readTaskFile("mixed");
+    expect(updated).toBe(
+      `---
+schedule: daily 09:00
+channel: feishu-dev
+target: feishu:dm:oc_abc
+---
+
+Body.
+`,
+    );
+  });
+
+  it("creates a front matter block containing only the bound lines when the file has none", async () => {
+    const original = "Just a prompt with <&>\"'\` chars and 中文.\nSecond line   \n";
+    await writeFile(path.join(tmpRoot, "raw.md"), original, "utf8");
+
+    const result = await bindTask(
+      "raw",
+      { target: "wecom:dm:oc_xyz", channel: "wecom-dev" },
+      tmpRoot,
+    );
     expect(result).toEqual({ ok: true });
 
     const updated = await readTaskFile("raw");
     expect(updated).toBe(
       `---
 target: wecom:dm:oc_xyz
+channel: wecom-dev
 ---
 Just a prompt with <&>"'\` chars and 中文.
 Second line${"   "}
@@ -456,50 +543,87 @@ Second line${"   "}
     const { task, errors } = parseTaskFile("raw.md", updated);
     expect(errors).toEqual(['missing required front matter key "schedule"']);
     expect(task.target).toBe("wecom:dm:oc_xyz");
+    expect(task.channel).toBe("wecom-dev");
     // The original body is intact (sans the added front matter).
     expect(task.prompt).toBe("Just a prompt with <&>\"'` chars and 中文.\nSecond line");
   });
 
-  it("preserves CRLF line endings and uses them for the inserted line", async () => {
-    const original = "---\r\nschedule: daily 09:00\r\n---\r\nBody.\r\n";
-    await writeFile(path.join(dir, "crlf.md"), original, "utf8");
+  it("appends the bound lines to an unterminated front matter block", async () => {
+    const original = "---\nschedule: daily 09:00\nbody text never separated\n";
+    await writeFile(path.join(tmpRoot, "open.md"), original, "utf8");
 
-    const result = await setTaskTarget("test", "crlf", "feishu:dm:oc_123", tmpRoot);
+    const result = await bindTask(
+      "open",
+      { target: "feishu:dm:oc_1", channel: "feishu-dev" },
+      tmpRoot,
+    );
+    expect(result).toEqual({ ok: true });
+
+    const updated = await readTaskFile("open");
+    expect(updated).toBe(
+      `---
+schedule: daily 09:00
+body text never separated
+
+target: feishu:dm:oc_1
+channel: feishu-dev`,
+    );
+    const { task } = parseTaskFile("open.md", updated);
+    // Unterminated block: everything is front matter, so the body stays empty.
+    expect(task.prompt).toBe("");
+    expect(task.target).toBe("feishu:dm:oc_1");
+    expect(task.channel).toBe("feishu-dev");
+  });
+
+  it("preserves CRLF line endings and uses them for the inserted lines", async () => {
+    const original = "---\r\nschedule: daily 09:00\r\n---\r\nBody.\r\n";
+    await writeFile(path.join(tmpRoot, "crlf.md"), original, "utf8");
+
+    const result = await bindTask(
+      "crlf",
+      { target: "feishu:dm:oc_123", channel: "feishu-dev" },
+      tmpRoot,
+    );
     expect(result).toEqual({ ok: true });
 
     const updated = await readTaskFile("crlf");
-    expect(updated).toBe("---\r\nschedule: daily 09:00\r\ntarget: feishu:dm:oc_123\r\n---\r\nBody.\r\n");
+    expect(updated).toBe(
+      "---\r\nschedule: daily 09:00\r\ntarget: feishu:dm:oc_123\r\nchannel: feishu-dev\r\n---\r\nBody.\r\n",
+    );
   });
 
-  it("re-claiming with a different chat replaces the target line", async () => {
+  it("re-binding with a different chat and channel replaces both lines", async () => {
     await writeFile(
-      path.join(dir, "moving.md"),
+      path.join(tmpRoot, "moving.md"),
       "---\nschedule: daily 09:00\n---\nBody.\n",
       "utf8",
     );
 
-    await setTaskTarget("test", "moving", "feishu:dm:oc_first", tmpRoot);
-    await setTaskTarget("test", "moving", "feishu:dm:oc_second", tmpRoot);
+    await bindTask("moving", { target: "feishu:dm:oc_first", channel: "chan-a" }, tmpRoot);
+    await bindTask("moving", { target: "feishu:dm:oc_second", channel: "chan-b" }, tmpRoot);
 
     const updated = await readTaskFile("moving");
-    expect(updated).toBe("---\nschedule: daily 09:00\ntarget: feishu:dm:oc_second\n---\nBody.\n");
+    expect(updated).toBe(
+      "---\nschedule: daily 09:00\ntarget: feishu:dm:oc_second\nchannel: chan-b\n---\nBody.\n",
+    );
     expect(updated.match(/target:/g)).toHaveLength(1);
+    expect(updated.match(/channel:/g)).toHaveLength(1);
   });
 
   it("returns an error result for a missing task file without throwing", async () => {
-    const result = await setTaskTarget("test", "ghost", "feishu:dm:oc_1", tmpRoot);
+    const result = await bindTask("ghost", { target: "feishu:dm:oc_1", channel: "feishu-dev" }, tmpRoot);
     expect(result).toEqual({ ok: false, reason: "task not found" });
   });
 
   it("returns an error result for an invalid task name without throwing", async () => {
-    const result = await setTaskTarget("test", "Bad_Name", "feishu:dm:oc_1", tmpRoot);
+    const result = await bindTask("Bad_Name", { target: "feishu:dm:oc_1", channel: "feishu-dev" }, tmpRoot);
     expect(result).toEqual({ ok: false, reason: "invalid task name" });
   });
 });
 
 describe("getSchedulesDir", () => {
-  it("joins the root with the percent-encoded channel name", () => {
-    expect(getSchedulesDir("feishu-dev", "/tmp/root")).toBe("/tmp/root/feishu-dev");
-    expect(getSchedulesDir("my channel", "/tmp/root")).toBe("/tmp/root/my%20channel");
+  it("returns the flat shared schedules directory (no channel subdirectory)", () => {
+    expect(getSchedulesDir("/tmp/root")).toBe("/tmp/root");
+    expect(getSchedulesDir()).toBe(SCHEDULES_DIR);
   });
 });

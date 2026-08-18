@@ -4,7 +4,7 @@
  * One instance per channel, owned by the channel runner. It owns:
  *
  * - the tick loop (default 30 s; spec D8 hot reload by polling) that
- *   re-scans the channel's task directory through `loadChannelTasks` and
+ *   re-scans the flat schedules directory through `loadAllTasks` and
  *   re-syncs the in-memory task table, so added/edited/deleted/disabled tasks
  *   take effect on the next tick;
  * - due-time evaluation (`now >= nextRun`, at most one fire per task per
@@ -33,8 +33,8 @@ import { createLogger, type Logger } from "../../core/logger";
 import { validateWorkingDirectory } from "../client/utils/working-directory";
 import { nextRun } from "./grammar";
 import {
-  loadChannelTasks,
-  setTaskTarget,
+  bindTask,
+  loadAllTasks,
   type LoadedTask,
   type ScheduleTask,
 } from "./task-file";
@@ -66,7 +66,7 @@ export interface SchedulerOptions {
   validateTarget?: (clientSessionId: string) => boolean;
   logger?: Logger;
   /**
-   * Task loader override, defaults to `loadChannelTasks` from `./task-file`.
+   * Task loader override, defaults to `loadAllTasks` from `./task-file`.
    * Tests inject a fake, or point {@link SchedulerOptions.schedulesRoot} at a
    * temporary directory.
    */
@@ -124,7 +124,10 @@ export class Scheduler {
     this.#t = options.t;
     this.#validateTarget = options.validateTarget;
     this.#logger = options.logger ?? createLogger("schedule");
-    this.#loadTasks = options.loadTasks ?? loadChannelTasks;
+    // T1: the task-file layer is channel-agnostic now; the per-channel
+    // loader signature is kept for the injected override, and the default
+    // delegates to the flat loader (channel name ignored).
+    this.#loadTasks = options.loadTasks ?? ((_channelName, schedulesRoot) => loadAllTasks(schedulesRoot));
     this.#schedulesRoot = options.schedulesRoot;
   }
 
@@ -246,12 +249,13 @@ export class Scheduler {
 
   /**
    * Binds a chat as the task's delivery target (spec D7, `/schedule-here`):
-   * writes the sending chat's `clientSessionId` into the task file's
-   * `target` line. The task must exist — resolved from the in-memory task
-   * table, falling back to an immediate directory load so a file written
-   * after the last tick is still claimable. Unknown task or a write failure
-   * returns `{ ok: false, reason }`; the localized reply for the triggering
-   * chat is the caller's job.
+   * writes the sending chat's `clientSessionId` and this channel's config
+   * name into the task file's `target`/`channel` front-matter lines in a
+   * single atomic write. The task must exist — resolved from the in-memory
+   * task table, falling back to an immediate directory load so a file
+   * written after the last tick is still claimable. Unknown task or a write
+   * failure returns `{ ok: false, reason }`; the localized reply for the
+   * triggering chat is the caller's job.
    */
   async claimTarget(taskName: string, clientSessionId: string): Promise<ScheduleHereResult> {
     let exists = this.#tasks.has(taskName);
@@ -271,7 +275,11 @@ export class Scheduler {
       this.#logger.warn(`[schedule] task "${taskName}" not found; nothing to claim`);
       return { ok: false, reason: "task not found" };
     }
-    return setTaskTarget(this.#channelName, taskName, clientSessionId, this.#schedulesRoot);
+    return bindTask(
+      taskName,
+      { target: clientSessionId, channel: this.#channelName },
+      this.#schedulesRoot,
+    );
   }
 
   async #fire(taskName: string): Promise<FireResult> {
