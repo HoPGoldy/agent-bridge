@@ -349,7 +349,13 @@ export class WeixinIMAdapter implements IMAdapter {
               `consecutive=${failures}/${TYPING_HEARTBEAT_MAX_FAILURES}):`,
             error,
           );
-          if (failures >= TYPING_HEARTBEAT_MAX_FAILURES) {
+          // An in-flight refresh from a previous heartbeat may reject after a
+          // new inbound message already replaced this timer; only self-stop
+          // when this timer is still the active one for the session.
+          if (
+            failures >= TYPING_HEARTBEAT_MAX_FAILURES &&
+            this.#typingHeartbeatBySession.get(clientSessionId) === timer
+          ) {
             this.#stopTypingHeartbeat(clientSessionId);
             this.#logger.warn(
               `typing heartbeat stopped after ${failures} consecutive failures ` +

@@ -1129,6 +1129,64 @@ describe("WeixinIMAdapter", () => {
     expect(sentTexts).toEqual(["final reply"]);
   });
 
+  it("a stale in-flight heartbeat failure does not stop a freshly restarted heartbeat", async () => {
+    vi.useFakeTimers();
+
+    const adapter = new WeixinIMAdapter(
+      {
+        accountId: "bot-account",
+        token: "bot-token",
+      },
+      createLogger("test"),
+    );
+    const onOutput = vi.fn(async (_event: ClientOutputEvent) => {});
+
+    await adapter.start(onOutput);
+
+    // Old heartbeat: its refreshes reject only after a long delay, so one is
+    // still in flight when the heartbeat is restarted below.
+    let rejectInflight: ((error: Error) => void) | null = null;
+    fakeClientState.sendTyping.mockImplementation(
+      () =>
+        new Promise<void>((resolve, reject) => {
+          rejectInflight = reject;
+          resolve();
+        }),
+    );
+
+    await fakeClientState.onMessage?.({
+      chatId: "wxid_user_1",
+      chatType: "dm",
+      messageId: "msg-stale-1",
+      text: "hello",
+      mentionedBot: false,
+    });
+    // Advance 5 intervals so the old heartbeat has 5 in-flight rejections
+    // pending (none settled yet).
+    await vi.advanceTimersByTimeAsync(10_000 * 5);
+    const pendingReject = rejectInflight;
+
+    // New inbound message restarts the heartbeat with a now-healthy client.
+    fakeClientState.sendTyping.mockReset();
+    fakeClientState.sendTyping.mockResolvedValue(undefined);
+    await fakeClientState.onMessage?.({
+      chatId: "wxid_user_1",
+      chatType: "dm",
+      messageId: "msg-stale-2",
+      text: "again",
+      mentionedBot: false,
+    });
+
+    // The stale rejection settles after the restart; with the timer-identity
+    // guard it must not stop the new heartbeat.
+    pendingReject?.(new Error("stale abort"));
+    await Promise.resolve();
+    await Promise.resolve();
+
+    await vi.advanceTimersByTimeAsync(10_000 * 3);
+    expect(fakeClientState.sendTyping.mock.calls.length).toBeGreaterThanOrEqual(3);
+  });
+
   it("degrades gracefully when onScheduleHere is absent: logs and replies nothing", async () => {
     const warnSpy = vi.spyOn(console, "warn").mockImplementation(() => {});
     try {
