@@ -92,7 +92,7 @@ Scheduled tasks (cron-style agent sessions with file-based prompts): [`docs/sche
 
 Event queues (FIFO agent task queues with file-based prompts, worker concurrency and chat-bound result delivery): [`docs/event-queue.md`](./docs/event-queue.md)
 
-Event queues let you run a stream of agent prompts through the same pipeline as scheduled tasks: a queue definition (`queues/<name>.md`) carries a worker count, an optional model and a shared-context body appended to every task; tasks are inserted with `agent-bridge queue insert` and consumed FIFO by the owning channel's controller, which delivers each result (or failure/timeout notice) to the chat bound with `/queue-here`. Like scheduled tasks, queue runs are fully isolated from the target chat's own session.
+Event queues let you run a stream of agent prompts through the same pipeline as scheduled tasks: a queue definition (`queues/<name>.md`) carries a worker count, an optional model and a shared-context body appended to every task; tasks are inserted with `agent-bridge queue insert` and consumed FIFO by the owning channel's controller, which delivers each result (or failure/timeout notice) to the chat bound with `/queue-here`. Like scheduled tasks, queue runs are fully isolated from the target chat's own session. Both scheduled tasks and event queues use the same completion protocol: the run ends when the agent appends the `BRIDGE_TASK_STATUS_DONE` marker as the last line of its final message, at which point the full accumulated transcript is delivered once; a silence probe asks an inactive run whether it is finished, and the wall-clock `timeout` remains the hard cap.
 
 ## Start a session in a specific directory
 
@@ -115,6 +115,8 @@ If the bot is not strictly private, restrict the directories users may start ses
 ```
 
 When configured, user-originated `/new <path>` targets (including remembered defaults) must resolve inside one of the roots. The client-side cwd fallback for a bare `/new` and the channel-level agent configuration are trusted and never checked.
+
+The bridge also releases agent sessions that are idle: a session whose last observable activity is older than `defaults.agentIdleTimeoutMs` (default `24h`) is stopped and released. The idle timer is pure inactivity — it tracks the last run event and reschedules whenever one arrives; there is no busy check. The agent adapters defend themselves internally (an `abort()` when there is no active turn is a no-op), and `/model` performs no busy gating.
 
 ## Development
 

@@ -28,6 +28,9 @@ import { parseSchedule, parseTimeout, type Schedule } from "./grammar";
 /** Default max run duration: `10m` (spec D3). */
 export const DEFAULT_TIMEOUT_MS = 10 * 60_000;
 
+/** Default silence window before a probe is sent: `10m` (qa-log 2026-08-19, layer 2). */
+export const DEFAULT_SILENCE_MS = 10 * 60_000;
+
 /** Task names are the `.md` file names without the extension (spec D3). */
 const TASK_NAME_RE = /^[a-z0-9-]+$/;
 
@@ -35,6 +38,7 @@ const KNOWN_KEYS = new Set([
   "schedule",
   "directory",
   "timeout",
+  "silence",
   "enabled",
   "target",
   "channel",
@@ -53,6 +57,13 @@ export interface ScheduleTask {
   directory: string | undefined;
   /** Max run duration in ms; defaults to {@link DEFAULT_TIMEOUT_MS}. */
   timeoutMs: number;
+  /**
+   * Silence window before a probe message is sent into the run session
+   * (qa-log 2026-08-19, layer 2); parsed from `silence:` front matter with
+   * the same duration syntax as `timeout:`, defaults to
+   * {@link DEFAULT_SILENCE_MS}.
+   */
+  silenceMs: number;
   /** Whether the task may fire; `enabled: false` pauses it without deleting it (spec D3). */
   enabled: boolean;
   /** Delivery address — the destination chat's clientSessionId, when set (spec D7). */
@@ -132,6 +143,16 @@ export function parseTaskFile(fileName: string, content: string): LoadedTask {
     }
   }
 
+  let silenceMs = DEFAULT_SILENCE_MS;
+  if (fields.silence !== undefined) {
+    const parsed = parseTimeout(fields.silence);
+    if (parsed.ok) {
+      silenceMs = parsed.ms;
+    } else {
+      errors.push(`invalid silence "${fields.silence}": ${parsed.reason}`);
+    }
+  }
+
   // Only the exact value `false` (case-insensitive) disables; anything else is enabled.
   const enabled = !(fields.enabled !== undefined && fields.enabled.toLowerCase() === "false");
 
@@ -146,6 +167,7 @@ export function parseTaskFile(fileName: string, content: string): LoadedTask {
     schedule,
     directory: nonEmptyString(fields.directory),
     timeoutMs,
+    silenceMs,
     enabled,
     target: nonEmptyString(fields.target),
     channel: nonEmptyString(fields.channel),

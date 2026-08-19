@@ -557,15 +557,6 @@ export class GatewayCore {
       return;
     }
 
-    if (await runtime.agentAdapter.isBusy()) {
-      await this.#deliverClientInput({
-        type: "error",
-        clientSessionId,
-        kind: "agent.model.busy",
-      });
-      return;
-    }
-
     try {
       const result = await runtime.agentAdapter.setModel(target);
       await this.#deliverClientInput({
@@ -1142,11 +1133,6 @@ export class GatewayCore {
       return;
     }
 
-    if (await runtime.agentAdapter.isBusy()) {
-      this.#scheduleIdleRelease(runtime);
-      return;
-    }
-
     try {
       await this.#stopRuntime(runtime);
     } catch (error) {
@@ -1166,7 +1152,7 @@ export class GatewayCore {
    * record is deleted with the runtime (SF-1 — a unique record per run would
    * otherwise grow the state file forever). The runtime is always removed
    * from
-   * the map and the state handle always revoked, even when `isBusy()`, `abort()`
+   * the map and the state handle always revoked, even when `abort()`
    * or `adapter.stop()` throws, so a stale adapter can never write its state
    * again; the original error still propagates to the caller.
    */
@@ -1177,7 +1163,9 @@ export class GatewayCore {
     }
 
     try {
-      if (runtime.agentAdapter.abort && (await runtime.agentAdapter.isBusy())) {
+      // T1: abort unconditionally when the adapter exposes it — the adapter
+      // internally no-ops when it has no active run to abort.
+      if (runtime.agentAdapter.abort) {
         try {
           await runtime.agentAdapter.abort();
         } catch (error) {

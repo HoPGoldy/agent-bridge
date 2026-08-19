@@ -2,7 +2,7 @@ import { mkdtemp, rm, writeFile } from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
-import type { ClientInputEvent, ClientOutputEvent } from "../../types";
+import type { ClientInputEvent, ClientOutputEvent, OutboundAttachment } from "../../types";
 import { getTranslator } from "../../i18n";
 import type { Logger } from "../../core/logger";
 import {
@@ -12,6 +12,7 @@ import {
   setQueueTaskState,
   writeQueueDefinition,
 } from "./queue-file";
+import { buildProbeMessage, buildTaskPrompt, DONE_MARKER } from "../run-completion";
 import { QueueController } from "./controller";
 
 const TARGET = "feishu:dm:oc_6f9d408e630098e6dd06bb071d6b60fc";
@@ -93,7 +94,7 @@ async function createHarness(
 async function seedQueue(
   root: string,
   name: string,
-  options: { channel?: string; workers?: number; model?: string; target?: string; body?: string },
+  options: { channel?: string; workers?: number; model?: string; target?: string; body?: string; silence?: string },
   prompts: string[],
 ): Promise<string[]> {
   await writeQueueDefinition(
@@ -106,6 +107,20 @@ async function seedQueue(
     },
     root,
   );
+  if (options.silence !== undefined) {
+    // `writeQueueDefinition` does not write `silence`; inject the front
+    // matter line directly (the probe tests use a tiny window).
+    const fm = [
+      "---",
+      `channel: ${options.channel ?? "test"}`,
+      `workers: ${options.workers ?? 1}`,
+      `silence: ${options.silence}`,
+      `target: ${options.target ?? ""}`,
+      "---",
+      "",
+    ];
+    await writeFile(path.join(root, `${name}.md`), fm.join("\n"), "utf8");
+  }
   if (options.target !== undefined) {
     const result = await setQueueTarget(name, options.target, root);
     if (!result.ok) throw new Error(result.reason);
@@ -134,8 +149,8 @@ describe("capacity and FIFO (D2)", () => {
 
     await waitFor(() => expect(h.dispatched).toHaveLength(4));
     expect(h.dispatched.filter((e) => e.type === "user.message").map((e) => e.text)).toEqual([
-      "a",
-      "b",
+      buildTaskPrompt("", "a"),
+      buildTaskPrompt("", "b"),
     ]);
     const tasks = await listQueueTasks("q", h.root);
     expect(tasks.filter((t) => t.state === "running")).toHaveLength(2);
@@ -154,23 +169,31 @@ describe("capacity and FIFO (D2)", () => {
     expect(h.dispatched[1]).toEqual({
       type: "user.message",
       clientSessionId: `queue:q:${ids[0]}`,
-      text: "a",
+      text: buildTaskPrompt("", "a"),
     });
 
-    h.controller.handleOutput({ type: "assistant.message", clientSessionId: `queue:q:${ids[0]}`, text: "ok1" });
+    h.controller.handleOutput({
+      type: "assistant.message",
+      clientSessionId: `queue:q:${ids[0]}`,
+      text: `ok1\n${DONE_MARKER}`,
+    });
     await waitFor(() => expect(h.dispatched).toHaveLength(4));
     expect(h.dispatched[3]).toEqual({
       type: "user.message",
       clientSessionId: `queue:q:${ids[1]}`,
-      text: "b",
+      text: buildTaskPrompt("", "b"),
     });
 
-    h.controller.handleOutput({ type: "assistant.message", clientSessionId: `queue:q:${ids[1]}`, text: "ok2" });
+    h.controller.handleOutput({
+      type: "assistant.message",
+      clientSessionId: `queue:q:${ids[1]}`,
+      text: `ok2\n${DONE_MARKER}`,
+    });
     await waitFor(() => expect(h.dispatched).toHaveLength(6));
     expect(h.dispatched[5]).toEqual({
       type: "user.message",
       clientSessionId: `queue:q:${ids[2]}`,
-      text: "c",
+      text: buildTaskPrompt("", "c"),
     });
   });
 });
@@ -197,7 +220,7 @@ describe("fire (D2)", () => {
     expect(h.dispatched[1]).toEqual({
       type: "user.message",
       clientSessionId: `queue:q:${id}`,
-      text: "Shared context.\n\ntask a",
+      text: buildTaskPrompt("Shared context.", "task a"),
     });
   });
 
@@ -217,7 +240,7 @@ describe("fire (D2)", () => {
     expect(h.dispatched[1]).toEqual({
       type: "user.message",
       clientSessionId: `queue:q:${id}`,
-      text: "task a",
+      text: buildTaskPrompt("", "task a"),
     });
   });
 });
@@ -229,7 +252,11 @@ describe("completion (D2)", () => {
     await h.controller.start();
     await waitFor(() => expect(h.dispatched).toHaveLength(2));
 
-    h.controller.handleOutput({ type: "assistant.message", clientSessionId: `queue:q:${ids[0]}`, text: "result A" });
+    h.controller.handleOutput({
+      type: "assistant.message",
+      clientSessionId: `queue:q:${ids[0]}`,
+      text: `result A\n${DONE_MARKER}`,
+    });
     await waitFor(() => expect(h.delivered).toHaveLength(1));
     expect(h.delivered[0]).toEqual({
       type: "assistant.message",
@@ -246,11 +273,15 @@ describe("completion (D2)", () => {
     expect(h.dispatched[3]).toEqual({
       type: "user.message",
       clientSessionId: `queue:q:${ids[1]}`,
-      text: "b",
+      text: buildTaskPrompt("", "b"),
     });
 
     // The run has ended: a second completion is an orphan and delivers nothing.
-    h.controller.handleOutput({ type: "assistant.message", clientSessionId: `queue:q:${ids[0]}`, text: "again" });
+    h.controller.handleOutput({
+      type: "assistant.message",
+      clientSessionId: `queue:q:${ids[0]}`,
+      text: `again\n${DONE_MARKER}`,
+    });
     expect(h.delivered).toHaveLength(1);
   });
 
@@ -268,7 +299,7 @@ describe("completion (D2)", () => {
     h.controller.handleOutput({
       type: "assistant.message",
       clientSessionId: `queue:q:${ids[0]}`,
-      text: "result A",
+      text: `result A\n${DONE_MARKER}`,
       attachments,
     });
     await waitFor(() => expect(h.delivered).toHaveLength(1));
@@ -284,7 +315,11 @@ describe("completion (D2)", () => {
 
     // Completion without attachments: the delivered event carries no
     // `attachments` field at all.
-    h.controller.handleOutput({ type: "assistant.message", clientSessionId: `queue:q:${ids[1]}`, text: "result B" });
+    h.controller.handleOutput({
+      type: "assistant.message",
+      clientSessionId: `queue:q:${ids[1]}`,
+      text: `result B\n${DONE_MARKER}`,
+    });
     await waitFor(() => expect(h.delivered).toHaveLength(2));
     expect(h.delivered[1]).toEqual({
       type: "assistant.message",
@@ -407,7 +442,7 @@ describe("unbound and foreign queues (D2)", () => {
     expect(h.dispatched[1]).toEqual({
       type: "user.message",
       clientSessionId: expect.stringMatching(/^queue:q:/),
-      text: "a",
+      text: buildTaskPrompt("", "a"),
     });
   });
 
@@ -451,7 +486,7 @@ describe("restart and reload (D2)", () => {
     expect(h2.dispatched[1]).toEqual({
       type: "user.message",
       clientSessionId: `queue:q:${id}`,
-      text: "a",
+      text: buildTaskPrompt("", "a"),
     });
   });
 
@@ -463,7 +498,7 @@ describe("restart and reload (D2)", () => {
     expect(h.dispatched[1]).toEqual({
       type: "user.message",
       clientSessionId: `queue:q:${ids[0]}`,
-      text: "a",
+      text: buildTaskPrompt("", "a"),
     });
     expect((await listQueueTasks("q", h.root)).filter((t) => t.state === "running")).toHaveLength(1);
 
@@ -477,7 +512,7 @@ describe("restart and reload (D2)", () => {
     expect(h.dispatched[3]).toEqual({
       type: "user.message",
       clientSessionId: `queue:q:${ids[1]}`,
-      text: "b",
+      text: buildTaskPrompt("", "b"),
     });
     expect((await listQueueTasks("q", h.root)).filter((t) => t.state === "running")).toHaveLength(2);
   });
@@ -545,7 +580,11 @@ describe("handleOutput routing (D3)", () => {
     });
     expect(h.delivered).toEqual([]);
 
-    h.controller.handleOutput({ type: "assistant.message", clientSessionId: `queue:q:${id}`, text: "final" });
+    h.controller.handleOutput({
+      type: "assistant.message",
+      clientSessionId: `queue:q:${id}`,
+      text: `final\n${DONE_MARKER}`,
+    });
     await waitFor(() => expect(h.delivered).toHaveLength(1));
     expect(h.delivered[0]).toEqual({
       type: "assistant.message",
@@ -559,5 +598,287 @@ describe("handleOutput routing (D3)", () => {
     h.controller.handleOutput({ type: "assistant.message", clientSessionId: "queue:q:1-2ab3", text: "x" });
     expect(h.delivered).toEqual([]);
     expect(h.logger.info).toHaveBeenCalledWith(expect.stringContaining("orphan"));
+  });
+});
+
+describe("three-layer completion (T4)", () => {
+  it("accumulates assistant messages and delivers them once only on DONE, marker stripped", async () => {
+    const h = await createHarness();
+    const ids = await seedQueue(h.root, "q", { workers: 1, target: TARGET }, ["a"]);
+    await h.controller.start();
+    await waitFor(() => expect(h.dispatched).toHaveLength(2));
+
+    // First message (no marker): accumulated, run NOT ended, nothing delivered.
+    await h.controller.handleOutput({
+      type: "assistant.message",
+      clientSessionId: `queue:q:${ids[0]}`,
+      text: "step one",
+    });
+    expect(h.delivered).toEqual([]);
+
+    // Second message (no marker): still nothing delivered.
+    await h.controller.handleOutput({
+      type: "assistant.message",
+      clientSessionId: `queue:q:${ids[0]}`,
+      text: "step two",
+    });
+    expect(h.delivered).toEqual([]);
+
+    // DONE: a single delivery carrying BOTH texts in order, marker stripped,
+    // and the task file deleted.
+    await h.controller.handleOutput({
+      type: "assistant.message",
+      clientSessionId: `queue:q:${ids[0]}`,
+      text: `step three\n${DONE_MARKER}`,
+    });
+    await waitFor(() => expect(h.delivered).toHaveLength(1));
+    expect(h.delivered[0]).toEqual({
+      type: "assistant.message",
+      clientSessionId: TARGET,
+      text: `✅ Queue "q" · task ${ids[0]} completed:\nstep one\n\nstep two\n\nstep three`,
+    });
+    expect(h.delivered[0]!.text).not.toContain(DONE_MARKER);
+    await waitFor(async () => {
+      const tasks = await listQueueTasks("q", h.root);
+      expect(tasks.some((t) => t.id === ids[0])).toBe(false);
+    });
+
+    // The run ended: a second completion is an orphan.
+    await h.controller.handleOutput({
+      type: "assistant.message",
+      clientSessionId: `queue:q:${ids[0]}`,
+      text: `again\n${DONE_MARKER}`,
+    });
+    expect(h.delivered).toHaveLength(1);
+  });
+
+  it("holds the slot until DONE: with workers=1 the second task must not fire after the first message", async () => {
+    const h = await createHarness();
+    const ids = await seedQueue(h.root, "q", { workers: 1, target: TARGET }, ["a", "b"]);
+    await h.controller.start();
+    await waitFor(() => expect(h.dispatched).toHaveLength(2));
+
+    // First assistant message WITHOUT the DONE marker: accumulated, the run
+    // stays alive and the worker slot is still held.
+    await h.controller.handleOutput({
+      type: "assistant.message",
+      clientSessionId: `queue:q:${ids[0]}`,
+      text: "working...",
+    });
+    // Several ticks pass: task b must NOT fire (the slot is held until DONE).
+    await sleep(80);
+    expect(h.dispatched).toHaveLength(2);
+    expect(h.delivered).toEqual([]);
+
+    // DONE frees the slot: the next tick fires task b.
+    await h.controller.handleOutput({
+      type: "assistant.message",
+      clientSessionId: `queue:q:${ids[0]}`,
+      text: `done\n${DONE_MARKER}`,
+    });
+    await waitFor(() => expect(h.dispatched).toHaveLength(4));
+    expect(h.dispatched[3]).toEqual({
+      type: "user.message",
+      clientSessionId: `queue:q:${ids[1]}`,
+      text: buildTaskPrompt("", "b"),
+    });
+  });
+
+  it("merges attachments from every accumulated message onto the final delivery", async () => {
+    const h = await createHarness();
+    const ids = await seedQueue(h.root, "q", { workers: 1, target: TARGET }, ["a"]);
+    await h.controller.start();
+    await waitFor(() => expect(h.dispatched).toHaveLength(2));
+
+    const a1: OutboundAttachment[] = [{ kind: "file", filePath: "/tmp/a.txt", fileName: "a.txt" }];
+    const a2: OutboundAttachment[] = [{ kind: "file", filePath: "/tmp/b.txt", fileName: "b.txt" }];
+    await h.controller.handleOutput({
+      type: "assistant.message",
+      clientSessionId: `queue:q:${ids[0]}`,
+      text: "first",
+      attachments: a1,
+    });
+    await h.controller.handleOutput({
+      type: "assistant.message",
+      clientSessionId: `queue:q:${ids[0]}`,
+      text: `second\n${DONE_MARKER}`,
+      attachments: a2,
+    });
+    await waitFor(() => expect(h.delivered).toHaveLength(1));
+    expect(h.delivered[0]).toEqual({
+      type: "assistant.message",
+      clientSessionId: TARGET,
+      text: `✅ Queue "q" · task ${ids[0]} completed:\nfirst\n\nsecond`,
+      attachments: [...a1, ...a2],
+    });
+  });
+
+  it("a bare message without DONE does not end the run; a DONE-only message delivers empty output", async () => {
+    const h = await createHarness();
+    const ids = await seedQueue(h.root, "q", { workers: 1, target: TARGET }, ["a"]);
+    await h.controller.start();
+    await waitFor(() => expect(h.dispatched).toHaveLength(2));
+
+    // Whitespace-only, no marker: accumulated but the run stays alive.
+    await h.controller.handleOutput({
+      type: "assistant.message",
+      clientSessionId: `queue:q:${ids[0]}`,
+      text: "   ",
+    });
+    expect(h.delivered).toEqual([]);
+
+    // DONE-only: delivers the (empty) accumulated content.
+    await h.controller.handleOutput({
+      type: "assistant.message",
+      clientSessionId: `queue:q:${ids[0]}`,
+      text: DONE_MARKER,
+    });
+    await waitFor(() => expect(h.delivered).toHaveLength(1));
+    expect(h.delivered[0]).toEqual({
+      type: "assistant.message",
+      clientSessionId: TARGET,
+      text: `✅ Queue "q" · task ${ids[0]} completed:\n`,
+    });
+  });
+});
+
+describe("partial content on failure (T4)", () => {
+  it("delivers a failure notice with accumulated partial content on a terminal error", async () => {
+    const h = await createHarness();
+    const ids = await seedQueue(h.root, "q", { workers: 1, target: TARGET }, ["a"]);
+    await h.controller.start();
+    await waitFor(() => expect(h.dispatched).toHaveLength(2));
+
+    await h.controller.handleOutput({
+      type: "assistant.message",
+      clientSessionId: `queue:q:${ids[0]}`,
+      text: "partial work",
+    });
+    expect(h.delivered).toEqual([]);
+
+    await h.controller.handleOutput({
+      type: "error",
+      clientSessionId: `queue:q:${ids[0]}`,
+      kind: "agent.run.failed",
+      detail: "boom",
+    });
+    await waitFor(() => expect(h.delivered).toHaveLength(1));
+    expect(h.delivered[0]).toEqual({
+      type: "assistant.message",
+      clientSessionId: TARGET,
+      text: `✅ Queue "q" · task ${ids[0]} completed:\npartial work\n\n❌ Queue "q" · task ${ids[0]} failed: boom`,
+    });
+    await waitFor(async () => expect(await listQueueTasks("q", h.root)).toHaveLength(0));
+  });
+
+  it("times out with accumulated partial content delivered alongside the timeout notice", async () => {
+    const h = await createHarness({ runTimeoutMs: 80 });
+    const ids = await seedQueue(h.root, "q", { workers: 1, target: TARGET }, ["a"]);
+    await h.controller.start();
+    await waitFor(() => expect(h.dispatched).toHaveLength(2));
+
+    await h.controller.handleOutput({
+      type: "assistant.message",
+      clientSessionId: `queue:q:${ids[0]}`,
+      text: "partial work",
+    });
+    await waitFor(() => expect(h.delivered).toHaveLength(1));
+    expect(h.delivered[0]).toEqual({
+      type: "assistant.message",
+      clientSessionId: TARGET,
+      text: `✅ Queue "q" · task ${ids[0]} completed:\npartial work\n\n⏰ Queue "q" · task ${ids[0]} timed out.`,
+    });
+    await waitFor(async () => expect(await listQueueTasks("q", h.root)).toHaveLength(0));
+  });
+});
+
+describe("silence probe (T4, layer 2)", () => {
+  it("dispatches a probing user.message into the run session after silence", async () => {
+    const h = await createHarness();
+    const ids = await seedQueue(
+      h.root,
+      "q",
+      { workers: 1, target: TARGET, silence: "1s" },
+      ["a"],
+    );
+    await h.controller.start();
+    await waitFor(() => expect(h.dispatched).toHaveLength(2));
+
+    // After ~1 s of silence the probe dispatches a probing user.message
+    // (silentMinutes=1 for a sub-minute window).
+    await waitFor(() =>
+      expect(
+        h.dispatched.some((e) => e.type === "user.message" && e.text === buildProbeMessage(1)),
+      ).toBe(true),
+    );
+  });
+
+  it("accumulates the probe answer, keeps the run alive, and delivers once on a later DONE", async () => {
+    const h = await createHarness();
+    const ids = await seedQueue(
+      h.root,
+      "q",
+      { workers: 1, target: TARGET, silence: "1s" },
+      ["a"],
+    );
+    await h.controller.start();
+    await waitFor(() => expect(h.dispatched).toHaveLength(2));
+
+    const probeCount = () =>
+      h.dispatched.filter(
+        (e) => e.type === "user.message" && e.text.startsWith("You have been silent"),
+      ).length;
+    await waitFor(() => expect(probeCount()).toBe(1));
+
+    // Probe answer WITHOUT DONE: accumulated, run continues, no delivery.
+    await h.controller.handleOutput({
+      type: "assistant.message",
+      clientSessionId: `queue:q:${ids[0]}`,
+      text: "still working",
+    });
+    expect(h.delivered).toEqual([]);
+
+    // DONE after the probe: delivered exactly once with the full accumulation.
+    await h.controller.handleOutput({
+      type: "assistant.message",
+      clientSessionId: `queue:q:${ids[0]}`,
+      text: `done now\n${DONE_MARKER}`,
+    });
+    await waitFor(() => expect(h.delivered).toHaveLength(1));
+    expect(h.delivered[0]).toEqual({
+      type: "assistant.message",
+      clientSessionId: TARGET,
+      text: `✅ Queue "q" · task ${ids[0]} completed:\nstill working\n\ndone now`,
+    });
+  });
+});
+
+describe("stop() mid-run (T4)", () => {
+  it("stop mid-run accumulates nothing delivered and disposes the accumulator", async () => {
+    const h = await createHarness();
+    const ids = await seedQueue(h.root, "q", { workers: 1, target: TARGET }, ["a"]);
+    await h.controller.start();
+    await waitFor(() => expect(h.dispatched).toHaveLength(2));
+
+    await h.controller.handleOutput({
+      type: "assistant.message",
+      clientSessionId: `queue:q:${ids[0]}`,
+      text: "partial work",
+    });
+    await h.controller.stop();
+    expect(h.delivered).toEqual([]);
+
+    // A late completion after stop is an orphan: nothing delivered.
+    await h.controller.handleOutput({
+      type: "assistant.message",
+      clientSessionId: `queue:q:${ids[0]}`,
+      text: `x\n${DONE_MARKER}`,
+    });
+    expect(h.delivered).toEqual([]);
+    expect(h.logger.info).toHaveBeenCalledWith(expect.stringContaining("orphan"));
+
+    // The task file stays `running` (restart re-enqueues it unchanged).
+    const tasks = await listQueueTasks("q", h.root);
+    expect(tasks.some((t) => t.id === ids[0] && t.state === "running")).toBe(true);
   });
 });

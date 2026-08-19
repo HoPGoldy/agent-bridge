@@ -2,7 +2,7 @@
 
 Scheduled tasks let you run an agent on a recurring schedule without touching a chat manually.
 
-A task is a Markdown file that declares **when** to run (a schedule string), **where** to run (a working directory), **how long** a run may take (a timeout), **which channel owns it** (a channel field), **where to send the result** (a target chat), and—optionally—**which agent model** to run (a model field). When the schedule fires, the bridge creates a **fresh, fully independent agent session**, sends the task's prompt into it, and delivers the agent's final result — or a failure/timeout notice — into the target chat as an ordinary message.
+A task is a Markdown file that declares **when** to run (a schedule string), **where** to run (a working directory), **how long** a run may take (a timeout), **which channel owns it** (a channel field), **where to send the result** (a target chat), and—optionally—**which agent model** to run (a model field). When the schedule fires, the bridge creates a **fresh, fully independent agent session**, sends the task's prompt into it, and delivers the agent's full output — or a failure/timeout notice — into the target chat as an ordinary message.
 
 The most important property is **isolation**: a task run never touches the target chat's own agent session. You can keep chatting in that chat before, during, and after a run and nothing about your session changes. The chat is only used as a delivery address.
 
@@ -73,6 +73,7 @@ The file is front matter plus a prompt body:
 schedule: daily 09:00
 directory: ~/reports
 timeout: 30m
+silence: 10m
 enabled: true
 channel: feishu-dev
 target: feishu:dm:oc_6f9d408e630098e6dd06bb071d6b60fc
@@ -94,12 +95,13 @@ yesterday's errors.
 | `schedule` | yes | — | Schedule grammar string (see below). Missing or invalid → the task is listed with an error and never fires. |
 | `directory` | no | bridge process cwd | Working directory of the new session. `~` is expanded, relative paths resolve against the bridge process cwd, and the path is canonicalized (`realpath`) and checked at fire time — it must exist, be a directory, and be readable. An invalid directory prevents the fire and an error is sent to the target chat. |
 | `timeout` | no | `10m` | Max run duration: `<n>s`, `<n>m` or `<n>h` (e.g. `90s`, `10m`, `1h`). The run is killed when exceeded and the target chat receives a timeout notice. An invalid value is listed as an error and the default is used. |
+| `silence` | no | `10m` | Silence window before a probe is sent into the run: same duration syntax as `timeout`. After this many minutes with no observable run activity, the scheduler asks the run whether it is finished (see [A run completes on DONE or ends by timing out](#a-run-completes-on-done-or-ends-by-timing-out)). An invalid value is listed as an error and the default is used. |
 | `enabled` | no | `true` | `false` (case-insensitive) pauses the task without deleting the file. Any other value or absence means enabled. |
 | `target` | no | — | Delivery address: the destination chat's clientSessionId. The recommended way to set it initially is `/schedule-here <task-name>` sent in the destination chat; the manual way is to copy the **Chat session ID** line from `/st` in that chat (see [Changing the destination chat](#changing-the-destination-chat)). Required for delivery — without it (or when it fails validation, e.g. a typo or a chat from another channel) the fire is skipped, the skip is logged, and `schedule list` shows `Target: no`. |
 | `channel` | no | — | Owning channel config name, written by `/schedule-here <task-name>` together with `target`. Each channel's scheduler fires on schedule only tasks whose `channel` matches that channel; a task with no `channel` line never fires on schedule (but can still be triggered manually with `/schedule-run`, see below). |
 | `model` | no | — | Optional per-task agent model override. Only this task's own runs use it — the channel's chat sessions are unaffected on pi, and on opencode chat `/new` only gains the same availability check against the channel config model (see the per-task model design spec, `docs/scheduled-task-model-spec.md`). Precedence: task `model` > channel agent config's `model` > env/adapter default. Blank or absent = the channel agent config's model. Parsing only checks for a non-empty string; validity is enforced at fire time by the adapter: **pi** passes it to the pi process as `--model` at spawn (an invalid model makes the process fail at startup), **opencode** runs its availability check against the effective (override-first) model and refuses to create a session. Applies to scheduled fires and `/schedule-run` alike, since both share one fire path. |
 
-`schedule add` writes the front matter with `schedule`, `directory` (only if you entered one), `timeout` and `model` (only if you entered a non-empty one), plus the example prompt body. It does not write `enabled` (absent means enabled), `target` or `channel` — the `target` and `channel` lines are meant to be set with `/schedule-here <task-name>` (or, for later manual edits, pasted from the `/st` output), and the body is meant to be replaced with your real prompt.
+`schedule add` writes the front matter with `schedule`, `directory` (only if you entered one), `timeout` and `model` (only if you entered a non-empty one), plus the example prompt body. It does not write `enabled` (absent means enabled), `target` or `channel` — the `target` and `channel` lines are meant to be set with `/schedule-here <task-name>` (or, for later manual edits, pasted from the `/st` output), and the body is meant to be replaced with your real prompt. The wizard does not offer a `silence` prompt — that field is set (and tuned) by editing the file, defaulting to `10m`.
 
 ## Schedule grammar
 
@@ -137,7 +139,7 @@ Semantics:
 On every fire the scheduler injects two synthetic events through the same ingress path ordinary chat messages use:
 
 1. a `command.session.new` with the task's working directory (validated; the operator-configured path is trusted, like the cwd fallback) and, when the task has a `model` field, that model — the override rides the same event into the agent-session creation, so only this task's run uses it;
-2. a `user.message` with the task's prompt, verbatim.
+2. a `user.message` with the task's prompt — the whole file body is the task's prompt, wrapped with a fixed completion-protocol instruction block (see [A run completes on DONE or ends by timing out](#a-run-completes-on-done-or-ends-by-timing-out)).
 
 Both carry a synthetic, run-unique client session id of the form `schedule:<task-name>:<run-seq>`. The core treats it like any other session, with two deliberate exceptions:
 
@@ -146,21 +148,25 @@ Both carry a synthetic, run-unique client session id of the form `schedule:<task
 
 Because the synthetic id never collides with a real chat's clientSessionId, the target chat's own session binding is never touched. Event queues reuse this exact synthetic-session machinery under `queue:<queue>:<taskId>` ids (same divert, memory-only bindings and orphan guard; see `docs/event-queue.md`).
 
-### The run ends by completing or by timing out
+### A run completes on DONE or ends by timing out
 
-A run ends for exactly one of two reasons:
+Assistant output no longer ends a run on its own: **a run completes only when the agent signals it is done.** Each fire wraps the task's prompt with a fixed completion-protocol instruction block, and every assistant message during the run is accumulated into a per-run local file under `run-outputs/` (shared with event queues; see `docs/event-queue.md`). A run ends for exactly one of two reasons:
 
-1. **Completion** — the run's final `assistant.message` (or a terminal `error`) arrives:
-   - Result: delivered to the target chat as a normal `assistant.message`, prefixed with a one-line header:
+1. **Completion (the DONE marker)** — the agent finishes its final `assistant.message` with the marker line `BRIDGE_TASK_STATUS_DONE` as its last line. The scheduler strips that line and delivers the **full accumulated transcript** to the target chat exactly once, as a normal `assistant.message` prefixed with a one-line header:
 
-     ```text
-     📋 Scheduled task "daily-report":
-     <the agent's result>
-     ```
+   ```text
+   📋 Scheduled task "daily-report":
+   <the accumulated transcript>
+   ```
 
-     Attachments, chunking and formatting behave exactly like a normal agent reply. A result that is empty or whitespace-only is delivered as "Scheduled task "name" finished with no output." instead of silence.
-   - Failure: a terminal error during the run delivers `❌ Scheduled task "name" failed.` (with the error detail when available).
-2. **Timeout** — the run exceeds the task's `timeout` (default `10m`): the scheduler aborts that run's session and delivers `⏰ Scheduled task "name" timed out.` to the target chat.
+   Attachments and formatting from every accumulated message behave exactly like a normal agent reply. A transcript that is empty or whitespace-only is delivered as `Scheduled task "name" finished with no output.` instead of silence. A marker in an intermediate (non-last) line is *not* a completion signal — the message is accumulated like any other.
+2. **Timeout** — the run exceeds the task's `timeout` (default `10m`): the scheduler aborts that run's session and delivers `⏰ Scheduled task "name" timed out.` to the target chat, preceded by any partial output already accumulated.
+
+A terminal `error` during the run ends it immediately and delivers `❌ Scheduled task "name" failed.` (with the error detail when available), also preceded by any accumulated partial content.
+
+**The completion protocol.** The instruction block appended to every task prompt tells the agent: to work until the task is *fully* complete, including async follow-ups it is still waiting on (background jobs, sub-agents, external callbacks); to append `BRIDGE_TASK_STATUS_DONE` as the **last line of its final message, and only then** — never in intermediate messages; and to answer honestly if asked whether it is finished, appending the marker only when it truly is. So a task waiting on asynchronous work should simply **not emit DONE until its callbacks return** — nothing else is needed; the run just stays alive and keeps accumulating.
+
+**The silence probe.** After `silence` minutes (front matter, default `10m`) without any observable run activity, the scheduler sends a probe message into the run session asking whether the task is finished (reply DONE, or keep working / keep waiting for async callbacks). Any run event — an assistant message, tool progress, or a probe answer — resets the silence window. The probe Q&A is accumulated like any other message and is included in the delivered transcript. An unanswered probe is harmless: the wall-clock `timeout` remains the only hard cap on the run.
 
 Fire-time validation failures behave like failures: if the working directory is invalid or the prompt is empty, **nothing is injected**; the target chat receives `❌ Scheduled task "name" could not start: <detail>` and the fire is logged. If the task has no valid `target`, there is nowhere to deliver to — the fire is skipped and only logged, and `schedule list` shows `Target: no`.
 
@@ -171,7 +177,7 @@ Fire-time validation failures behave like failures: if the working directory is 
 Every channel's scheduler re-scans the shared schedules directory (all channels' tasks) on a short fixed tick (30 s) and re-syncs its in-memory table. Each scheduler fires on schedule only the tasks whose front-matter `channel` matches that channel — tasks owned by other channels, and tasks with no `channel` line, are never fired on schedule by it:
 
 - **Edited prompt body** → the file is re-read at fire time, so the new body is used on the next fire.
-- **Edited front matter** (schedule, timeout, directory, enabled, target, channel) → effective on the next tick; no channel restart needed.
+- **Edited front matter** (schedule, timeout, silence, directory, enabled, target, channel) → effective on the next tick; no channel restart needed.
 - **New or deleted files** → tasks appear/disappear on the next tick. Deleting a file mid-run does not interrupt the in-flight run.
 - There is no file-system watching; 30 s polling is cheap and predictable.
 

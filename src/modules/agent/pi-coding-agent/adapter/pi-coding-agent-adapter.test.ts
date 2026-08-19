@@ -195,17 +195,20 @@ afterEach(() => {
 });
 
 describe("PiCodingAgentAdapter", () => {
-  it("delegates busy-message steering to Pi and tracks the run until it settles", async () => {
+  it("delegates busy-message steering to Pi and aborts only while a run is active", async () => {
     const adapter = new PiCodingAgentAdapter({ agentSessionId: "agent-1", mode: "create", sessionState: createFakeHandle() });
 
     await adapter.start(() => {});
+
+    // T1: an idle abort is a no-op (the core calls abort unconditionally).
+    await adapter.abort();
+    expect(abortCalls).toBe(0);
+
     await adapter.input({ type: "user.message", text: "long-running task" });
 
     expect(promptCalls).toEqual([
       { message: "long-running task", streamingBehavior: "steer" },
     ]);
-    await new Promise((resolve) => setImmediate(resolve));
-    expect(await adapter.isBusy()).toBe(true);
 
     await adapter.input({ type: "user.message", text: "change direction" });
     expect(promptCalls).toEqual([
@@ -217,9 +220,10 @@ describe("PiCodingAgentAdapter", () => {
     expect(abortCalls).toBe(1);
 
     rpcClients[0]?.emit({ type: "agent_settled" });
-    await vi.waitFor(async () => {
-      expect(await adapter.isBusy()).toBe(false);
-    });
+    await adapter.abort();
+    expect(abortCalls).toBe(1);
+
+    await adapter.stop();
   });
 
   it("forwards the persisted working directory to the pi RPC client on resume", async () => {
@@ -432,7 +436,7 @@ describe("PiCodingAgentAdapter", () => {
     expect(result).toEqual({ provider: "anthropic", modelId: "claude-sonnet-4-5" });
   });
 
-  it("rejects model switching while the agent is running", async () => {
+  it("switches the model mid-run without a busy precheck (pi RPC answers)", async () => {
     mockedState = {
       sessionId: "pi-session-1",
       sessionName: "agent-1",
@@ -444,10 +448,10 @@ describe("PiCodingAgentAdapter", () => {
 
     await adapter.start(() => {});
 
-    await expect(adapter.setModel?.("anthropic/claude-sonnet-4-5")).rejects.toMatchObject({
-      kind: "agent.model.busy",
-    });
-    expect(setModelCalls).toEqual([]);
+    const result = await adapter.setModel?.("anthropic/claude-sonnet-4-5");
+
+    expect(setModelCalls).toEqual([{ provider: "anthropic", modelId: "claude-sonnet-4-5" }]);
+    expect(result).toEqual({ provider: "anthropic", modelId: "claude-sonnet-4-5" });
   });
 
   it("forwards assistant text from Pi message_end text blocks", async () => {

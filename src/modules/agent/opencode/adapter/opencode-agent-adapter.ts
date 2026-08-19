@@ -74,7 +74,7 @@ export function assertAllowedWorkingDirectory(
 }
 
 class OpenCodeModelCommandError extends Error {
-  readonly kind: "agent.model.invalid" | "agent.model.busy" | "agent.model.set.unavailable";
+  readonly kind: "agent.model.invalid" | "agent.model.set.unavailable";
 
   constructor(kind: OpenCodeModelCommandError["kind"], message: string) {
     super(message);
@@ -417,6 +417,10 @@ export class OpenCodeAgentAdapter implements AgentAdapter, OpenCodeRuntimeAdapte
 
   async abort(): Promise<void> {
     this.#assertStarted();
+    // T1: idle-abort is a no-op; the core may call abort unconditionally.
+    if (!this.#busy && !this.#compacting) {
+      return;
+    }
     this.#settleCompact(false);
     try {
       await this.#api.abort(this.openCodeSessionId);
@@ -461,11 +465,6 @@ export class OpenCodeAgentAdapter implements AgentAdapter, OpenCodeRuntimeAdapte
       });
       await this.#emitError("agent.run.failed", describeOpenCodeError(error, [this.#config.password]));
     }
-  }
-
-  async isBusy(): Promise<boolean> {
-    if (!this.#statusKnown) await this.#refreshBusyStatus();
-    return this.#busy || this.#compacting;
   }
 
   async getStatus(): Promise<AgentSessionStatus> {
@@ -524,9 +523,8 @@ export class OpenCodeAgentAdapter implements AgentAdapter, OpenCodeRuntimeAdapte
 
   async setModel(target: string): Promise<{ provider: string; modelId: string }> {
     this.#assertStarted();
-    if (this.#busy || this.#compacting) {
-      throw new OpenCodeModelCommandError("agent.model.busy", "Current OpenCode session is busy");
-    }
+    // T1: no busy precheck — OpenCode accepts a local model override at any
+    // time; the next prompt carries it.
     const parsed = this.#parseModelTarget(target);
     const providers = await this.#api.getProviders();
     const provider = providers.all.find((item) => item.id === parsed.providerID);

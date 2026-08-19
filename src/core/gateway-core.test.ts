@@ -93,7 +93,6 @@ class FakeAgentAdapter implements AgentAdapter {
   readonly outputs: AgentOutputEvent[] = [];
   stopCount = 0;
   abortCount = 0;
-  busy = false;
   statusResult?: import("../types").AgentSessionStatus;
   statusError?: Error;
   availableModels: import("../types").AgentAvailableModel[] = [];
@@ -132,10 +131,6 @@ class FakeAgentAdapter implements AgentAdapter {
 
   async input(event: AgentInputEvent): Promise<void> {
     this.inputs.push(event);
-  }
-
-  async isBusy(): Promise<boolean> {
-    return this.busy;
   }
 
   async getStatus(): Promise<import("../types").AgentSessionStatus> {
@@ -2549,14 +2544,15 @@ describe("GatewayCore", () => {
     });
   });
 
-  it("emits a busy error when trying to switch model during an active run", async () => {
+  it("reaches the adapter and switches the model even during an active turn", async () => {
     const imAdapter = new FakeIMAdapter();
     const createdAdapters: FakeAgentAdapter[] = [];
 
     const agentModule = makeFakeModule({
       create: async (args) => {
         const adapter = new FakeAgentAdapter(args.agentSessionId);
-        adapter.busy = true;
+        // T1: busy state is adapter-internal — a mid-turn /model reaches the
+        // adapter, which answers (or errors) on its own.
         adapter.setModelResult = {
           provider: "anthropic",
           modelId: "claude-sonnet-4-5",
@@ -2592,11 +2588,12 @@ describe("GatewayCore", () => {
     });
 
     await waitFor(() => {
-      expect(createdAdapters[0]?.setModelCalls).toEqual([]);
+      expect(createdAdapters[0]?.setModelCalls).toEqual(["anthropic/claude-sonnet-4-5"]);
       expect(imAdapter.outputs.at(-1)).toEqual({
-        type: "error",
+        type: "agent.model.updated",
         clientSessionId: "client-1",
-        kind: "agent.model.busy",
+        provider: "anthropic",
+        modelId: "claude-sonnet-4-5",
       });
     });
   });

@@ -148,7 +148,10 @@ describe("OpenCodeAgentAdapter", () => {
       model: { providerID: "anthropic", modelID: "claude-sonnet" },
       system: MEDIA_CONVENTION_PROMPT,
     });
-    expect(await adapter.isBusy()).toBe(true);
+    // T1: busy state is adapter-internal — abort reaches the API while a run
+    // is active.
+    await adapter.abort();
+    expect(api.abort).toHaveBeenCalledWith("ses-1");
 
     await adapter.stop();
   });
@@ -454,7 +457,7 @@ describe("OpenCodeAgentAdapter", () => {
     await adapter.stop();
   });
 
-  it("compacts and aborts only the current session", async () => {
+  it("compacts the session and no-ops abort once idle", async () => {
     const { adapter, api } = createAdapter();
     const output = vi.fn();
     await adapter.start(output);
@@ -480,9 +483,9 @@ describe("OpenCodeAgentAdapter", () => {
       expect.objectContaining({ type: "assistant.message", text: "Context compacted." }),
     );
 
+    // After settlement the adapter is idle: abort no-ops and never hits the API.
     await adapter.abort();
-    expect(api.abort).toHaveBeenCalledWith("ses-1");
-    expect(await adapter.isBusy()).toBe(false);
+    expect(api.abort).not.toHaveBeenCalled();
     await adapter.stop();
   });
 });

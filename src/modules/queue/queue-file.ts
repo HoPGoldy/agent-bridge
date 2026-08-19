@@ -29,6 +29,8 @@ import { randomBytes, randomUUID } from "node:crypto";
 import os from "node:os";
 import path from "node:path";
 import { QUEUES_DIR } from "../../config/channel-state";
+import { DEFAULT_SILENCE_MS } from "../schedule/task-file";
+import { parseTimeout } from "../schedule/grammar";
 
 /** Synthetic clientSessionId prefix for queue runs (spec D1). Shared with the core. */
 export const QUEUE_SESSION_PREFIX = "queue:";
@@ -44,7 +46,7 @@ const TASK_ID_RE = /^\d+-[0-9a-f]{4}$/;
 
 const TASK_STATES = new Set(["pending", "running"]);
 
-const KNOWN_DEFINITION_KEYS = new Set(["channel", "workers", "model", "target"]);
+const KNOWN_DEFINITION_KEYS = new Set(["channel", "workers", "silence", "model", "target"]);
 const KNOWN_TASK_KEYS = new Set(["state", "enqueuedAt"]);
 
 /** A parsed, validated queue definition (spec D1). */
@@ -55,6 +57,13 @@ export interface QueueDefinition {
   channel: string;
   /** Max concurrent tasks; integer >= 1, defaults to {@link DEFAULT_WORKERS}. */
   workers: number;
+  /**
+   * Silence window before a probe message is sent into the run session
+   * (qa-log 2026-08-19, layer 2); parsed from the definition's `silence:`
+   * front matter with the same duration syntax as `timeout:`, defaults to
+   * {@link DEFAULT_SILENCE_MS}.
+   */
+  silenceMs: number;
   /** Worker model override; absent/blank → the channel agent config's model. */
   model: string | undefined;
   /** Delivery address — the destination chat's clientSessionId, written by `/queue-here`. */
@@ -183,12 +192,23 @@ export function parseQueueDefinition(
     }
   }
 
+  let silenceMs = DEFAULT_SILENCE_MS;
+  if (fields.silence !== undefined && fields.silence.trim() !== "") {
+    const parsed = parseTimeout(fields.silence);
+    if (parsed.ok) {
+      silenceMs = parsed.ms;
+    } else {
+      errors.push(`invalid silence "${fields.silence}": ${parsed.reason}`);
+    }
+  }
+
   const definition: QueueDefinition | null =
     errors.length === 0
       ? {
           name,
           channel,
           workers,
+          silenceMs,
           model: nonEmptyString(fields.model),
           target: nonEmptyString(fields.target),
           body: body.trim(),

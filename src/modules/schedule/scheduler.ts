@@ -46,6 +46,15 @@ import { createLogger, type Logger } from "../../core/logger";
 import { validateWorkingDirectory } from "../client/utils/working-directory";
 import { nextRun } from "./grammar";
 import {
+  buildProbeMessage,
+  buildTaskPrompt,
+  classifyMessage,
+  createRunAccumulator,
+  createSilenceProbe,
+  type RunAccumulator,
+  type SilenceProbe,
+} from "../run-completion";
+import {
   bindTask,
   loadAllTasks,
   type LoadedTask,
@@ -107,6 +116,10 @@ interface RunRecord {
   task: ScheduleTask;
   startedAt: number;
   timer: NodeJS.Timeout;
+  /** Per-run output accumulator (T3): every assistant message is appended here. */
+  accumulator: RunAccumulator;
+  /** Per-run silence probe (T3): fires a probing user.message after inactivity. */
+  probe: SilenceProbe;
 }
 
 export class Scheduler {
@@ -176,26 +189,28 @@ export class Scheduler {
     }
     for (const record of this.#runs.values()) {
       clearTimeout(record.timer);
+      record.probe.stop();
+      // Stop contract (T3, unchanged): dispose accumulators WITHOUT
+      // delivering their accumulated content.
+      await record.accumulator.dispose();
     }
     this.#runs.clear();
   }
 
   /**
-   * Routes a diverted agent-output event for a `schedule:*` session (spec
-   * D2). `assistant.message` is the completion signal: the result (with a
-   * localized task header, or a localized no-output notice when empty) is
-   * delivered to the task's `target` and that run ends. A terminal `error`
-   * delivers a localized failure notice and ends the run. Every other event
-   * type is discarded. Events whose run-unique id has no active run are
-   * discarded and logged. Note: schedule sessions produce no "started a new
-   * session" confirmation (suppressed in the core from T4 on).
+   * Routes a diverted agent-output event for a `schedule:*` session (T3,
+   * three-layer completion protocol per qa-log 2026-08-19（二）).
+   *
+   * `assistant.message` no longer ends the run: it is classified against the
+   * DONE-marker protocol, appended to the run's accumulator and pokes the
+   * silence probe. When DONE is detected the run ends and the FULL
+   * accumulated text (with all attachments) is delivered once. Every other
+   * live-run event merely pokes the probe (activity resets the silence
+   * window). A terminal `error` ends the run with a localized failure notice
+   * (plus any accumulated partial content). Events whose run-unique id has no
+   * active run are orphaned: dropped and logged.
    */
-  handleOutput(event: ClientInputEvent): void {
-    // NOTE (T4): schedule sessions never produce a "started a new session"
-    // confirmation — the core suppresses it for `schedule:*` ids from T4 on.
-    // Until that lands, such a confirmation (or any other event whose run is
-    // not registered) is dropped as an orphan below; it must never be
-    // mistaken for a task result.
+  async handleOutput(event: ClientInputEvent): Promise<void> {
     const parsed = parseSyntheticSessionId(event.clientSessionId);
     if (parsed === null) return;
 
@@ -206,50 +221,98 @@ export class Scheduler {
       this.#logger.info(`[schedule] dropping orphan output for run "${event.clientSessionId}"`);
       return;
     }
-    const taskName = record.task.name;
 
     if (event.type === "assistant.message") {
-      this.#endRun(event.clientSessionId);
-      const target = record.task.target;
-      if (target === undefined) {
-        this.#logger.warn(`[schedule] task "${taskName}" has no target to deliver its result to`);
-        return;
-      }
-      const text = event.text ?? "";
-      if (text.trim() === "") {
-        // Spec edge case: never deliver silence.
-        void this.#deliverToTarget(
-          target,
-          this.#t("schedule.taskNoOutput", { name: taskName }),
-        );
-        return;
-      }
-      const header = this.#t("schedule.taskResultHeader", { name: taskName });
-      void this.#deliverToTarget(target, {
-        type: "assistant.message",
-        clientSessionId: target,
-        text: `${header}\n${text}`,
-        ...(event.attachments !== undefined && event.attachments.length > 0
-          ? { attachments: event.attachments }
-          : {}),
-      });
+      await this.#handleAssistantMessage(record, event);
       return;
     }
 
     if (event.type === "error") {
-      this.#endRun(event.clientSessionId);
-      const target = record.task.target;
-      if (target === undefined) {
-        this.#logger.warn(`[schedule] task "${taskName}" has no target to deliver its failure to`);
-        return;
-      }
-      const base = this.#t("schedule.taskFailed", { name: taskName });
-      const detail = event.detail ? ` ${event.detail}` : "";
-      void this.#deliverToTarget(target, `${base}${detail}`);
+      await this.#handleError(record, event);
       return;
     }
 
-    // Intermediate/progress events are discarded (spec D2).
+    // Every other event for a live run counts as activity: it resets the
+    // silence window so the probe does not fire while work is observable.
+    record.probe.poke();
+  }
+
+  /** Classifies, accumulates and (on DONE) finishes an assistant message. */
+  async #handleAssistantMessage(
+    record: RunRecord,
+    event: Extract<ClientInputEvent, { type: "assistant.message" }>,
+  ): Promise<void> {
+    const text = event.text ?? "";
+    // An intermediate message (no marker) is accumulated and does NOT end
+    // the run; a message carrying the DONE marker is stripped and ends it.
+    const { done, content } = classifyMessage(text);
+    await record.accumulator.append(content, event.attachments);
+    record.probe.poke();
+    if (!done) {
+      return;
+    }
+    this.#endRun(record.sessionId);
+    await this.#deliverDone(record);
+  }
+
+  /** Reads the full accumulation and delivers ONE result message (or no-output). */
+  async #deliverDone(record: RunRecord): Promise<void> {
+    const { task } = record;
+    const target = task.target;
+    if (target === undefined) {
+      this.#logger.warn(`[schedule] task "${task.name}" has no target to deliver its result to`);
+      await record.accumulator.dispose();
+      return;
+    }
+    const fullText = (await record.accumulator.readAll()).trimEnd();
+    if (fullText.trim() === "") {
+      // Spec edge case: never deliver silence.
+      void this.#deliverToTarget(
+        target,
+        this.#t("schedule.taskNoOutput", { name: task.name }),
+      );
+    } else {
+      const header = this.#t("schedule.taskResultHeader", { name: task.name });
+      const attachments = record.accumulator.collectedAttachments.map((a) => ({
+        kind: "file" as const,
+        filePath: a.filePath,
+        ...(a.fileName !== undefined ? { fileName: a.fileName } : {}),
+      }));
+      void this.#deliverToTarget(target, {
+        type: "assistant.message",
+        clientSessionId: target,
+        text: `${header}\n${fullText}`,
+        ...(attachments.length > 0 ? { attachments } : {}),
+      });
+    }
+    await record.accumulator.dispose();
+  }
+
+  /** Ends a run on a terminal error, appending any accumulated partial content. */
+  async #handleError(
+    record: RunRecord,
+    event: Extract<ClientInputEvent, { type: "error" }>,
+  ): Promise<void> {
+    const { task } = record;
+    const target = task.target;
+    this.#endRun(record.sessionId);
+    if (target === undefined) {
+      this.#logger.warn(`[schedule] task "${task.name}" has no target to deliver its failure to`);
+      await record.accumulator.dispose();
+      return;
+    }
+    const base = this.#t("schedule.taskFailed", { name: task.name });
+    const detail = event.detail ? ` ${event.detail}` : "";
+    const partial = (await record.accumulator.readAll()).trim();
+    let notice: string;
+    if (partial === "") {
+      notice = `${base}${detail}`;
+    } else {
+      const header = this.#t("schedule.taskResultHeader", { name: task.name });
+      notice = `${header}\n${partial}\n\n${base}${detail}`;
+    }
+    void this.#deliverToTarget(target, notice);
+    await record.accumulator.dispose();
   }
 
   /**
@@ -413,7 +476,10 @@ export class Scheduler {
       const messageResult = await this.#dispatchClientEvent({
         type: "user.message",
         clientSessionId: sessionId,
-        text: task.prompt,
+        // T3: wrap the task prompt with the fixed completion-protocol block.
+        // The schedule task's whole file body IS its prompt (`task.prompt`),
+        // so it is supplied as the shared context/body with no extra prompt.
+        text: buildTaskPrompt(task.prompt, ""),
       });
       if (!messageResult.ok) {
         return await this.#failFire(task, sessionId, messageResult.reason);
@@ -552,10 +618,23 @@ export class Scheduler {
     // nobody will clear.
     if (!this.#started) return null;
     const sessionId = syntheticSessionId(task.name, ++this.#runSeq);
+    // T3: per-run output accumulator and silence probe, alongside the
+    // existing wall-clock timeout (the layer-3 backstop). The probe is armed
+    // (poked) at run start so its silence window opens as soon as the run
+    // registers.
+    const probe = createSilenceProbe({
+      silentMs: task.silenceMs,
+      onProbe: () => {
+        void this.#handleProbe(sessionId);
+      },
+    });
+    probe.poke();
     const record: RunRecord = {
       sessionId,
       task,
       startedAt: this.#now().getTime(),
+      accumulator: createRunAccumulator({ sessionId }),
+      probe,
       timer: setTimeout(() => {
         void this.#handleTimeout(sessionId);
       }, task.timeoutMs),
@@ -565,16 +644,39 @@ export class Scheduler {
     return sessionId;
   }
 
+  /**
+   * Layer-2 probe (T3): the silence window elapsed with no run event, so a
+   * probing `user.message` is dispatched into the run session asking it to
+   * either report DONE or keep working. The wall-clock timeout (layer 3)
+   * remains the only backstop — a failed probe dispatch is logged, with no
+   * force-close added.
+   */
+  async #handleProbe(sessionId: string): Promise<void> {
+    const record = this.#runs.get(sessionId);
+    if (record === undefined) return; // run ended before the probe fired
+    const silentMinutes = Math.max(1, Math.round(record.task.silenceMs / 60_000));
+    const result = await this.#dispatchClientEvent({
+      type: "user.message",
+      clientSessionId: sessionId,
+      text: buildProbeMessage(silentMinutes),
+    });
+    if (!result.ok) {
+      this.#logger.warn(`[schedule] probe dispatch failed for run "${sessionId}": ${result.reason}`);
+    }
+  }
+
   async #handleTimeout(sessionId: string): Promise<void> {
     const record = this.#runs.get(sessionId);
     if (record === undefined) return; // run already ended
     this.#runs.delete(sessionId);
+    record.probe.stop();
     const { task } = record;
     this.#logger.warn(`[schedule] task "${task.name}" timed out after ${task.timeoutMs}ms`);
 
     const target = task.target;
     if (target === undefined) {
       this.#logger.warn(`[schedule] task "${task.name}" has no target to deliver its timeout notice to`);
+      await record.accumulator.dispose();
       return;
     }
 
@@ -585,13 +687,25 @@ export class Scheduler {
       type: "command.session.stop",
       clientSessionId: sessionId,
     });
-    await this.#deliverToTarget(target, this.#t("schedule.taskTimedOut", { name: task.name }));
+
+    // T3: deliver any accumulated partial content alongside the timeout
+    // notice (layer 3 also flushes partial output).
+    const partial = (await record.accumulator.readAll()).trim();
+    if (partial === "") {
+      await this.#deliverToTarget(target, this.#t("schedule.taskTimedOut", { name: task.name }));
+    } else {
+      const header = this.#t("schedule.taskResultHeader", { name: task.name });
+      const timedOut = this.#t("schedule.taskTimedOut", { name: task.name });
+      await this.#deliverToTarget(target, `${header}\n${partial}\n\n${timedOut}`);
+    }
+    await record.accumulator.dispose();
   }
 
   #endRun(sessionId: string): void {
     const record = this.#runs.get(sessionId);
     if (record === undefined) return;
     clearTimeout(record.timer);
+    record.probe.stop();
     this.#runs.delete(sessionId);
   }
 

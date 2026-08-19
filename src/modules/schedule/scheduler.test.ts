@@ -5,6 +5,11 @@ import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import type { ClientInputEvent, ClientOutputEvent, OutboundAttachment } from "../../types";
 import { getTranslator } from "../../i18n";
 import type { Logger } from "../../core/logger";
+import {
+  DONE_MARKER,
+  buildProbeMessage,
+  buildTaskPrompt,
+} from "../run-completion";
 import { DEFAULT_TIMEOUT_MS, type LoadedTask, type ScheduleTask } from "./task-file";
 import { Scheduler } from "./scheduler";
 
@@ -47,6 +52,7 @@ function makeTask(overrides: Partial<ScheduleTask> & { name: string }): Schedule
     schedule: overrides.schedule ?? { type: "every", intervalMs: 30 * 60_000 },
     directory: overrides.directory,
     timeoutMs: overrides.timeoutMs ?? DEFAULT_TIMEOUT_MS,
+    silenceMs: overrides.silenceMs ?? 10 * 60_000,
     enabled: overrides.enabled ?? true,
     // T2: harness tasks belong to the scheduler's channel ("test") unless
     // the test overrides `channel` (a deliberate `undefined` means an unbound
@@ -136,7 +142,7 @@ describe("tick loop and hot reload (D8)", () => {
     expect(h.dispatched[1]).toEqual({
       type: "user.message",
       clientSessionId: "schedule:report:1",
-      text: "summarize",
+      text: buildTaskPrompt("summarize", ""),
     });
     expect(h.delivered).toEqual([]);
 
@@ -166,12 +172,20 @@ describe("tick loop and hot reload (D8)", () => {
 
     h.clock.advance(30 * 60_000);
     await waitFor(() => expect(h.dispatched).toHaveLength(2));
-    expect(h.dispatched[1]).toEqual({ type: "user.message", clientSessionId: "schedule:report:1", text: "v1" });
+    expect(h.dispatched[1]).toEqual({
+      type: "user.message",
+      clientSessionId: "schedule:report:1",
+      text: buildTaskPrompt("v1", ""),
+    });
 
     h.tasks[0] = makeLoaded(makeTask({ name: "report", target: TARGET, prompt: "v2" }));
     h.clock.advance(30 * 60_000);
     await waitFor(() => expect(h.dispatched).toHaveLength(4));
-    expect(h.dispatched[3]).toEqual({ type: "user.message", clientSessionId: "schedule:report:2", text: "v2" });
+    expect(h.dispatched[3]).toEqual({
+      type: "user.message",
+      clientSessionId: "schedule:report:2",
+      text: buildTaskPrompt("v2", ""),
+    });
   });
 
   it("picks up newly added tasks on the next tick", async () => {
@@ -348,11 +362,15 @@ describe("fire-time validation (D6/D7)", () => {
         workingDirectory: await realpath(process.cwd()),
         workingDirectorySource: "default",
       },
-      { type: "user.message", clientSessionId: "schedule:ok:1", text: "hello" },
+      { type: "user.message", clientSessionId: "schedule:ok:1", text: buildTaskPrompt("hello", "") },
     ]);
 
-    // A run was registered: its completion signal is honored.
-    h.scheduler.handleOutput({ type: "assistant.message", clientSessionId: "schedule:ok:1", text: "done" });
+    // A run was registered: its completion signal (DONE marker) is honored.
+    await h.scheduler.handleOutput({
+      type: "assistant.message",
+      clientSessionId: "schedule:ok:1",
+      text: `done\n${DONE_MARKER}`,
+    });
     expect(h.delivered).toEqual([
       { type: "assistant.message", clientSessionId: TARGET, text: '📋 Scheduled task "ok":\ndone' },
     ]);
@@ -380,7 +398,7 @@ describe("per-task model override (scheduled-task-model spec)", () => {
     expect(h.dispatched[1]).toEqual({
       type: "user.message",
       clientSessionId: "schedule:pinned:1",
-      text: "do the thing",
+      text: buildTaskPrompt("do the thing", ""),
     });
   });
 
@@ -496,92 +514,317 @@ describe("timeout (D5)", () => {
     expect(h.delivered).toHaveLength(1);
     expect(h.logger.info).toHaveBeenCalledWith(expect.stringContaining("orphan"));
   });
+
+  it("delivers the timeout notice plus accumulated partial content", async () => {
+    const h = createHarness({
+      tasks: [makeLoaded(makeTask({ name: "slow", target: TARGET, timeoutMs: 100 }))],
+    });
+    await h.scheduler.start();
+    await h.scheduler.runNow("slow");
+
+    await h.scheduler.handleOutput({
+      type: "assistant.message",
+      clientSessionId: "schedule:slow:1",
+      text: "partial work",
+    });
+    await waitFor(() => expect(h.delivered).toHaveLength(1));
+    expect(h.delivered[0]).toEqual({
+      type: "assistant.message",
+      clientSessionId: TARGET,
+      text: '📋 Scheduled task "slow":\npartial work\n\n⏰ Scheduled task "slow" timed out.',
+    });
+  });
 });
 
-describe("handleOutput (D2)", () => {
-  it("delivers the result with the localized task header and ends the run", async () => {
+// The probe is a real timer (createSilenceProbe uses setTimeout); these tests
+// use a tiny `silenceMs` so the window elapses within the waitFor budget.
+describe("silence probe (T3, layer 2)", () => {
+  it("dispatches a probing user.message into the run session after silence", async () => {
+    const h = createHarness({
+      tasks: [makeLoaded(makeTask({ name: "report", target: TARGET, silenceMs: 50 }))],
+    });
+    await h.scheduler.start();
+    await h.scheduler.runNow("report");
+
+    // Initial fire dispatches the task prompt; after 50 ms of silence the
+    // probe dispatches a probing user.message (silentMinutes=1 for <1min).
+    await waitFor(() =>
+      expect(
+        h.dispatched.some((e) => e.type === "user.message" && e.text === buildProbeMessage(1)),
+      ).toBe(true),
+    );
+  });
+
+  it("accumulates the probe answer, keeps the run alive, and delivers once on a later DONE", async () => {
+    const h = createHarness({
+      tasks: [makeLoaded(makeTask({ name: "report", target: TARGET, silenceMs: 50 }))],
+    });
+    await h.scheduler.start();
+    const probeCount = () =>
+      h.dispatched.filter((e) => e.type === "user.message" && e.text.startsWith("You have been silent")).length;
+
+    await h.scheduler.runNow("report");
+    await waitFor(() => expect(probeCount()).toBe(1));
+
+    // Probe answer WITHOUT DONE: accumulated, run continues, no delivery.
+    await h.scheduler.handleOutput({
+      type: "assistant.message",
+      clientSessionId: "schedule:report:1",
+      text: "still working",
+    });
+    expect(h.delivered).toEqual([]);
+
+    // DONE after the probe: delivered exactly once with the full accumulation.
+    await h.scheduler.handleOutput({
+      type: "assistant.message",
+      clientSessionId: "schedule:report:1",
+      text: `done now\n${DONE_MARKER}`,
+    });
+    expect(h.delivered).toEqual([
+      {
+        type: "assistant.message",
+        clientSessionId: TARGET,
+        text: '📋 Scheduled task "report":\nstill working\n\ndone now',
+      },
+    ]);
+  });
+
+  it("peeks: activity resets the silence window so the probe does not fire", async () => {
+    const h = createHarness({
+      tasks: [makeLoaded(makeTask({ name: "report", target: TARGET, silenceMs: 200 }))],
+    });
+    await h.scheduler.start();
+    await h.scheduler.runNow("report");
+
+    // Keep poking every ~30 ms; each poke resets the 200 ms window, so the
+    // silence threshold never elapses while activity is ongoing.
+    for (let i = 0; i < 5; i++) {
+      await sleep(30);
+      await h.scheduler.handleOutput({
+        type: "assistant.thinking",
+        clientSessionId: "schedule:report:1",
+        text: "...",
+      });
+    }
+    // No probe was dispatched during the sustained-activity period.
+    expect(h.dispatched.some((e) => e.text === buildProbeMessage(1))).toBe(false);
+  });
+});
+
+describe("stop() mid-run (T3)", () => {
+  it("stop mid-run disposes the accumulator without delivering", async () => {
     const h = createHarness({ tasks: [makeLoaded(makeTask({ name: "report", target: TARGET }))] });
     await h.scheduler.start();
     await h.scheduler.runNow("report");
 
-    h.scheduler.handleOutput({ type: "assistant.message", clientSessionId: "schedule:report:1", text: "line1\nline2" });
+    await h.scheduler.handleOutput({
+      type: "assistant.message",
+      clientSessionId: "schedule:report:1",
+      text: "partial work",
+    });
+    await h.scheduler.stop();
+    expect(h.delivered).toEqual([]);
+
+    // A late completion after stop is an orphan: nothing delivered.
+    await h.scheduler.handleOutput({
+      type: "assistant.message",
+      clientSessionId: "schedule:report:1",
+      text: `x\n${DONE_MARKER}`,
+    });
+    expect(h.delivered).toEqual([]);
+    expect(h.logger.info).toHaveBeenCalledWith(expect.stringContaining("orphan"));
+  });
+});
+
+describe("handleOutput / three-layer completion (T3)", () => {
+  it("accumulates two assistant messages and delivers them once only on DONE, marker stripped", async () => {
+    const h = createHarness({ tasks: [makeLoaded(makeTask({ name: "report", target: TARGET }))] });
+    await h.scheduler.start();
+    await h.scheduler.runNow("report");
+
+    // First message (no marker): accumulated, run NOT ended, nothing delivered.
+    await h.scheduler.handleOutput({
+      type: "assistant.message",
+      clientSessionId: "schedule:report:1",
+      text: "step one",
+    });
+    expect(h.delivered).toEqual([]);
+
+    // Second message: still no delivery.
+    await h.scheduler.handleOutput({
+      type: "assistant.message",
+      clientSessionId: "schedule:report:1",
+      text: "step two",
+    });
+    expect(h.delivered).toEqual([]);
+
+    // DONE: a single delivery carrying BOTH texts in order, marker stripped.
+    await h.scheduler.handleOutput({
+      type: "assistant.message",
+      clientSessionId: "schedule:report:1",
+      text: `step three\n${DONE_MARKER}`,
+    });
     expect(h.delivered).toEqual([
-      { type: "assistant.message", clientSessionId: TARGET, text: '📋 Scheduled task "report":\nline1\nline2' },
+      {
+        type: "assistant.message",
+        clientSessionId: TARGET,
+        text: '📋 Scheduled task "report":\nstep one\n\nstep two\n\nstep three',
+      },
     ]);
+    expect(h.delivered[0]!.text).not.toContain(DONE_MARKER);
 
     // The run ended: a second completion is an orphan.
-    h.scheduler.handleOutput({ type: "assistant.message", clientSessionId: "schedule:report:1", text: "again" });
+    await h.scheduler.handleOutput({
+      type: "assistant.message",
+      clientSessionId: "schedule:report:1",
+      text: `again\n${DONE_MARKER}`,
+    });
     expect(h.delivered).toHaveLength(1);
   });
 
-  it("passes attachments through on the result", async () => {
+  it("merges attachments from every accumulated message onto the final delivery", async () => {
     const h = createHarness({ tasks: [makeLoaded(makeTask({ name: "report", target: TARGET }))] });
     await h.scheduler.start();
     await h.scheduler.runNow("report");
 
-    const attachments: OutboundAttachment[] = [{ kind: "file", filePath: "/tmp/x.txt", fileName: "x.txt" }];
-    h.scheduler.handleOutput({
+    const a1: OutboundAttachment[] = [{ kind: "file", filePath: "/tmp/a.txt", fileName: "a.txt" }];
+    const a2: OutboundAttachment[] = [{ kind: "file", filePath: "/tmp/b.txt", fileName: "b.txt" }];
+    await h.scheduler.handleOutput({
       type: "assistant.message",
       clientSessionId: "schedule:report:1",
-      text: "see attached",
-      attachments,
+      text: "first",
+      attachments: a1,
+    });
+    await h.scheduler.handleOutput({
+      type: "assistant.message",
+      clientSessionId: "schedule:report:1",
+      text: `second\n${DONE_MARKER}`,
+      attachments: a2,
     });
     expect(h.delivered[0]).toEqual({
       type: "assistant.message",
       clientSessionId: TARGET,
-      text: '📋 Scheduled task "report":\nsee attached',
-      attachments,
+      text: '📋 Scheduled task "report":\nfirst\n\nsecond',
+      attachments: [...a1, ...a2],
     });
   });
 
-  it("delivers a no-output notice for an empty result instead of silence", async () => {
+  it("delivers a no-output notice when the run ends with empty accumulation", async () => {
     const h = createHarness({ tasks: [makeLoaded(makeTask({ name: "quiet", target: TARGET }))] });
     await h.scheduler.start();
     await h.scheduler.runNow("quiet");
 
-    h.scheduler.handleOutput({ type: "assistant.message", clientSessionId: "schedule:quiet:1", text: "   " });
+    // Only the marker: the curated content is empty, so no-output is delivered.
+    await h.scheduler.handleOutput({
+      type: "assistant.message",
+      clientSessionId: "schedule:quiet:1",
+      text: DONE_MARKER,
+    });
     expect(h.delivered).toEqual([
-      { type: "assistant.message", clientSessionId: TARGET, text: 'Scheduled task "quiet" finished with no output.' },
+      {
+        type: "assistant.message",
+        clientSessionId: TARGET,
+        text: 'Scheduled task "quiet" finished with no output.',
+      },
     ]);
   });
 
-  it("delivers a localized failure notice on a terminal error and ends the run", async () => {
+  it("a bare message without DONE does not end the run", async () => {
     const h = createHarness({ tasks: [makeLoaded(makeTask({ name: "report", target: TARGET }))] });
     await h.scheduler.start();
     await h.scheduler.runNow("report");
 
-    h.scheduler.handleOutput({ type: "error", clientSessionId: "schedule:report:1", kind: "agent.run.failed", detail: "boom" });
-    expect(h.delivered).toEqual([
-      { type: "assistant.message", clientSessionId: TARGET, text: '❌ Scheduled task "report" failed. boom' },
-    ]);
-
-    // The run ended: a second error is an orphan.
-    h.scheduler.handleOutput({ type: "error", clientSessionId: "schedule:report:1", kind: "agent.run.failed" });
+    // Whitespace-only, no marker: accumulated but the run stays alive.
+    await h.scheduler.handleOutput({
+      type: "assistant.message",
+      clientSessionId: "schedule:report:1",
+      text: "   ",
+    });
+    expect(h.delivered).toEqual([]);
+    // Still alive: a DONE-only message delivers (empty) accumulated content.
+    await h.scheduler.handleOutput({
+      type: "assistant.message",
+      clientSessionId: "schedule:report:1",
+      text: DONE_MARKER,
+    });
     expect(h.delivered).toHaveLength(1);
   });
 
-  it("ignores non-schedule sessions and discards intermediate events", async () => {
+  it("delivers a failure notice with accumulated partial content on a terminal error", async () => {
     const h = createHarness({ tasks: [makeLoaded(makeTask({ name: "report", target: TARGET }))] });
     await h.scheduler.start();
     await h.scheduler.runNow("report");
 
-    h.scheduler.handleOutput({ type: "assistant.message", clientSessionId: TARGET, text: "user's chat reply" });
-    h.scheduler.handleOutput({ type: "assistant.thinking", clientSessionId: "schedule:report:1", text: "thinking..." });
-    h.scheduler.handleOutput({
+    await h.scheduler.handleOutput({
+      type: "assistant.message",
+      clientSessionId: "schedule:report:1",
+      text: "partial work",
+    });
+    await h.scheduler.handleOutput({
+      type: "error",
+      clientSessionId: "schedule:report:1",
+      kind: "agent.run.failed",
+      detail: "boom",
+    });
+    expect(h.delivered).toEqual([
+      {
+        type: "assistant.message",
+        clientSessionId: TARGET,
+        text: '📋 Scheduled task "report":\npartial work\n\n❌ Scheduled task "report" failed. boom',
+      },
+    ]);
+
+    // The run ended: a second error is an orphan.
+    await h.scheduler.handleOutput({ type: "error", clientSessionId: "schedule:report:1", kind: "agent.run.failed" });
+    expect(h.delivered).toHaveLength(1);
+  });
+
+  it("delivers only the failure notice when there is no partial content", async () => {
+    const h = createHarness({ tasks: [makeLoaded(makeTask({ name: "report", target: TARGET }))] });
+    await h.scheduler.start();
+    await h.scheduler.runNow("report");
+
+    await h.scheduler.handleOutput({
+      type: "error",
+      clientSessionId: "schedule:report:1",
+      kind: "agent.run.failed",
+      detail: "boom",
+    });
+    expect(h.delivered).toEqual([
+      {
+        type: "assistant.message",
+        clientSessionId: TARGET,
+        text: '❌ Scheduled task "report" failed. boom',
+      },
+    ]);
+  });
+
+  it("treats intermediate events as activity (no run end) and ignores non-schedule sessions", async () => {
+    const h = createHarness({ tasks: [makeLoaded(makeTask({ name: "report", target: TARGET }))] });
+    await h.scheduler.start();
+    await h.scheduler.runNow("report");
+
+    await h.scheduler.handleOutput({ type: "assistant.message", clientSessionId: TARGET, text: "user's chat reply" });
+    await h.scheduler.handleOutput({ type: "assistant.thinking", clientSessionId: "schedule:report:1", text: "thinking..." });
+    await h.scheduler.handleOutput({
       type: "agent.status.info",
       clientSessionId: "schedule:report:1",
       status: { sessionId: "s1" },
     });
     expect(h.delivered).toEqual([]);
 
-    // The run is still alive after the discarded intermediate events.
-    h.scheduler.handleOutput({ type: "assistant.message", clientSessionId: "schedule:report:1", text: "final" });
+    // The run is still alive after the intermediate events.
+    await h.scheduler.handleOutput({
+      type: "assistant.message",
+      clientSessionId: "schedule:report:1",
+      text: `final\n${DONE_MARKER}`,
+    });
     expect(h.delivered).toHaveLength(1);
   });
 
   it("drops orphan events for schedule sessions with no active run", async () => {
     const h = createHarness();
-    h.scheduler.handleOutput({ type: "assistant.message", clientSessionId: "schedule:ghost:1", text: "x" });
+    await h.scheduler.handleOutput({ type: "assistant.message", clientSessionId: "schedule:ghost:1", text: "x" });
     expect(h.delivered).toEqual([]);
     expect(h.logger.info).toHaveBeenCalledWith(expect.stringContaining("orphan"));
   });
@@ -604,20 +847,28 @@ describe("concurrent runs of the same task (D5)", () => {
       "schedule:report:2",
     ]);
 
-    // Run 1 completes: its result is delivered and run 2 is untouched.
-    h.scheduler.handleOutput({ type: "assistant.message", clientSessionId: "schedule:report:1", text: "first" });
+    // Run 1 completes: its result is delivered (accumulated) and run 2 is untouched.
+    await h.scheduler.handleOutput({
+      type: "assistant.message",
+      clientSessionId: "schedule:report:1",
+      text: `first\n${DONE_MARKER}`,
+    });
     expect(h.delivered).toEqual([
       { type: "assistant.message", clientSessionId: TARGET, text: '📋 Scheduled task "report":\nfirst' },
     ]);
 
     // A late event from the ended run 1 is an orphan — it can never be
     // mistaken for run 2's result.
-    h.scheduler.handleOutput({ type: "assistant.message", clientSessionId: "schedule:report:1", text: "stale" });
+    await h.scheduler.handleOutput({ type: "assistant.message", clientSessionId: "schedule:report:1", text: "stale" });
     expect(h.delivered).toHaveLength(1);
     expect(h.logger.info).toHaveBeenCalledWith(expect.stringContaining("orphan"));
 
     // Run 2 still completes normally with its own result.
-    h.scheduler.handleOutput({ type: "assistant.message", clientSessionId: "schedule:report:2", text: "second" });
+    await h.scheduler.handleOutput({
+      type: "assistant.message",
+      clientSessionId: "schedule:report:2",
+      text: `second\n${DONE_MARKER}`,
+    });
     expect(h.delivered).toHaveLength(2);
     expect(h.delivered[1]).toEqual({
       type: "assistant.message",
@@ -635,7 +886,11 @@ describe("concurrent runs of the same task (D5)", () => {
     expect(await h.scheduler.fire("report")).toEqual({ ok: true });
 
     // Run 1 completes normally, clearing only its own timer...
-    h.scheduler.handleOutput({ type: "assistant.message", clientSessionId: "schedule:report:1", text: "ok" });
+    await h.scheduler.handleOutput({
+      type: "assistant.message",
+      clientSessionId: "schedule:report:1",
+      text: `ok\n${DONE_MARKER}`,
+    });
     expect(h.delivered).toHaveLength(1);
 
     // ...so run 2's independent timer still fires: it aborts only run 2's
@@ -827,9 +1082,16 @@ summarize the logs
       workingDirectory: await realpath(tempRoot),
       workingDirectorySource: "default",
     });
-    expect(dispatched[1]).toMatchObject({ type: "user.message", text: "summarize the logs" });
+    expect(dispatched[1]).toMatchObject({
+      type: "user.message",
+      text: buildTaskPrompt("summarize the logs", ""),
+    });
 
-    scheduler.handleOutput({ type: "assistant.message", clientSessionId: "schedule:report:1", text: "done!" });
+    await scheduler.handleOutput({
+      type: "assistant.message",
+      clientSessionId: "schedule:report:1",
+      text: `done!\n${DONE_MARKER}`,
+    });
     expect(delivered).toEqual([
       { type: "assistant.message", clientSessionId: TARGET, text: '📋 Scheduled task "report":\ndone!' },
     ]);

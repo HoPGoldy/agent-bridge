@@ -4,6 +4,7 @@ import path from "node:path";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { SCHEDULES_DIR } from "../../config/channel-state";
 import {
+  DEFAULT_SILENCE_MS,
   DEFAULT_TIMEOUT_MS,
   bindTask,
   getSchedulesDir,
@@ -16,6 +17,7 @@ const WELL_FORMED = `---
 schedule: daily 09:00
 directory: ~/reports
 timeout: 30m
+silence: 2m
 enabled: true
 target: feishu:dm:oc_6f9d408e630098e6dd06bb071d6b60fc
 channel: feishu-dev
@@ -46,6 +48,7 @@ describe("parseTaskFile", () => {
       schedule: { type: "daily", hour: 9, minute: 0 },
       directory: "~/reports",
       timeoutMs: 30 * 60_000,
+      silenceMs: 2 * 60_000,
       enabled: true,
       target: "feishu:dm:oc_6f9d408e630098e6dd06bb071d6b60fc",
       channel: "feishu-dev",
@@ -60,6 +63,7 @@ describe("parseTaskFile", () => {
     );
     expect(errors).toEqual([]);
     expect(task.timeoutMs).toBe(DEFAULT_TIMEOUT_MS);
+    expect(task.silenceMs).toBe(DEFAULT_SILENCE_MS);
     expect(task.enabled).toBe(true);
     expect(task.directory).toBeUndefined();
     expect(task.target).toBeUndefined();
@@ -197,6 +201,40 @@ Body.
     expect(warnings).toEqual(["unknown front matter key \"foo\"", "unknown front matter key \"baz\""]);
     expect(task.name).toBe("unknown");
     expect(task.schedule).toEqual({ type: "daily", hour: 9, minute: 0 });
+  });
+
+  it("parses the silence field with the timeout duration syntax, defaulting to 10m", () => {
+    // Bare value.
+    const bare = parseTaskFile(
+      "silence.md",
+      "---\nschedule: daily 09:00\nsilence: 3m\n---\nBody.\n",
+    );
+    expect(bare.task.silenceMs).toBe(3 * 60_000);
+    expect(bare.errors).toEqual([]);
+
+    // Seconds and hours also usable, and quoted values are stripped.
+    const quoted = parseTaskFile(
+      "silence.md",
+      "---\nschedule: daily 09:00\nsilence: '90s'\n---\nBody.\n",
+    );
+    expect(quoted.task.silenceMs).toBe(90_000);
+    const hours = parseTaskFile(
+      "silence.md",
+      "---\nschedule: daily 09:00\nsilence: 2h\n---\nBody.\n",
+    );
+    expect(hours.task.silenceMs).toBe(2 * 3_600_000);
+
+    // Missing → default 10m.
+    const absent = parseTaskFile("silence.md", "---\nschedule: daily 09:00\n---\nBody.\n");
+    expect(absent.task.silenceMs).toBe(DEFAULT_SILENCE_MS);
+
+    // Invalid duration → error + default.
+    const bad = parseTaskFile(
+      "silence.md",
+      "---\nschedule: daily 09:00\nsilence: 10\n---\nBody.\n",
+    );
+    expect(bad.errors).toContain('invalid silence "10": invalid timeout "10" — expected like "10m", "1h" or "90s"');
+    expect(bad.task.silenceMs).toBe(DEFAULT_SILENCE_MS);
   });
 
   it("records invalid schedule and timeout strings as errors and keeps the task listable", () => {

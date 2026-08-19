@@ -3,6 +3,7 @@ import os from "node:os";
 import path from "node:path";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { QUEUES_DIR } from "../../config/channel-state";
+import { DEFAULT_SILENCE_MS } from "../schedule/task-file";
 import {
   DEFAULT_WORKERS,
   QUEUE_SESSION_PREFIX,
@@ -76,6 +77,7 @@ describe("parseQueueDefinition", () => {
       name: "ops",
       channel: "feishu-dev",
       workers: 2,
+      silenceMs: DEFAULT_SILENCE_MS,
       model: "azure-openai-responses/gpt-5.6-terra",
       target: "feishu:dm:oc_6f9d408e630098e6dd06bb071d6b60fc",
       body: "Shared context for every task of this queue.",
@@ -94,6 +96,7 @@ describe("parseQueueDefinition", () => {
       name: "minimal",
       channel: "wecom-dev",
       workers: DEFAULT_WORKERS,
+      silenceMs: DEFAULT_SILENCE_MS,
       model: undefined,
       target: undefined,
       body: "",
@@ -148,6 +151,38 @@ Body.
     expect(errors).toEqual([]);
     expect(warnings).toEqual(['unknown front matter key "foo"']);
     expect(definition?.name).toBe("extra");
+  });
+
+  it("parses the optional silence duration with the timeout syntax, defaulting to 10m", () => {
+    const { definition, errors, warnings } = parseQueueDefinition(
+      "silence.md",
+      "---\nchannel: feishu-dev\nsilence: 5m\n---\nBody.\n",
+    );
+    expect(errors).toEqual([]);
+    expect(warnings).toEqual([]);
+    expect(definition?.silenceMs).toBe(5 * 60_000);
+  });
+
+  it("treats a blank silence as unset (defaults to 10m)", () => {
+    for (const raw of ["silence:", "silence:  ", 'silence: ""']) {
+      const { definition, errors } = parseQueueDefinition(
+        "blank-silence.md",
+        `---\nchannel: feishu-dev\n${raw}\n---\nBody.\n`,
+      );
+      expect(errors).toEqual([]);
+      expect(definition?.silenceMs).toBe(DEFAULT_SILENCE_MS);
+    }
+  });
+
+  it("rejects an invalid silence value and drops the definition", () => {
+    const { definition, errors } = parseQueueDefinition(
+      "bad-silence.md",
+      "---\nchannel: feishu-dev\nsilence: nope\n---\nBody.\n",
+    );
+    expect(errors).toEqual([
+      'invalid silence "nope": invalid timeout "nope" — expected like "10m", "1h" or "90s"',
+    ]);
+    expect(definition).toBeNull();
   });
 
   it("rejects a definition missing the channel", () => {

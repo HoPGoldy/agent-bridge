@@ -17,9 +17,9 @@ import { resolveWorkingDirectory } from "../working-directory";
 import type { PiCodingAgentSessionStateV1 } from "../index";
 
 class PiModelCommandError extends Error {
-  readonly kind: "agent.model.invalid" | "agent.model.busy" | "agent.model.set.unavailable";
+  readonly kind: "agent.model.invalid" | "agent.model.set.unavailable";
 
-  constructor(kind: "agent.model.invalid" | "agent.model.busy" | "agent.model.set.unavailable", message: string) {
+  constructor(kind: "agent.model.invalid" | "agent.model.set.unavailable", message: string) {
     super(message);
     this.kind = kind;
   }
@@ -221,6 +221,10 @@ export class PiCodingAgentAdapter implements AgentAdapter {
   }
 
   async abort(): Promise<void> {
+    // T1: idle-abort is a no-op; the core may call abort unconditionally.
+    if (!this.#activeRun) {
+      return;
+    }
     this.#logger.info(`aborting agent turn (session=${this.#agentSessionId})`);
     await this.#client?.abort();
   }
@@ -231,10 +235,6 @@ export class PiCodingAgentAdapter implements AgentAdapter {
     }
 
     await this.#processEvent(event);
-  }
-
-  async isBusy(): Promise<boolean> {
-    return this.#activeRun;
   }
 
   async getStatus(): Promise<AgentSessionStatus> {
@@ -281,11 +281,8 @@ export class PiCodingAgentAdapter implements AgentAdapter {
     }
 
     const parsed = this.#parseModelTarget(target);
-    const state = await this.#client.getState();
-    if (state.isStreaming || state.isCompacting) {
-      throw new PiModelCommandError("agent.model.busy", "Current session is busy, so the model cannot be switched. Please use /stop first.");
-    }
-
+    // T1: no busy precheck — pi's own RPC answers mid-run switches (its
+    // `set_model` has no busy gate) and errors are mapped below as today.
     try {
       const result = await this.#client.setModel(parsed.provider, parsed.modelId);
       return {

@@ -28,7 +28,7 @@ The task run is completely isolated from the target chat's own session: a user c
 The scheduler fires by injecting two synthetic events through the normal ingress path:
 
 1. `command.session.new` — `workingDirectory` from the task file (validated, see D6), `workingDirectorySource: "default"` (operator-configured paths are trusted, like the cwd fallback; the agent-side allowlist does not apply), and, when the task pins one, a `model` override that rides the event into `createAgentSession` (see the per-task model design spec, `docs/scheduled-task-model-spec.md`).
-2. `user.message` — the Markdown body of the task file, verbatim.
+2. `user.message` — the Markdown body of the task file (which is the task's whole prompt), wrapped with the fixed completion-protocol instruction block (T3: the DONE-marker contract, see D2/D5).
 
 Both events carry a **synthetic clientSessionId** of the form `schedule:<task-name>:<run-seq>` (task names are globally unique, so the id is globally unique; the run sequence makes every run's id unique). The core treats it like any other client session — binding, session lifecycle, abort, and shutdown-on-stop all work unchanged — with two deliberate exceptions (see the Component Map): `schedule:*` bindings are kept **in memory only** (a unique id per run would otherwise grow the state file forever, and resume semantics are meaningless for ephemeral runs), and the "started a new session" confirmation is **suppressed** for them (it would be mistaken for the task result). The id never collides with a real chat's clientSessionId, so **the target chat's own session binding is never touched**. This synthetic-session machinery (divert, memory-only bindings, orphan guard, suppressed confirmation) was later generalized to `queue:*` ids for event queues (see `docs/event-queue-spec.md`).
 
@@ -37,8 +37,8 @@ Both events carry a **synthetic clientSessionId** of the form `schedule:<task-na
 Output events for the synthetic `schedule:*` session cannot be delivered as-is (there is no real chat behind that id), and we do not want per-chunk streaming anyway. The divert lives in `GatewayCore.#handleAgentOutput` — the only place that knows the agentSession→clientSession mapping — in cooperation with the scheduler:
 
 - Any output event whose resolved clientSessionId starts with `schedule:` is handed to the scheduler instead of `imAdapter.input`.
-- Intermediate/progress events (tool calls, thinking, the "started new session" confirmation, ...) are discarded.
-- `assistant.message` is the completion signal: the scheduler delivers it by emitting a normal `assistant.message` egress event through `imAdapter.input`, addressed to the task's **`target` clientSessionId** (from the front matter), prefixed with a localized one-line header identifying the task (e.g. `📋 Scheduled task "daily-report":`). Client adapters resolve the target chat from the clientSessionId alone (e.g. Feishu's `parseFeishuSessionId`), so no binding lookup is needed and the chat's own session state is never touched.
+- Intermediate/progress events (tool calls, thinking, the "started new session" confirmation, ...) are discarded; `assistant.message` events are accumulated (T3) into a per-run local file under `run-outputs/`.
+- Completion is the three-layer DONE protocol (T3), not the first `assistant.message`: the scheduler accumulates every `assistant.message`, and when one carries the `BRIDGE_TASK_STATUS_DONE` marker as its last line it delivers the **full accumulated transcript** exactly once by emitting a normal `assistant.message` egress event through `imAdapter.input`, addressed to the task's **`target` clientSessionId** (from the front matter), prefixed with a localized one-line header identifying the task (e.g. `📋 Scheduled task "daily-report":`). After `silence` minutes (front matter, default 10m) without any run event the scheduler sends a probe `user.message` into the session asking whether the run is finished; the probe Q&A is accumulated and included in the delivered transcript. Client adapters resolve the target chat from the clientSessionId alone (e.g. Feishu's `parseFeishuSessionId`), so no binding lookup is needed and the chat's own session state is never touched.
 
 Because delivery goes through the standard egress event path, message chunking, `MEDIA:` attachment claiming, and formatting all behave exactly like a normal agent reply — for free.
 
@@ -63,6 +63,7 @@ Location: `~/.config/agent-bridge/schedules/<task-name>.md` — a **flat, channe
 schedule: daily 09:00
 directory: ~/reports
 timeout: 30m
+silence: 10m
 enabled: true
 channel: feishu-dev
 target: feishu:dm:oc_6f9d408e630098e6dd06bb071d6b60fc
@@ -84,6 +85,7 @@ Front matter keys:
 | `schedule` | yes | — | Schedule grammar string (D4) |
 | `directory` | no | bridge process cwd | Working directory of the new session (`~` expanded, relative → bridge cwd, canonicalized at fire time) |
 | `timeout` | no | `10m` | Max run duration (`<n>m` / `<n>h`); the run is killed when exceeded (D5) |
+| `silence` | no | `10m` | Silence window (same duration syntax as `timeout`) before a probe `user.message` is sent into the run asking whether it is finished (D2/D5); an invalid value is listed as an error and the default is used |
 | `enabled` | no | `true` | `false` pauses the task without deleting it |
 | `target` | no | — | Delivery address: the clientSessionId of the destination chat, copied from `/st` in that chat or set by `/schedule-here` (D7). Missing/invalid → fire skipped, logged, shown by `schedule list` |
 | `channel` | no | — | Owning channel config name, written by `/schedule-here` alongside `target` (D7). A scheduler fires on schedule only tasks whose `channel` equals its own name; a task with no `channel` never fires on schedule |
@@ -102,12 +104,14 @@ monthly <day-of-month> HH:MM   1..31; short months clamp to their last day
 
 Implementation: a pure `nextRun(schedule, from: Date): Date` function plus a tick loop. Parsing and next-run computation are fully unit-testable with an injected clock. Invalid strings are rejected at `schedule add` time (re-prompt) and disable the task at load time.
 
-### D5. Run lifecycle: completion or timeout — no overlap policy
+### D5. Run lifecycle: DONE completion, silence probe, or timeout — no overlap policy
 
-Every fire unconditionally starts a **fresh, fully isolated run**; runs never interact, so no mutual-exclusion configuration is needed. A run ends for exactly one of two reasons:
+Every fire unconditionally starts a **fresh, fully isolated run**; runs never interact, so no mutual-exclusion configuration is needed. Each run wraps its prompt with a fixed completion-protocol instruction block and accumulates every `assistant.message` into a per-run local file under `run-outputs/`. A run ends for exactly one of two reasons:
 
-1. **Completion** — the diverted `assistant.message` (or terminal `error`) arrives; the result/failure is delivered per D2 and the run is done.
-2. **Timeout** — the run exceeds the task's `timeout` (default `10m`): the scheduler aborts the run's `schedule:<task>:<seq>` session, releases it, and delivers a localized "task timed out" notice to the target chat.
+1. **Completion (three-layer DONE protocol, T3)** — the agent appends the `BRIDGE_TASK_STATUS_DONE` marker as the last line of its final `assistant.message`; the scheduler strips it and delivers the **full accumulated transcript** once (per D2), and the run is done. A terminal `error` also ends the run and delivers a failure notice per D2. The old "first `assistant.message` ends the run" semantics is gone.
+2. **Timeout** — the run exceeds the task's `timeout` (default `10m`): the scheduler aborts the run's `schedule:<task>:<seq>` session, releases it, and delivers a localized "task timed out" notice to the target chat, preceded by any partial output already accumulated.
+
+**The silence probe (layer 2).** After `silence` minutes (front matter, default 10m) with no run event, the scheduler sends a probe `user.message` into the run asking whether it is finished (reply DONE, or keep working / keep waiting for async callbacks). Any run event resets the silence window; the probe Q&A is accumulated and delivered with the transcript. An unanswered probe is harmless — the wall-clock `timeout` (layer 3) remains the only cap. A task waiting on async follow-ups simply does not emit DONE until its callbacks return; nothing else is needed.
 
 Consequence to document: if the schedule interval is shorter than the timeout (e.g. `every 1m` with `timeout: 30m`), several runs of the same task can be alive concurrently. Because each run has its own synthetic session id, they are genuinely isolated (results can never cross), but concurrency costs resources — the docs recommend choosing an interval comfortably larger than the expected run duration.
 
@@ -175,7 +179,7 @@ graph LR
     CORE --> AG[Agent Adapter]
     AG -->|egress events for schedule:*| DIV{Core divert}
     DIV -->|discard| X[progress/chunks]
-    DIV -->|"final assistant.message → task target id"| CA[Client Adapter]
+    DIV -->|"DONE-marked transcript → task target id"| CA[Client Adapter]
     CA -->|normal reply pipeline: chunking, MEDIA:, errors| CHAT[Target IM chat]
     CA -->|/schedule-run name| SCH
   end
@@ -247,7 +251,7 @@ Wizard steps for `add`:
 - Grammar: parse + `nextRun` across all four forms, clamping (`monthly 31` in February), invalid strings, DST boundary (fixed clock).
 - Front-matter parser: happy path, comments/quotes, unknown keys, malformed files, empty body.
 - Scheduler: fake clock + fake runner — fire injection order and event payloads, hot reload (edit/disable/delete), timeout kill (abort + timeout notice delivered), fire-time directory validation failure (no injection, error delivered).
-- Runner/core divert: schedule-session progress events dropped; `assistant.message` delivered to the task's `target` with header and completing the run; terminal `error` delivered as failure; non-schedule sessions untouched; the target chat's own binding never modified.
+- Runner/core divert: schedule-session progress events dropped; intermediate `assistant.message` accumulated (no run end); DONE-marked `assistant.message` delivered to the task's `target` with header and completing the run; silence probe dispatched and its Q&A accumulated; terminal `error` delivered as failure; non-schedule sessions untouched; the target chat's own binding never modified.
 - Channel state: unchanged (assert no scheduler writes).
 - `/schedule-run`: adapter-level test (Feishu) — success and error paths; `/st` renders the chat session ID line.
 - CLI: wizard validation loops (schedule string, task name), file creation shape.

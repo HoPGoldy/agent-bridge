@@ -30,10 +30,19 @@
  * module deliberately knows nothing about the agent adapter or the core.
  */
 
-import type { ClientInputEvent, ClientOutputEvent, IngressResult, OutboundAttachment } from "../../types";
+import type { ClientInputEvent, ClientOutputEvent, IngressResult } from "../../types";
 import type { Translator } from "../../i18n";
 import { createLogger, type Logger } from "../../core/logger";
 import { DEFAULT_TIMEOUT_MS } from "../schedule/task-file";
+import {
+  buildProbeMessage,
+  buildTaskPrompt,
+  classifyMessage,
+  createRunAccumulator,
+  createSilenceProbe,
+  type RunAccumulator,
+  type SilenceProbe,
+} from "../run-completion";
 import {
   QUEUE_SESSION_PREFIX,
   deleteQueueTask,
@@ -73,7 +82,13 @@ interface RunRecord {
   taskId: string;
   /** Delivery address captured at fire time (spec D2). */
   target: string;
+  /** Silence window for the probe, from the queue definition (T4). */
+  silentMs: number;
   timer: NodeJS.Timeout;
+  /** Per-run output accumulator (T4): every assistant message is appended here. */
+  accumulator: RunAccumulator;
+  /** Per-run silence probe (T4): fires a probing user.message after inactivity. */
+  probe: SilenceProbe;
 }
 
 export class QueueController {
@@ -121,7 +136,8 @@ export class QueueController {
    * Stops the tick loop and clears every timer (including run timeout
    * timers). In-flight runs are forgotten; their task files stay `running`
    * and are re-enqueued at the next start (spec D2). No delivery happens
-   * after stop (same contract as the scheduler, T6).
+   * after stop (same contract as the scheduler, T6); probe timers are
+   * stopped and accumulators disposed WITHOUT delivering their content.
    */
   async stop(): Promise<void> {
     this.#started = false;
@@ -131,23 +147,31 @@ export class QueueController {
     }
     for (const record of this.#runs.values()) {
       clearTimeout(record.timer);
+      record.probe.stop();
+      // Stop contract (T4, unchanged): dispose accumulators WITHOUT
+      // delivering their accumulated content.
+      await record.accumulator.dispose();
     }
     this.#runs.clear();
   }
 
   /**
-   * Routes a diverted agent-output event for a `queue:*` session (spec D3).
-   * `assistant.message` is the completion signal: the result (a localized
-   * completion notice naming queue and task) is delivered to the run's
-   * `target` together with any attachments the task produced (same contract
-   * as the scheduler), the task file is deleted (fail-and-drop) and the run
-   * ends. A
-   * terminal `error` delivers a localized failure notice with the real
-   * reason, deletes the task file and ends the run. Every other event type
-   * is discarded. Events whose run-unique id has no active run are dropped
-   * and logged (orphan).
+   * Routes a diverted agent-output event for a `queue:*` session (T4,
+   * three-layer completion protocol per qa-log 2026-08-19（二）).
+   *
+   * `assistant.message` no longer ends the run: it is classified against the
+   * DONE-marker protocol, appended to the run's accumulator and pokes the
+   * silence probe. When DONE is detected the run ends, ONE `queue.taskCompleted`
+   * message with the full accumulated text (plus all attachments) is
+   * delivered, the task file is deleted and the worker slot is freed — the
+   * slot is held until DONE/failure/timeout (WAITING, decided), so with
+   * `workers=1` a second task cannot fire between the first message and DONE.
+   * A terminal `error` delivers a localized failure notice with any
+   * accumulated partial content, deletes the task file and ends the run.
+   * Events whose run-unique id has no active run are dropped and logged
+   * (orphan).
    */
-  handleOutput(event: ClientInputEvent): void {
+  async handleOutput(event: ClientInputEvent): Promise<void> {
     if (!event.clientSessionId.startsWith(QUEUE_SESSION_PREFIX)) return;
     const record = this.#runs.get(event.clientSessionId);
     if (record === undefined) {
@@ -156,20 +180,46 @@ export class QueueController {
     }
 
     if (event.type === "assistant.message") {
-      this.#endRun(event.clientSessionId);
-      const text = event.text ?? "";
-      void this.#completeTask(record, text, event.attachments);
+      await this.#handleAssistantMessage(record, event);
       return;
     }
 
     if (event.type === "error") {
-      this.#endRun(event.clientSessionId);
-      const reason = event.detail ?? "agent run failed";
-      void this.#failTask(record, reason);
+      await this.#handleError(record, event);
       return;
     }
 
-    // Intermediate/progress events are discarded (spec D2).
+    // Every other event for a live run counts as activity: it resets the
+    // silence window so the probe does not fire while work is observable.
+    record.probe.poke();
+  }
+
+  /** Classifies, accumulates and (on DONE) finishes an assistant message. */
+  async #handleAssistantMessage(
+    record: RunRecord,
+    event: Extract<ClientInputEvent, { type: "assistant.message" }>,
+  ): Promise<void> {
+    const text = event.text ?? "";
+    // An intermediate message (no marker) is accumulated and does NOT end
+    // the run; a message carrying the DONE marker is stripped and ends it.
+    const { done, content } = classifyMessage(text);
+    await record.accumulator.append(content, event.attachments);
+    record.probe.poke();
+    if (!done) {
+      return;
+    }
+    this.#endRun(record.sessionId);
+    await this.#completeTask(record);
+  }
+
+  /** Ends a run on a terminal error, appending any accumulated partial content. */
+  async #handleError(
+    record: RunRecord,
+    event: Extract<ClientInputEvent, { type: "error" }>,
+  ): Promise<void> {
+    this.#endRun(record.sessionId);
+    const reason = event.detail ?? "agent run failed";
+    await this.#failTask(record, reason);
   }
 
   async #tick(): Promise<void> {
@@ -266,7 +316,7 @@ export class QueueController {
         return;
       }
 
-      const text = definition.body === "" ? task.prompt : `${definition.body}\n\n${task.prompt}`;
+      const text = buildTaskPrompt(definition.body, task.prompt);
       const messageResult = await this.#dispatchClientEvent({
         type: "user.message",
         clientSessionId: sessionId,
@@ -306,65 +356,111 @@ export class QueueController {
   }
 
   /**
-   * Completion (spec D2): deliver the result notice — with the task's
-   * attachments when it produced any (same contract as the scheduler) — and
-   * delete the task file.
+   * Completion (T4): reads the full accumulation and delivers ONE
+   * `queue.taskCompleted` message — carrying the full accumulated text and
+   * every attachment collected across all messages — then deletes the task
+   * file (fail-and-drop). The run/slot is already released by the caller
+   * (DONE end-run) once this runs.
    */
-  async #completeTask(
-    record: RunRecord,
-    text: string,
-    attachments?: OutboundAttachment[],
-  ): Promise<void> {
-    await this.#deliverToTarget(record.target, {
+  async #completeTask(record: RunRecord): Promise<void> {
+    const { queueName, taskId, target } = record;
+    const fullText = (await record.accumulator.readAll()).trimEnd();
+    const attachments = record.accumulator.collectedAttachments.map((a) => ({
+      kind: "file" as const,
+      filePath: a.filePath,
+      ...(a.fileName !== undefined ? { fileName: a.fileName } : {}),
+    }));
+    await this.#deliverToTarget(target, {
       type: "assistant.message",
-      clientSessionId: record.target,
+      clientSessionId: target,
       text: this.#t("queue.taskCompleted", {
-        queue: record.queueName,
-        taskId: record.taskId,
-        result: text,
+        queue: queueName,
+        taskId,
+        result: fullText,
       }),
-      ...(attachments !== undefined && attachments.length > 0 ? { attachments } : {}),
+      ...(attachments.length > 0 ? { attachments } : {}),
     });
-    await this.#deleteTask(record.queueName, record.taskId);
+    await this.#deleteTask(queueName, taskId);
+    await record.accumulator.dispose();
   }
 
-  /** Failure from a diverted `error` event (spec D2): notice + drop. */
+  /** Failure from a diverted `error` event (T4): notice + partial content + drop. */
   async #failTask(record: RunRecord, reason: string): Promise<void> {
-    await this.#deliverToTarget(
-      record.target,
-      this.#t("queue.taskFailed", { queue: record.queueName, taskId: record.taskId, reason }),
-    );
-    await this.#deleteTask(record.queueName, record.taskId);
+    const { queueName, taskId, target } = record;
+    const base = this.#t("queue.taskFailed", { queue: queueName, taskId, reason });
+    const partial = (await record.accumulator.readAll()).trim();
+    let notice: string;
+    if (partial === "") {
+      notice = base;
+    } else {
+      const completed = this.#t("queue.taskCompleted", {
+        queue: queueName,
+        taskId,
+        result: partial,
+      });
+      notice = `${completed}\n\n${base}`;
+    }
+    await this.#deliverToTarget(target, notice);
+    await this.#deleteTask(queueName, taskId);
+    await record.accumulator.dispose();
   }
 
   async #handleTimeout(sessionId: string): Promise<void> {
     const record = this.#runs.get(sessionId);
     if (record === undefined) return; // run already ended
     this.#runs.delete(sessionId);
+    record.probe.stop();
+    const { queueName, taskId, target } = record;
     this.#logger.warn(
-      `[queue] task "${record.taskId}" of queue "${record.queueName}" timed out after ${this.#runTimeoutMs}ms`,
+      `[queue] task "${taskId}" of queue "${queueName}" timed out after ${this.#runTimeoutMs}ms`,
     );
     // Abort this run's own session (same core command as the scheduler).
     await this.#dispatchSafe({
       type: "command.session.stop",
       clientSessionId: sessionId,
     });
-    await this.#deleteTask(record.queueName, record.taskId);
-    await this.#deliverToTarget(
-      record.target,
-      this.#t("queue.taskTimedOut", { queue: record.queueName, taskId: record.taskId }),
-    );
+    await this.#deleteTask(queueName, taskId);
+
+    // T4: deliver any accumulated partial content alongside the timeout
+    // notice (layer 3 also flushes partial output).
+    const timedOut = this.#t("queue.taskTimedOut", { queue: queueName, taskId });
+    const partial = (await record.accumulator.readAll()).trim();
+    if (partial === "") {
+      await this.#deliverToTarget(target, timedOut);
+    } else {
+      const completed = this.#t("queue.taskCompleted", {
+        queue: queueName,
+        taskId,
+        result: partial,
+      });
+      await this.#deliverToTarget(target, `${completed}\n\n${timedOut}`);
+    }
+    await record.accumulator.dispose();
   }
 
-  /** Registers the run and its timeout timer; `null` when stopped (SF-2). */
+  /** Registers the run, its timeout timer, accumulator and silence probe; `null` when stopped (SF-2). */
   #registerRun(definition: QueueDefinition, task: QueueTask, target: string): RunRecord | null {
     if (!this.#started) return null;
     const sessionId = `${QUEUE_SESSION_PREFIX}${definition.name}:${task.id}`;
+    // T4: per-run output accumulator and silence probe, alongside the
+    // existing wall-clock timeout (the layer-3 backstop). The probe is armed
+    // (poked) at run start so its silence window opens as soon as the run
+    // registers.
+    const probe = createSilenceProbe({
+      silentMs: definition.silenceMs,
+      onProbe: () => {
+        void this.#handleProbe(sessionId);
+      },
+    });
+    probe.poke();
     const record: RunRecord = {
       sessionId,
       queueName: definition.name,
       taskId: task.id,
       target,
+      silentMs: definition.silenceMs,
+      accumulator: createRunAccumulator({ sessionId }),
+      probe,
       timer: setTimeout(() => {
         void this.#handleTimeout(sessionId);
       }, this.#runTimeoutMs),
@@ -374,10 +470,32 @@ export class QueueController {
     return record;
   }
 
+  /**
+   * Layer-2 probe (T4): the silence window elapsed with no run event, so a
+   * probing `user.message` is dispatched into the run session asking it to
+   * either report DONE or keep working. The wall-clock timeout (layer 3)
+   * remains the only backstop — a failed probe dispatch is logged, with no
+   * force-close added.
+   */
+  async #handleProbe(sessionId: string): Promise<void> {
+    const record = this.#runs.get(sessionId);
+    if (record === undefined) return; // run ended before the probe fired
+    const silentMinutes = Math.max(1, Math.round(record.silentMs / 60_000));
+    const result = await this.#dispatchClientEvent({
+      type: "user.message",
+      clientSessionId: sessionId,
+      text: buildProbeMessage(silentMinutes),
+    });
+    if (!result.ok) {
+      this.#logger.warn(`[queue] probe dispatch failed for run "${sessionId}": ${result.reason}`);
+    }
+  }
+
   #endRun(sessionId: string): void {
     const record = this.#runs.get(sessionId);
     if (record === undefined) return;
     clearTimeout(record.timer);
+    record.probe.stop();
     this.#runs.delete(sessionId);
   }
 

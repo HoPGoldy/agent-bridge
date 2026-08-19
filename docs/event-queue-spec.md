@@ -30,6 +30,7 @@ All state lives under `~/.config/agent-bridge/queues/`.
 ---
 channel: feishu-dev        # owning channel; written by `queue add`
 workers: 2                 # max concurrent tasks; integer >= 1, default 1
+silence: 10m               # optional; silence window before a probe (same syntax as timeout, default 10m)
 model: provider/model-id   # optional; blank/absent = channel default model
 target: chat:xxx           # delivery address; written by /queue-here
 ---
@@ -69,12 +70,23 @@ ownership rule as the scheduler).
 - **Fire**: register a run under the synthetic client session id
   `queue:<queueName>:<taskId>`; `dispatchClientEvent` a `session.new`
   (carrying `model` when the queue pins one), check the `IngressResult`;
-  on `ok` dispatch `user.message` with `<queue body>\n\n<task prompt>`.
-  A run carries a timeout timer (same 10-minute default as scheduled tasks).
-- **Completion**: the diverted `assistant.message` delivers the result to the
-  queue's `target` chat (queue + task identified in the notice), deletes the
-  task file and ends the run. With `workers > 1` results are delivered in
-  completion order (may be out of FIFO order) — documented, not enforced.
+  on `ok` dispatch `user.message` with `<queue body>\n\n<task prompt>\n\n<completion-protocol block>` (the body is empty when blank; the fixed protocol block is the T4 DONE-marker instruction).
+  A run carries a timeout timer (same 10-minute default as scheduled tasks)
+  and a silence probe (`silence` front matter, default 10m).
+- **Completion (three-layer protocol, T4)**: the old "first
+  `assistant.message` ends the run" semantics is gone. Every `assistant.message`
+  is accumulated into a per-run file under `run-outputs/`; a run completes only
+  when the agent appends `BRIDGE_TASK_STATUS_DONE` as the last line of its
+  final message. The controller then delivers ONE message to the queue's
+  `target` chat (queue + task identified in the notice) carrying the FULL
+  accumulated transcript — including the silence-probe Q&A — deletes the task
+  file and ends the run. After `silence` minutes without any run event the
+  controller sends a probe `user.message` into the session asking whether the
+  task is finished; the probe is accumulated like any other message. The worker
+  slot is held until DONE/failure/timeout (WAITING, decided), so with
+  `workers: 1` a second task cannot fire between the first message and DONE.
+  With `workers > 1` results are delivered in completion order (may be out of
+  FIFO order) — documented, not enforced.
 - **Failure (fail-and-drop, decided)**: any failed synthetic dispatch
   (`IngressResult.ok === false` for either `session.new` or the follow-up
   `user.message`), a runtime `error` event, or a timeout → end the run,

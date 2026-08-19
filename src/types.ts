@@ -176,7 +176,6 @@ export interface AgentAdapter {
   getAvailableModels?(): Promise<AgentAvailableModel[]>;
   setModel?(target: string): Promise<{ provider: string; modelId: string }>;
   input(event: AgentInputEvent): Promise<void>;
-  isBusy(): Promise<boolean>;
 }
 
 export interface ConfigSelectOption {

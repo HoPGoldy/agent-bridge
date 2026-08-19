@@ -28,6 +28,9 @@ export const SCHEDULES_DIR = path.join(os.homedir(), ".config", "agent-bridge", 
 /** Root directory of event queue files (`queues/<name>.md` + `<name>.tasks/`, spec D1). */
 export const QUEUES_DIR = path.join(os.homedir(), ".config", "agent-bridge", "queues");
 
+/** Root directory of per-run output accumulation files (`run-outputs/<sanitizedSessionId>.md`). */
+export const RUN_OUTPUTS_DIR = path.join(os.homedir(), ".config", "agent-bridge", "run-outputs");
+
 /** Bridge agent session id prefixes for the built-in agent modules. */
 const KNOWN_AGENT_TYPE_PREFIXES: ReadonlyArray<readonly [prefix: string, agentType: string]> = [
   ["pi-coding-agent:", "pi-coding-agent"],

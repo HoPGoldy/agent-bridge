@@ -65,6 +65,7 @@ A queue definition is front matter plus a body:
 ---
 channel: feishu-dev        # owning channel; required
 workers: 2                 # max concurrent tasks; integer >= 1, default 1
+silence: 10m               # optional; silence window before a probe (same syntax as timeout, default 10m)
 model: azure-openai-responses/gpt-5.6-terra   # optional; blank/absent = channel default model
 target: feishu:dm:oc_6f9d408e630098e6dd06bb071d6b60fc   # written by /queue-here
 ---
@@ -81,10 +82,11 @@ You are the release bot. Always answer in one short paragraph.
 | --- | --- | --- | --- |
 | `channel` | yes | — | Owning channel config name, written by `queue add`. Only that channel's controller consumes the queue (and its tasks). Missing → the queue is skipped with a log. |
 | `workers` | no | `1` | Max concurrent tasks, integer >= 1. On each tick the controller starts up to `workers - inFlight` new tasks. |
+| `silence` | no | `10m` | Silence window before a probe is sent into a run: same duration syntax as `timeout`. After this many minutes with no observable run activity, the controller asks the run whether it is finished (see [Completion](#completion)). An invalid value fails validation and the queue is skipped with a log. |
 | `model` | no | — | Optional per-queue agent model override for every run of the queue (same override plumbing as scheduled tasks' per-task model). Blank or absent = the channel agent config's model. Parsing only checks for a non-empty string; validity is enforced at fire time — an invalid model fails the session creation, which fails the task (see [Failure: fail-and-drop](#failure-fail-and-drop)). |
 | `target` | no | — | Delivery address: the destination chat's clientSessionId, written by `/queue-here <name>` sent in that chat. Without it the queue is never consumed — tasks pile up until a chat is bound. |
 
-`queue add` writes the front matter with `channel`, `workers` (default `1`) and `model` (only if you entered a non-empty one), plus an empty body. It does not write `target` — that line is meant to be set with `/queue-here <name>` (or edited by hand; see [Changing the destination chat](#changing-the-destination-chat)).
+`queue add` writes the front matter with `channel`, `workers` (default `1`) and `model` (only if you entered a non-empty one), plus an empty body. It does not offer a `silence` prompt — that field is set (and tuned) by editing the file, defaulting to `10m`. It does not write `target` — that line is meant to be set with `/queue-here <name>` (or edited by hand; see [Changing the destination chat](#changing-the-destination-chat)).
 
 ## Task files
 
@@ -135,12 +137,18 @@ A bound queue cannot be rebound with `/queue-here`. To move it to another chat, 
 The per-channel queue controller runs next to the scheduler and only consumes queues whose `channel` matches its channel. Each task runs in a **fresh, fully isolated agent session**:
 
 1. On its tick the controller reloads the queue definitions and, for every bound queue (`target` set), computes **capacity = workers − inFlight**, takes the oldest `pending` tasks up to that capacity, marks them `running`, and fires each.
-2. **Fire** injects two synthetic events through the same ingress path ordinary chat messages use: a `command.session.new` with the bridge process's working directory and the queue's pinned `model` (when it has one) — the override rides the same event into the agent-session creation, so only this queue's runs use it — followed by a `user.message` whose text is `<queue body>\n\n<task prompt>` (the bare prompt when the body is empty). Both carry a synthetic, run-unique client session id of the form `queue:<queue-name>:<task-id>`.
-3. Each run carries a timeout timer — the same 10-minute default as scheduled tasks. The run ends by completing, failing, or timing out.
+2. **Fire** injects two synthetic events through the same ingress path ordinary chat messages use: a `command.session.new` with the bridge process's working directory and the queue's pinned `model` (when it has one) — the override rides the same event into the agent-session creation, so only this queue's runs use it — followed by a `user.message` whose text is `<queue body>\n\n<task prompt>` (the bare prompt when the body is empty), wrapped with the fixed completion-protocol instruction block. Both carry a synthetic, run-unique client session id of the form `queue:<queue-name>:<task-id>`.
+3. Each run carries a timeout timer — the same 10-minute default as scheduled tasks — and a silence probe (`silence` front matter, default `10m`). A run ends by completing, failing, or timing out.
 
 ### Completion
 
-The run's final `assistant.message` is diverted to the controller, which delivers the result to the queue's `target` chat as a normal `assistant.message` prefixed with a one-line header (`✅ Queue "<name>" · task <id> completed:`), deletes the task file, and ends the run. Attachments, chunking and formatting behave exactly like a normal agent reply.
+Assistant output no longer completes a task on its own: **a task completes only when the agent signals it is done.** Each task prompt is wrapped with a fixed completion-protocol instruction block, and every assistant message during the run is accumulated into a per-run local file under `run-outputs/` (shared with scheduled tasks; see `docs/scheduled-tasks.md`). The agent finishes its final `assistant.message` with the marker line `BRIDGE_TASK_STATUS_DONE` as its last line; the controller then delivers the **full accumulated transcript** to the queue's `target` chat exactly once, as a normal `assistant.message` prefixed with a one-line header (`✅ Queue "<name>" · task <id> completed:`), deletes the task file, and ends the run. Attachments and formatting from every accumulated message behave exactly like a normal agent reply. A marker in an intermediate (non-last) line is *not* a completion signal.
+
+**Waiting on async work.** The protocol block tells the agent to work until the task is fully complete, including async follow-ups (background jobs, sub-agents, external callbacks), and to append `BRIDGE_TASK_STATUS_DONE` only when it truly is. So a task waiting on asynchronous callbacks should simply **not emit DONE until they return** — the run stays alive and keeps accumulating.
+
+**The silence probe.** After `silence` minutes without any observable run activity, the controller sends a probe message into the run session asking whether the task is finished (reply DONE, or keep working / keep waiting for async callbacks). Any run event — an assistant message, tool progress, or a probe answer — resets the silence window. The probe Q&A is accumulated and included in the delivered transcript. An unanswered probe is harmless: the wall-clock timeout remains the only cap.
+
+**The worker slot is held until the run ends.** A run holds its worker slot until DONE, failure or timeout — not just until its first message. With `workers: 1`, a second task cannot fire between the first assistant message and the DONE marker; with `workers > 1`, capacity (`workers − inFlight`) is computed against in-flight runs, so waiting tasks do not consume extra concurrency.
 
 ### Failure: fail-and-drop
 
@@ -167,7 +175,7 @@ A queue with no `target` is never consumed: tasks accumulate (each `queue insert
 The controller reloads queue definitions on every tick, so:
 
 - **Edited body (shared context)** → used for every task fired after the next tick.
-- **Edited front matter** (`workers`, `model`, `target`) → effective on the next tick; no channel restart needed.
+- **Edited front matter** (`workers`, `silence`, `model`, `target`) → effective on the next tick; no channel restart needed.
 - **New or deleted task files** → appear/disappear on the next tick. Deleting a task file mid-run does not interrupt the in-flight run.
 - There is no file-system watching; 30 s polling is cheap and predictable.
 

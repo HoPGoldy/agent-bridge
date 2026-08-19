@@ -49,7 +49,7 @@ describe("config store", () => {
     const config = await loadConfig();
 
     expect(config.defaults.allowedWorkingDirectoryRoots).toBeUndefined();
-    expect(config.defaults.agentIdleTimeoutMs).toBe(10 * 60 * 1000);
+    expect(config.defaults.agentIdleTimeoutMs).toBe(24 * 60 * 60 * 1000);
   });
 
   it("trims, drops empty entries, and dedupes allowedWorkingDirectoryRoots", async () => {
