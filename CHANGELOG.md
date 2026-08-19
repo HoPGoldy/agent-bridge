@@ -2,6 +2,14 @@
 
 All notable changes to this project will be documented in this file. See [commit-and-tag-version](https://github.com/absolute-version/commit-and-tag-version) for commit guidelines.
 
+## [0.8.4](https://github.com/HoPGoldy/agent-bridge/compare/v0.8.3...v0.8.4) (2026-08-19)
+
+
+### Bug Fixes
+
+* **weixin:** guard heartbeat self-stop on timer identity ([8b14846](https://github.com/HoPGoldy/agent-bridge/commit/8b14846a192f57f7e0fc461705bd5791ddae17a3))
+* **weixin:** make typing indicators crash-safe ([09b41ec](https://github.com/HoPGoldy/agent-bridge/commit/09b41ec64d44ea16f49c1c1dbb7734ddfe576b93))
+
 ## [0.8.3](https://github.com/HoPGoldy/agent-bridge/compare/v0.8.2...v0.8.3) (2026-08-19)
 
 
