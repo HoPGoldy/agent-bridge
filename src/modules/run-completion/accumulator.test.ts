@@ -66,6 +66,21 @@ describe("createRunAccumulator", () => {
       { filePath: "/tmp/report.pdf", fileName: "report.pdf" },
       { filePath: "/tmp/chart.png" },
     ]);
+    // lastMessage tracks the most recently appended message (marker already
+    // stripped by the caller) — what a controller delivers.
+    expect(accumulator.lastMessage).toBe("final with marker");
+  });
+
+  it("tracks lastMessage across appends (last write wins)", async () => {
+    const dir = await makeOutputsDir();
+    const accumulator = createRunAccumulator({ sessionId: "schedule:t:9", outputsDir: dir });
+    expect(accumulator.lastMessage).toBe("");
+    await accumulator.append("first");
+    expect(accumulator.lastMessage).toBe("first");
+    await accumulator.append("");
+    expect(accumulator.lastMessage).toBe("");
+    await accumulator.append("third");
+    expect(accumulator.lastMessage).toBe("third");
   });
 
   it("writes the file under the outputs dir (created lazily)", async () => {
@@ -110,24 +125,9 @@ describe("createRunAccumulator", () => {
     expect(await a.readAll()).toBe("mine\n\n");
   });
 
-  it("dispose deletes the accumulation file and is idempotent", async () => {
-    const dir = await makeOutputsDir();
-    const accumulator = createRunAccumulator({ sessionId: "schedule:t:1", outputsDir: dir });
-    await accumulator.append("temp");
-    await accumulator.dispose();
-    await expect(stat(accumulator.filePath)).rejects.toMatchObject({ code: "ENOENT" });
-    await expect(accumulator.dispose()).resolves.toBeUndefined();
-  });
-
-  it("dispose does not touch sibling files", async () => {
-    const dir = await makeOutputsDir();
-    const a = createRunAccumulator({ sessionId: "queue:q:1-a", outputsDir: dir });
-    const b = createRunAccumulator({ sessionId: "queue:q:2-b", outputsDir: dir });
-    await a.append("a");
-    await b.append("b");
-    await a.dispose();
-    expect(await b.readAll()).toBe("b\n\n");
-  });
+  // T2 decision: accumulation files are KEPT after delivery and on stop —
+  // there is no dispose(). The file is a durable transcript that the delivery
+  // suffix references.
 
   it("collects attachments from every message in arrival order", async () => {
     const dir = await makeOutputsDir();

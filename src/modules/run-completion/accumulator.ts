@@ -2,7 +2,9 @@
  * Run output accumulator (decided in `docs/grill-context/qa-log.md`,
  * 2026-08-19（二）, decision 3): during a run, every assistant message
  * (including silence-probe Q&A) is appended to a per-run Markdown file under
- * `RUN_OUTPUTS_DIR`; the full file is delivered once when the run ends.
+ * `RUN_OUTPUTS_DIR`. The accumulator tracks the LAST appended message (used
+ * for delivery) and the full file is kept as a durable transcript; the
+ * delivery suffix references the file so recipients can read the whole run.
  *
  * Pure fs, no gateway dependencies: the controllers (scheduler T3, queue
  * controller T4) own the run lifecycle and call `append` on every
@@ -19,7 +21,7 @@
  * guarantee for a log-structured file.
  */
 
-import { appendFile, mkdir, readFile, unlink } from "node:fs/promises";
+import { appendFile, mkdir, readFile } from "node:fs/promises";
 import path from "node:path";
 import type { OutboundAttachment } from "../../types";
 import { RUN_OUTPUTS_DIR } from "../../config/channel-state";
@@ -49,10 +51,10 @@ export interface RunAccumulator {
   append(text: string, attachments?: readonly OutboundAttachment[]): Promise<void>;
   /** Attachments collected from every appended message, in arrival order. */
   readonly collectedAttachments: readonly CollectedAttachment[];
-  /** Reads everything accumulated so far (final delivery). */
+  /** The last appended message's text (marker already stripped). */
+  readonly lastMessage: string;
+  /** Reads everything accumulated so far. */
   readAll(): Promise<string>;
-  /** Deletes the accumulation file (idempotent). */
-  dispose(): Promise<void>;
 }
 
 export interface RunAccumulatorOptions {
@@ -68,14 +70,18 @@ export function createRunAccumulator(options: RunAccumulatorOptions): RunAccumul
   const filePath = path.join(dir, `${sanitizeSessionId(options.sessionId)}.md`);
 
   // The file accumulates text; attachments are collected for the final
-  // delivery (read back via `collectedAttachments`).
+  // delivery (read back via `collectedAttachments`). `last` tracks the most
+  // recently appended message so a controller can deliver only that one
+  // while the file keeps the whole run.
   const collected: CollectedAttachment[] = [];
+  let last = "";
 
   async function append(text: string, messageAttachments?: readonly OutboundAttachment[]): Promise<void> {
     for (const attachment of messageAttachments ?? []) {
       collected.push({ filePath: attachment.filePath, ...(attachment.fileName !== undefined ? { fileName: attachment.fileName } : {}) });
     }
     await mkdir(dir, { recursive: true });
+    last = text;
     const block = text.trim() === "" ? "\n" : `${text}\n\n`;
     await appendFile(filePath, block, "utf8");
   }
@@ -86,6 +92,9 @@ export function createRunAccumulator(options: RunAccumulatorOptions): RunAccumul
     get collectedAttachments(): readonly CollectedAttachment[] {
       return collected;
     },
+    get lastMessage(): string {
+      return last;
+    },
     async readAll(): Promise<string> {
       try {
         return await readFile(filePath, "utf8");
@@ -95,13 +104,6 @@ export function createRunAccumulator(options: RunAccumulatorOptions): RunAccumul
         }
         throw error;
       }
-    },
-    async dispose(): Promise<void> {
-      await unlink(filePath).catch((error: unknown) => {
-        if ((error as NodeJS.ErrnoException)?.code !== "ENOENT") {
-          throw error;
-        }
-      });
     },
   };
 }

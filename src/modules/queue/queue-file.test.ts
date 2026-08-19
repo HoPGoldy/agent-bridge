@@ -17,7 +17,7 @@ import {
   loadQueueDefinition,
   parseQueueDefinition,
   parseQueueTaskFile,
-  setQueueTarget,
+  bindQueue,
   setQueueTaskState,
   writeQueueDefinition,
 } from "./queue-file";
@@ -185,13 +185,23 @@ Body.
     expect(definition).toBeNull();
   });
 
-  it("rejects a definition missing the channel", () => {
-    const { definition, errors } = parseQueueDefinition(
+  it("accepts a definition without the channel field (unbound queue, T1)", () => {
+    const { definition, errors, warnings } = parseQueueDefinition(
       "nofm.md",
       "---\nworkers: 2\n---\nBody.\n",
     );
-    expect(errors).toEqual(['missing required front matter key "channel"']);
-    expect(definition).toBeNull();
+    expect(errors).toEqual([]);
+    expect(warnings).toEqual([]);
+    expect(definition).toEqual({
+      name: "nofm",
+      channel: undefined,
+      workers: 2,
+      silenceMs: DEFAULT_SILENCE_MS,
+      model: undefined,
+      target: undefined,
+      body: "Body.",
+      filePath: "",
+    });
   });
 
   it("rejects invalid workers values (0, negative, non-integer, garbage)", () => {
@@ -349,24 +359,22 @@ describe("listQueueDefinitions", () => {
     expect(warnSpy).not.toHaveBeenCalled();
   });
 
-  it("skips invalid definitions (missing channel, bad workers) with a log", async () => {
+  it("skips invalid definitions (bad workers) with a log, keeping channel-less queues (T1)", async () => {
     const root = await mkdtemp(path.join(os.tmpdir(), "agent-bridge-queues-"));
     tmpDirs.push(root);
     await writeFile(path.join(root, "good.md"), "---\nchannel: feishu-dev\n---\nGood.\n", "utf8");
+    // A queue without `channel` is valid now (unbound, owned by no controller).
     await writeFile(path.join(root, "nochan.md"), "---\nworkers: 2\n---\nNo channel.\n", "utf8");
     await writeFile(path.join(root, "badworkers.md"), "---\nchannel: feishu-dev\nworkers: 0\n---\nBad.\n", "utf8");
 
     const definitions = await listQueueDefinitions(root);
-    expect(definitions.map((d) => d.name)).toEqual(["good"]);
-    expect(warnSpy).toHaveBeenCalledTimes(2);
+    expect(definitions.map((d) => d.name)).toEqual(["good", "nochan"]);
+    expect(definitions.find((d) => d.name === "nochan")?.channel).toBeUndefined();
+    expect(warnSpy).toHaveBeenCalledTimes(1);
     const messages = warnSpy.mock.calls.map((call) => String(call[0]));
     for (const message of messages) {
       expect(message).toContain("[queue] skipping");
     }
-    // readdir order is not guaranteed, so match on content, not call order.
-    expect(messages.some((m) => m.includes('missing required front matter key "channel"'))).toBe(
-      true,
-    );
     expect(messages.some((m) => m.includes('invalid workers "0": must be an integer >= 1'))).toBe(
       true,
     );
@@ -454,18 +462,20 @@ describe("writeQueueDefinition", () => {
     }
   });
 
-  it("creates a queue file with channel and default workers, model omitted", async () => {
+  it("creates a queue file with default workers and no channel (T1)", async () => {
     const root = await mkdtemp(path.join(os.tmpdir(), "agent-bridge-queues-"));
     tmpDirs.push(root);
-    const result = await writeQueueDefinition({ name: "ops", channel: "feishu-dev" }, root);
+    const result = await writeQueueDefinition({ name: "ops" }, root);
     expect(result).toEqual({ ok: true, filePath: path.join(root, "ops.md") });
 
     const content = await readFile(path.join(root, "ops.md"), "utf8");
-    expect(content).toBe("---\nchannel: feishu-dev\nworkers: 1\n---\n\n");
+    expect(content).toBe("---\nworkers: 1\n---\n\n");
+    expect(content).not.toContain("channel:");
     const definition = await loadQueueDefinition("ops", root);
     expect(definition?.workers).toBe(1);
     expect(definition?.model).toBeUndefined();
     expect(definition?.body).toBe("");
+    expect(definition?.channel).toBeUndefined();
   });
 
   it("writes workers, model and body when provided", async () => {
@@ -474,7 +484,6 @@ describe("writeQueueDefinition", () => {
     const result = await writeQueueDefinition(
       {
         name: "ops",
-        channel: "wecom-dev",
         workers: 3,
         model: "azure-openai-responses/gpt-5.6-terra",
         body: "Shared context.",
@@ -491,38 +500,32 @@ describe("writeQueueDefinition", () => {
   it("refuses to overwrite an existing queue", async () => {
     const root = await mkdtemp(path.join(os.tmpdir(), "agent-bridge-queues-"));
     tmpDirs.push(root);
-    await writeQueueDefinition({ name: "ops", channel: "feishu-dev" }, root);
-    const result = await writeQueueDefinition(
-      { name: "ops", channel: "wecom-dev", workers: 9 },
-      root,
-    );
+    await writeQueueDefinition({ name: "ops" }, root);
+    const result = await writeQueueDefinition({ name: "ops", workers: 9 }, root);
     expect(result).toEqual({ ok: false, reason: 'queue "ops" already exists' });
     // The original file is untouched.
     const definition = await loadQueueDefinition("ops", root);
-    expect(definition?.channel).toBe("feishu-dev");
+    expect(definition?.channel).toBeUndefined();
     expect(definition?.workers).toBe(1);
   });
 
   it("returns error results for invalid input", async () => {
     const root = await mkdtemp(path.join(os.tmpdir(), "agent-bridge-queues-"));
     tmpDirs.push(root);
-    expect(await writeQueueDefinition({ name: "Bad_Name", channel: "feishu-dev" }, root)).toEqual({
+    expect(await writeQueueDefinition({ name: "Bad_Name" }, root)).toEqual({
       ok: false,
       reason: "invalid queue name",
     });
-    expect(await writeQueueDefinition({ name: "ops", channel: "  " }, root)).toEqual({
-      ok: false,
-      reason: "channel must be a non-empty string",
-    });
     for (const workers of [0, -1, 2.5]) {
-      expect(await writeQueueDefinition({ name: "ops", channel: "feishu-dev", workers }, root)).toEqual({
+      expect(await writeQueueDefinition({ name: "ops", workers }, root)).toEqual({
         ok: false,
         reason: "workers must be an integer >= 1",
       });
     }
-    expect(
-      await writeQueueDefinition({ name: "ops", channel: "feishu-dev", model: "  " }, root),
-    ).toEqual({ ok: false, reason: "model must be a non-empty string when present" });
+    expect(await writeQueueDefinition({ name: "ops", model: "  " }, root)).toEqual({
+      ok: false,
+      reason: "model must be a non-empty string when present",
+    });
   });
 });
 
@@ -544,7 +547,7 @@ describe("insertQueueTask / listQueueTasks", () => {
   it("creates the tasks directory and task file on demand with a well-formed id", async () => {
     const root = await mkdtemp(path.join(os.tmpdir(), "agent-bridge-queues-"));
     tmpDirs.push(root);
-    await writeQueueDefinition({ name: "ops", channel: "feishu-dev" }, root);
+    await writeQueueDefinition({ name: "ops" }, root);
 
     const taskId = await insertQueueTask("ops", "Run the migration.", root);
     expect(isValidTaskId(taskId)).toBe(true);
@@ -566,7 +569,7 @@ describe("insertQueueTask / listQueueTasks", () => {
   it("inserts tasks with distinct, monotonic ids and lists them in FIFO order", async () => {
     const root = await mkdtemp(path.join(os.tmpdir(), "agent-bridge-queues-"));
     tmpDirs.push(root);
-    await writeQueueDefinition({ name: "ops", channel: "feishu-dev" }, root);
+    await writeQueueDefinition({ name: "ops" }, root);
 
     const ids: string[] = [];
     for (const prompt of ["first", "second", "third"]) {
@@ -601,7 +604,7 @@ describe("insertQueueTask / listQueueTasks", () => {
   it("rejects an empty prompt", async () => {
     const root = await mkdtemp(path.join(os.tmpdir(), "agent-bridge-queues-"));
     tmpDirs.push(root);
-    await writeQueueDefinition({ name: "ops", channel: "feishu-dev" }, root);
+    await writeQueueDefinition({ name: "ops" }, root);
     await expect(insertQueueTask("ops", "   ", root)).rejects.toThrow(
       "task prompt must be a non-empty string",
     );
@@ -617,7 +620,7 @@ describe("insertQueueTask / listQueueTasks", () => {
   it("skips task files with an invalid state with a log", async () => {
     const root = await mkdtemp(path.join(os.tmpdir(), "agent-bridge-queues-"));
     tmpDirs.push(root);
-    await writeQueueDefinition({ name: "ops", channel: "feishu-dev" }, root);
+    await writeQueueDefinition({ name: "ops" }, root);
     await insertQueueTask("ops", "good", root);
     await writeFile(
       path.join(root, "ops.tasks", "1724000000000-dead.md"),
@@ -649,7 +652,7 @@ describe("setQueueTaskState / deleteQueueTask", () => {
   });
 
   async function setUpQueue(root: string): Promise<string> {
-    await writeQueueDefinition({ name: "ops", channel: "feishu-dev" }, root);
+    await writeQueueDefinition({ name: "ops" }, root);
     return insertQueueTask("ops", "Run the migration.", root);
   }
 
@@ -686,7 +689,7 @@ describe("setQueueTaskState / deleteQueueTask", () => {
   it("deletes a task file", async () => {
     const root = await mkdtemp(path.join(os.tmpdir(), "agent-bridge-queues-"));
     tmpDirs.push(root);
-    await writeQueueDefinition({ name: "ops", channel: "feishu-dev" }, root);
+    await writeQueueDefinition({ name: "ops" }, root);
     const first = await insertQueueTask("ops", "first", root);
     const second = await insertQueueTask("ops", "second", root);
 
@@ -698,7 +701,7 @@ describe("setQueueTaskState / deleteQueueTask", () => {
   it("throws for missing tasks and invalid ids", async () => {
     const root = await mkdtemp(path.join(os.tmpdir(), "agent-bridge-queues-"));
     tmpDirs.push(root);
-    await writeQueueDefinition({ name: "ops", channel: "feishu-dev" }, root);
+    await writeQueueDefinition({ name: "ops" }, root);
     await expect(setQueueTaskState("ops", "1724000000000-ab12", "running", root)).rejects.toThrow(
       'task "1724000000000-ab12" not found in queue "ops"',
     );
@@ -714,7 +717,7 @@ describe("setQueueTaskState / deleteQueueTask", () => {
   });
 });
 
-describe("setQueueTarget", () => {
+describe("bindQueue", () => {
   const tmpDirs: string[] = [];
 
   afterEach(async () => {
@@ -742,19 +745,24 @@ Body line 2 with 中文 🎉
     );
   }
 
-  it("replaces an existing target line, preserving body and other front matter byte-for-byte", async () => {
+  it("writes BOTH channel and target in one atomic write, replacing existing lines", async () => {
     const root = await mkdtemp(path.join(os.tmpdir(), "agent-bridge-queues-"));
     tmpDirs.push(root);
     await writeBoundQueue(root);
 
-    const result = await setQueueTarget("ops", "feishu:dm:oc_6f9d408e630098e6dd06bb071d6b60fc", root);
+    const result = await bindQueue(
+      "ops",
+      "wecom-main",
+      "feishu:dm:oc_6f9d408e630098e6dd06bb071d6b60fc",
+      root,
+    );
     expect(result).toEqual({ ok: true });
 
     const updated = await readFile(path.join(root, "ops.md"), "utf8");
     expect(updated).toBe(
       `---
 # keep this comment
-channel: feishu-dev
+channel: wecom-main
 workers: 2
 model: azure-openai-responses/gpt-5.6-terra
 target: feishu:dm:oc_6f9d408e630098e6dd06bb071d6b60fc
@@ -766,19 +774,19 @@ Body line 2 with 中文 🎉
 `,
     );
     const definition = await loadQueueDefinition("ops", root);
+    expect(definition?.channel).toBe("wecom-main");
     expect(definition?.target).toBe("feishu:dm:oc_6f9d408e630098e6dd06bb071d6b60fc");
     expect(definition?.model).toBe("azure-openai-responses/gpt-5.6-terra");
     expect(definition?.workers).toBe(2);
     expect(definition?.body).toBe("Body line 1\n\nBody line 2 with 中文 🎉");
   });
 
-  it("inserts a target line just before the closing --- when none exists", async () => {
+  it("binds a channel-less queue: inserts channel and target lines before the closing ---", async () => {
     const root = await mkdtemp(path.join(os.tmpdir(), "agent-bridge-queues-"));
     tmpDirs.push(root);
     await writeFile(
       path.join(root, "ops.md"),
       `---
-channel: feishu-dev
 workers: 2
 ---
 
@@ -787,57 +795,67 @@ Body.
       "utf8",
     );
 
-    const result = await setQueueTarget("ops", "feishu:group:oc_123", root);
+    const result = await bindQueue("ops", "feishu-dev", "feishu:group:oc_123", root);
     expect(result).toEqual({ ok: true });
     const updated = await readFile(path.join(root, "ops.md"), "utf8");
     expect(updated).toBe(
       `---
-channel: feishu-dev
 workers: 2
+channel: feishu-dev
 target: feishu:group:oc_123
 ---
 
 Body.
 `,
     );
-    expect((await loadQueueDefinition("ops", root))?.target).toBe("feishu:group:oc_123");
+    const definition = await loadQueueDefinition("ops", root);
+    expect(definition?.channel).toBe("feishu-dev");
+    expect(definition?.target).toBe("feishu:group:oc_123");
   });
 
-  it("creates a front matter block when the file has none", async () => {
+  it("creates a front matter block with both channel and target when the file has none", async () => {
     const root = await mkdtemp(path.join(os.tmpdir(), "agent-bridge-queues-"));
     tmpDirs.push(root);
     await writeFile(path.join(root, "ops.md"), "Just a raw body.\n", "utf8");
 
-    const result = await setQueueTarget("ops", "wecom:dm:oc_xyz", root);
+    const result = await bindQueue("ops", "feishu-dev", "wecom:dm:oc_xyz", root);
     expect(result).toEqual({ ok: true });
     const updated = await readFile(path.join(root, "ops.md"), "utf8");
-    expect(updated).toBe("---\ntarget: wecom:dm:oc_xyz\n---\nJust a raw body.\n");
+    expect(updated).toBe(
+      "---\nchannel: feishu-dev\ntarget: wecom:dm:oc_xyz\n---\nJust a raw body.\n",
+    );
   });
 
-  it("re-binding replaces the previous target", async () => {
+  it("re-binding replaces the previous channel and target, one line each", async () => {
     const root = await mkdtemp(path.join(os.tmpdir(), "agent-bridge-queues-"));
     tmpDirs.push(root);
     await writeBoundQueue(root);
-    await setQueueTarget("ops", "feishu:dm:oc_first", root);
-    await setQueueTarget("ops", "feishu:dm:oc_second", root);
+    await bindQueue("ops", "a", "feishu:dm:oc_first", root);
+    await bindQueue("ops", "b", "feishu:dm:oc_second", root);
     const updated = await readFile(path.join(root, "ops.md"), "utf8");
     expect(updated.match(/target:/g)).toHaveLength(1);
+    expect(updated.match(/channel:/g)).toHaveLength(1);
+    expect(updated).toContain("channel: b");
     expect(updated).toContain("target: feishu:dm:oc_second");
     expect(updated).toContain("Body line 1");
   });
 
-  it("returns error results for a missing queue, invalid name and empty target", async () => {
+  it("returns error results for a missing queue, invalid name, empty channel and empty target", async () => {
     const root = await mkdtemp(path.join(os.tmpdir(), "agent-bridge-queues-"));
     tmpDirs.push(root);
-    expect(await setQueueTarget("ghost", "feishu:dm:oc_1", root)).toEqual({
+    expect(await bindQueue("ghost", "feishu-dev", "feishu:dm:oc_1", root)).toEqual({
       ok: false,
       reason: "queue not found",
     });
-    expect(await setQueueTarget("Bad_Name", "feishu:dm:oc_1", root)).toEqual({
+    expect(await bindQueue("Bad_Name", "feishu-dev", "feishu:dm:oc_1", root)).toEqual({
       ok: false,
       reason: "invalid queue name",
     });
-    expect(await setQueueTarget("ghost", "   ", root)).toEqual({
+    expect(await bindQueue("ops", "   ", "feishu:dm:oc_1", root)).toEqual({
+      ok: false,
+      reason: "channel must be a non-empty string",
+    });
+    expect(await bindQueue("ops", "feishu-dev", "   ", root)).toEqual({
       ok: false,
       reason: "target must be a non-empty string",
     });

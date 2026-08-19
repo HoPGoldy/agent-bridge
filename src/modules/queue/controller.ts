@@ -72,6 +72,8 @@ export interface QueueControllerOptions {
   t: Translator;
   /** Overridable queues root (defaults to the shared `QUEUES_DIR`). */
   queuesRoot?: string;
+  /** Overridable run-outputs root for the per-run accumulator (tests). */
+  outputsDir?: string;
   logger?: Logger;
 }
 
@@ -100,6 +102,7 @@ export class QueueController {
   readonly #t: Translator;
   readonly #logger: Logger;
   readonly #queuesRoot?: string;
+  readonly #outputsDir?: string;
 
   /** Active runs keyed by their run-unique synthetic session id. */
   readonly #runs = new Map<string, RunRecord>();
@@ -115,6 +118,7 @@ export class QueueController {
     this.#deliver = options.deliver;
     this.#t = options.t;
     this.#queuesRoot = options.queuesRoot;
+    this.#outputsDir = options.outputsDir;
     this.#logger = options.logger ?? createLogger("queue");
   }
 
@@ -137,7 +141,7 @@ export class QueueController {
    * timers). In-flight runs are forgotten; their task files stay `running`
    * and are re-enqueued at the next start (spec D2). No delivery happens
    * after stop (same contract as the scheduler, T6); probe timers are
-   * stopped and accumulators disposed WITHOUT delivering their content.
+   * stopped and the accumulation files are KEPT (they may hold partial work).
    */
   async stop(): Promise<void> {
     this.#started = false;
@@ -148,9 +152,9 @@ export class QueueController {
     for (const record of this.#runs.values()) {
       clearTimeout(record.timer);
       record.probe.stop();
-      // Stop contract (T4, unchanged): dispose accumulators WITHOUT
-      // delivering their accumulated content.
-      await record.accumulator.dispose();
+      // Stop contract (T4, unchanged): nothing is delivered after stop, and
+      // the accumulation file is KEPT — it may hold partial work that is
+      // still readable at run-outputs/<run-id>.md.
     }
     this.#runs.clear();
   }
@@ -161,9 +165,10 @@ export class QueueController {
    *
    * `assistant.message` no longer ends the run: it is classified against the
    * DONE-marker protocol, appended to the run's accumulator and pokes the
-   * silence probe. When DONE is detected the run ends, ONE `queue.taskCompleted`
-   * message with the full accumulated text (plus all attachments) is
-   * delivered, the task file is deleted and the worker slot is freed — the
+   * silence probe. When DONE is detected the run ends, ONE delivery (content
+   * plus a trailing italic one-liner via `queue.taskCompletedSuffix`) with the
+   * full accumulated text (plus all attachments) is delivered, the task file
+   * is deleted and the worker slot is freed — the
    * slot is held until DONE/failure/timeout (WAITING, decided), so with
    * `workers=1` a second task cannot fire between the first message and DONE.
    * A terminal `error` delivers a localized failure notice with any
@@ -349,60 +354,73 @@ export class QueueController {
     this.#logger.warn(`[queue] task "${record.taskId}" of queue "${record.queueName}" failed: ${reason}`);
     if (!this.#started) return;
     await this.#deleteTask(record.queueName, record.taskId);
+    // T1: content first (the real reason), then a trailing italic one-liner
+    // referencing the kept accumulation file.
     await this.#deliverToTarget(
       record.target,
-      this.#t("queue.taskFailed", { queue: record.queueName, taskId: record.taskId, reason }),
+      `${reason}\n\n${this.#t("queue.taskFailedSuffix", {
+        queue: record.queueName,
+        path: record.accumulator.filePath,
+      })}`,
     );
   }
 
   /**
-   * Completion (T4): reads the full accumulation and delivers ONE
-   * `queue.taskCompleted` message — carrying the full accumulated text and
-   * every attachment collected across all messages — then deletes the task
-   * file (fail-and-drop). The run/slot is already released by the caller
-   * (DONE end-run) once this runs.
+   * Completion (T4): delivers the run's LAST assistant message (marker
+   * stripped) plus an italic suffix referencing the kept accumulation file
+   * (or the suffix alone when the last message is empty), carrying every
+   * attachment collected across all messages, then deletes the task file
+   * (fail-and-drop). The run/slot is already released by the caller (DONE
+   * end-run) once this runs. T1: content first, then a trailing italic
+   * one-liner — no prefix header, task id dropped from the attribution.
    */
   async #completeTask(record: RunRecord): Promise<void> {
     const { queueName, taskId, target } = record;
-    const fullText = (await record.accumulator.readAll()).trimEnd();
+    const filePath = record.accumulator.filePath;
+    const lastMessage = record.accumulator.lastMessage.trim();
     const attachments = record.accumulator.collectedAttachments.map((a) => ({
       kind: "file" as const,
       filePath: a.filePath,
       ...(a.fileName !== undefined ? { fileName: a.fileName } : {}),
     }));
-    await this.#deliverToTarget(target, {
-      type: "assistant.message",
-      clientSessionId: target,
-      text: this.#t("queue.taskCompleted", {
-        queue: queueName,
-        taskId,
-        result: fullText,
-      }),
-      ...(attachments.length > 0 ? { attachments } : {}),
-    });
+    const suffix = this.#t("queue.taskCompletedSuffix", { queue: queueName, path: filePath });
+    if (lastMessage === "") {
+      // No separate no-output key for queues: the completed suffix (with the
+      // file reference) is the notice. Attachments collected across the run
+      // still go with the delivery (same as the non-empty branch).
+      if (attachments.length === 0) {
+        await this.#deliverToTarget(target, suffix);
+      } else {
+        await this.#deliverToTarget(target, {
+          type: "assistant.message",
+          clientSessionId: target,
+          text: suffix,
+          attachments,
+        });
+      }
+    } else {
+      await this.#deliverToTarget(target, {
+        type: "assistant.message",
+        clientSessionId: target,
+        text: `${lastMessage}\n\n${suffix}`,
+        ...(attachments.length > 0 ? { attachments } : {}),
+      });
+    }
     await this.#deleteTask(queueName, taskId);
-    await record.accumulator.dispose();
   }
 
-  /** Failure from a diverted `error` event (T4): notice + partial content + drop. */
+  /** Failure from a diverted `error` event (T4): notice + reason, no partial transcript. */
   async #failTask(record: RunRecord, reason: string): Promise<void> {
     const { queueName, taskId, target } = record;
-    const base = this.#t("queue.taskFailed", { queue: queueName, taskId, reason });
-    const partial = (await record.accumulator.readAll()).trim();
-    let notice: string;
-    if (partial === "") {
-      notice = base;
-    } else {
-      const completed = this.#t("queue.taskCompleted", {
-        queue: queueName,
-        taskId,
-        result: partial,
-      });
-      notice = `${completed}\n\n${base}`;
-    }
+    // The reason stays visible; the partial transcript is NOT inlined — it
+    // lives in the kept accumulation file that the suffix references.
+    const suffix = this.#t("queue.taskFailedSuffix", {
+      queue: queueName,
+      path: record.accumulator.filePath,
+    });
+    const notice = `${reason}\n\n${suffix}`;
     await this.#deliverToTarget(target, notice);
     await this.#deleteTask(queueName, taskId);
-    await record.accumulator.dispose();
   }
 
   async #handleTimeout(sessionId: string): Promise<void> {
@@ -421,21 +439,13 @@ export class QueueController {
     });
     await this.#deleteTask(queueName, taskId);
 
-    // T4: deliver any accumulated partial content alongside the timeout
-    // notice (layer 3 also flushes partial output).
-    const timedOut = this.#t("queue.taskTimedOut", { queue: queueName, taskId });
-    const partial = (await record.accumulator.readAll()).trim();
-    if (partial === "") {
-      await this.#deliverToTarget(target, timedOut);
-    } else {
-      const completed = this.#t("queue.taskCompleted", {
-        queue: queueName,
-        taskId,
-        result: partial,
-      });
-      await this.#deliverToTarget(target, `${completed}\n\n${timedOut}`);
-    }
-    await record.accumulator.dispose();
+    // The partial transcript is NOT inlined — the kept accumulation file is
+    // referenced by the trailing italic one-liner.
+    const suffix = this.#t("queue.taskTimedOutSuffix", {
+      queue: queueName,
+      path: record.accumulator.filePath,
+    });
+    await this.#deliverToTarget(target, suffix);
   }
 
   /** Registers the run, its timeout timer, accumulator and silence probe; `null` when stopped (SF-2). */
@@ -459,7 +469,10 @@ export class QueueController {
       taskId: task.id,
       target,
       silentMs: definition.silenceMs,
-      accumulator: createRunAccumulator({ sessionId }),
+      accumulator: createRunAccumulator({
+        sessionId,
+        ...(this.#outputsDir !== undefined ? { outputsDir: this.#outputsDir } : {}),
+      }),
       probe,
       timer: setTimeout(() => {
         void this.#handleTimeout(sessionId);

@@ -4,12 +4,13 @@
  *
  * Storage root: `~/.config/agent-bridge/queues/`, mirroring the schedules
  * layout. A queue definition is `queues/<name>.md` — front matter `channel`
- * (required, non-empty), `workers` (integer >= 1, default 1), `model`
- * (optional, blank/absent → undefined), `target` (optional, non-empty,
- * written by `/queue-here`) — and its body is the shared context appended to
- * every task prompt. Tasks live in `queues/<name>.tasks/<taskId>.md`; a
- * `taskId` is `<enqueueMs>-<random4>`, so lexicographic file-name order IS
- * the FIFO order and ids are generated accordingly (monotonic ms prefix).
+ * (optional, absent until the queue is bound; written by `/queue-here`),
+ * `workers` (integer >= 1, default 1), `model` (optional, blank/absent →
+ * undefined), `target` (optional, non-empty, written by `/queue-here`) —
+ * and its body is the shared context appended to every task prompt. Tasks
+ * live in `queues/<name>.tasks/<taskId>.md`; a `taskId` is
+ * `<enqueueMs>-<random4>`, so lexicographic file-name order IS the FIFO
+ * order and ids are generated accordingly (monotonic ms prefix).
  *
  * Front matter is the same flat `key: value` subset as task-file.ts (no YAML
  * dependency): one key per line, values are bare strings with surrounding
@@ -53,8 +54,13 @@ const KNOWN_TASK_KEYS = new Set(["state", "enqueuedAt"]);
 export interface QueueDefinition {
   /** Queue name — the file name without `.md`. */
   name: string;
-  /** Owning channel config name; written by `queue add`, required. */
-  channel: string;
+  /**
+   * Owning channel config name; absent until the queue is bound.
+   * `queue add` does not write it; `/queue-here` writes both `channel`
+   * (the current channel) and `target` (the current chat) at bind time.
+   * A queue without `channel` is owned by no controller and never consumed.
+   */
+  channel: string | undefined;
   /** Max concurrent tasks; integer >= 1, defaults to {@link DEFAULT_WORKERS}. */
   workers: number;
   /**
@@ -105,7 +111,6 @@ export interface LoadedQueueTask {
 /** Input for {@link writeQueueDefinition} (the `queue add` wizard). */
 export interface QueueDefinitionInput {
   name: string;
-  channel: string;
   workers?: number;
   model?: string;
   body?: string;
@@ -117,7 +122,7 @@ export type WriteQueueDefinitionResult =
   | { ok: false; reason: string };
 
 /** Outcome of binding a chat as a queue's delivery target (`/queue-here`, spec D4). */
-export type SetQueueTargetResult = { ok: true } | { ok: false; reason: string };
+export type BindQueueResult = { ok: true } | { ok: false; reason: string };
 
 /** True when `name` is a valid queue name (`[a-z0-9-]+`). */
 export function isValidQueueName(name: string): boolean {
@@ -172,10 +177,8 @@ export function parseQueueDefinition(
   }
 
   const channel = nonEmptyString(fields.channel);
-  if (channel === undefined) {
-    errors.push('missing required front matter key "channel"');
-    return { definition: null, errors, warnings };
-  }
+  // `channel` is optional (absent until `/queue-here` binds the queue, T1):
+  // a definition without it is valid and owned by no controller.
 
   let workers = DEFAULT_WORKERS;
   const workersRaw = fields.workers;
@@ -357,21 +360,19 @@ export async function loadQueueDefinition(
 
 /**
  * Creates a queue definition file (the `queue add` wizard): front matter
- * `channel`, `workers` (default 1) and `model` when provided, then an empty
- * body. Create-only: refuses to overwrite an existing file, so an
- * already-taken name is reported as an error result (callers re-ask).
+ * `workers` (default 1) and `model` when provided, then an empty body. No
+ * `channel` is written — a queue stays ownerless and unbound until
+ * `/queue-here` writes both `channel` and `target` at bind time. Create-only:
+ * refuses to overwrite an existing file, so an already-taken name is reported
+ * as an error result (callers re-ask).
  */
 export async function writeQueueDefinition(
   input: QueueDefinitionInput,
   queuesRoot: string = QUEUES_DIR,
 ): Promise<WriteQueueDefinitionResult> {
-  const { name, channel, workers = DEFAULT_WORKERS, model, body = "" } = input;
+  const { name, workers = DEFAULT_WORKERS, model, body = "" } = input;
   if (!isValidQueueName(name)) {
     return { ok: false, reason: "invalid queue name" };
-  }
-  const trimmedChannel = channel.trim();
-  if (trimmedChannel === "") {
-    return { ok: false, reason: "channel must be a non-empty string" };
   }
   if (!Number.isInteger(workers) || workers < 1) {
     return { ok: false, reason: "workers must be an integer >= 1" };
@@ -393,7 +394,6 @@ export async function writeQueueDefinition(
 
   const frontMatter = [
     "---",
-    `channel: ${trimmedChannel}`,
     `workers: ${workers}`,
     ...(trimmedModel !== undefined && trimmedModel !== "" ? [`model: ${trimmedModel}`] : []),
     "---",
@@ -553,24 +553,30 @@ export async function deleteQueueTask(
 }
 
 /**
- * Writes `target` (a chat's clientSessionId) into the queue file's front
- * matter (`/queue-here`, spec D4): the surgical, single-line edit that binds
- * a chat as the queue's delivery target. An existing `target:` line is
+ * Binds a chat as the queue's delivery target (`/queue-here`, spec D4):
+ * writes BOTH `channel` (the current channel's config name) and `target`
+ * (the chat's clientSessionId) into the queue file's front matter in one
+ * atomic write. Each field is applied with the same surgical, single-line
+ * rules as `setQueueTaskState`'s front-matter edit: an existing line is
  * replaced in place; a file with front matter but no such line gets one
  * inserted just before the closing `---`; a file without front matter gets a
  * new front matter block prepended; an unterminated front matter block gets
  * the line appended to the end. In every case the body and all other lines
  * are preserved byte-for-byte (using the file's own line endings) and the
- * write is atomic. Never throws for the expected failures: a missing file or
- * an invalid queue name returns an error result.
+ * write is atomic. Never throws for the expected failures: a missing file,
+ * an invalid queue name, or an empty channel/target returns an error result.
  */
-export async function setQueueTarget(
+export async function bindQueue(
   name: string,
+  channel: string,
   target: string,
   queuesRoot: string = QUEUES_DIR,
-): Promise<SetQueueTargetResult> {
+): Promise<BindQueueResult> {
   if (!isValidQueueName(name)) {
     return { ok: false, reason: "invalid queue name" };
+  }
+  if (channel.trim() === "") {
+    return { ok: false, reason: "channel must be a non-empty string" };
   }
   if (target.trim() === "") {
     return { ok: false, reason: "target must be a non-empty string" };
@@ -586,7 +592,12 @@ export async function setQueueTarget(
     return { ok: false, reason: `failed to read queue file: ${(error as Error).message}` };
   }
   try {
-    await writeFileAtomic(filePath, applyFrontMatterField(content, "target", target));
+    const updated = applyFrontMatterField(
+      applyFrontMatterField(content, "channel", channel),
+      "target",
+      target,
+    );
+    await writeFileAtomic(filePath, updated);
   } catch (error) {
     return { ok: false, reason: `failed to write queue file: ${(error as Error).message}` };
   }

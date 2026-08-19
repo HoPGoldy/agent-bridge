@@ -2,7 +2,7 @@
 
 Scheduled tasks let you run an agent on a recurring schedule without touching a chat manually.
 
-A task is a Markdown file that declares **when** to run (a schedule string), **where** to run (a working directory), **how long** a run may take (a timeout), **which channel owns it** (a channel field), **where to send the result** (a target chat), and—optionally—**which agent model** to run (a model field). When the schedule fires, the bridge creates a **fresh, fully independent agent session**, sends the task's prompt into it, and delivers the agent's full output — or a failure/timeout notice — into the target chat as an ordinary message.
+A task is a Markdown file that declares **when** to run (a schedule string), **where** to run (a working directory), **how long** a run may take (a timeout), **which channel owns it** (a channel field), **where to send the result** (a target chat), and—optionally—**which agent model** to run (a model field). When the schedule fires, the bridge creates a **fresh, fully independent agent session**, sends the task's prompt into it, and delivers the agent's final answer — or a failure/timeout notice — into the target chat as an ordinary message. The run's **full transcript is kept in a local file** under `run-outputs/` (shared with event queues) and every delivered message references that file, so you can always read the whole run.
 
 The most important property is **isolation**: a task run never touches the target chat's own agent session. You can keep chatting in that chat before, during, and after a run and nothing about your session changes. The chat is only used as a delivery address.
 
@@ -152,25 +152,26 @@ Because the synthetic id never collides with a real chat's clientSessionId, the 
 
 Assistant output no longer ends a run on its own: **a run completes only when the agent signals it is done.** Each fire wraps the task's prompt with a fixed completion-protocol instruction block, and every assistant message during the run is accumulated into a per-run local file under `run-outputs/` (shared with event queues; see `docs/event-queue.md`). A run ends for exactly one of two reasons:
 
-1. **Completion (the DONE marker)** — the agent finishes its final `assistant.message` with the marker line `BRIDGE_TASK_STATUS_DONE` as its last line. The scheduler strips that line and delivers the **full accumulated transcript** to the target chat exactly once, as a normal `assistant.message` prefixed with a one-line header:
+1. **Completion (the DONE marker)** — the agent finishes its final `assistant.message` with the marker line `BRIDGE_TASK_STATUS_DONE` as its last line. The scheduler strips that line and delivers **only that last message** to the target chat exactly once, as a normal `assistant.message` — **content first, then a trailing italic one-liner** naming the task and its kept transcript file (no prefix header):
 
    ```text
-   📋 Scheduled task "daily-report":
-   <the accumulated transcript>
+   <the run's last assistant message>
+
+   *Scheduled task "daily-report" completed · full output: ~/.config/agent-bridge/run-outputs/schedule_daily-report_3.md*
    ```
 
-   Attachments and formatting from every accumulated message behave exactly like a normal agent reply. A transcript that is empty or whitespace-only is delivered as `Scheduled task "name" finished with no output.` instead of silence. A marker in an intermediate (non-last) line is *not* a completion signal — the message is accumulated like any other.
-2. **Timeout** — the run exceeds the task's `timeout` (default `10m`): the scheduler aborts that run's session and delivers `⏰ Scheduled task "name" timed out.` to the target chat, preceded by any partial output already accumulated.
+   Attachments and formatting from every accumulated message still go with the delivery (they are real deliverables). The **full transcript stays in the accumulation file** at `run-outputs/<run-id>.md` (kept after delivery — it is the pointer the suffix references) and is *not* inlined. A last message that is empty or whitespace-only is delivered as the italic one-liner `*Scheduled task "name" finished with no output · full output: <path>*` instead of silence. A marker in an intermediate (non-last) line is *not* a completion signal — the message is accumulated like any other.
+2. **Timeout** — the run exceeds the task's `timeout` (default `10m`): the scheduler aborts that run's session and delivers the italic one-liner `*Scheduled task "name" timed out · full output: <path>*` to the target chat. The partial transcript is **not** inlined — it stays in the kept accumulation file the suffix references.
 
-A terminal `error` during the run ends it immediately and delivers `❌ Scheduled task "name" failed.` (with the error detail when available), also preceded by any accumulated partial content.
+A terminal `error` during the run ends it immediately and delivers the error detail followed by the italic one-liner `*Scheduled task "name" failed · full output: <path>*`. The partial transcript is **not** inlined — it stays in the accumulated file.
 
 **The completion protocol.** The instruction block appended to every task prompt tells the agent: to work until the task is *fully* complete, including async follow-ups it is still waiting on (background jobs, sub-agents, external callbacks); to append `BRIDGE_TASK_STATUS_DONE` as the **last line of its final message, and only then** — never in intermediate messages; and to answer honestly if asked whether it is finished, appending the marker only when it truly is. So a task waiting on asynchronous work should simply **not emit DONE until its callbacks return** — nothing else is needed; the run just stays alive and keeps accumulating.
 
-**The silence probe.** After `silence` minutes (front matter, default `10m`) without any observable run activity, the scheduler sends a probe message into the run session asking whether the task is finished (reply DONE, or keep working / keep waiting for async callbacks). Any run event — an assistant message, tool progress, or a probe answer — resets the silence window. The probe Q&A is accumulated like any other message and is included in the delivered transcript. An unanswered probe is harmless: the wall-clock `timeout` remains the only hard cap on the run.
+**The silence probe.** After `silence` minutes (front matter, default `10m`) without any observable run activity, the scheduler sends a probe message into the run session asking whether the task is finished (reply DONE, or keep working / keep waiting for async callbacks). Any run event — an assistant message, tool progress, or a probe answer — resets the silence window. The probe Q&A is accumulated like any other message and is included in the kept transcript file (it is not inlined in the delivered message, which carries only the last assistant message). An unanswered probe is harmless: the wall-clock `timeout` remains the only hard cap on the run.
 
 Fire-time validation failures behave like failures: if the working directory is invalid or the prompt is empty, **nothing is injected**; the target chat receives `❌ Scheduled task "name" could not start: <detail>` and the fire is logged. If the task has no valid `target`, there is nowhere to deliver to — the fire is skipped and only logged, and `schedule list` shows `Target: no`.
 
-**A typo'd or unavailable `model` is not part of that fire-time check.** It is validated by the adapter when the session is created (pi: passed to the pi process as `--model` at spawn, fail-fast if the process exits; opencode: an availability check that refuses to create the session). When session creation fails, the fire **fails** rather than falling back: the run ends immediately, the target chat receives `❌ Scheduled task "name" failed. <adapter's error detail>`, and a manual `/schedule-run` reports the real reason in its reply. There is no fallback to the channel default model — the follow-up prompt is never sent, so the task cannot silently run on the wrong model. (A task with no valid `target` has nowhere to receive the notice; such a fire is skipped and only logged.) Treat the `model` field as "pin it and verify the first `/schedule-run` succeeded on the intended model" — a typo now fails loudly and visibly instead of silently burning the default model's budget.
+**A typo'd or unavailable `model` is not part of that fire-time check.** It is validated by the adapter when the session is created (pi: passed to the pi process as `--model` at spawn, fail-fast if the process exits; opencode: an availability check that refuses to create the session). When session creation fails, the fire **fails** rather than falling back: the run ends immediately and the target chat receives the adapter's error detail followed by the italic one-liner `*Scheduled task "name" failed*`, and a manual `/schedule-run` reports the real reason in its reply. There is no fallback to the channel default model — the follow-up prompt is never sent, so the task cannot silently run on the wrong model. (A task with no valid `target` has nowhere to receive the notice; such a fire is skipped and only logged.) Treat the `model` field as "pin it and verify the first `/schedule-run` succeeded on the intended model" — a typo now fails loudly and visibly instead of silently burning the default model's budget.
 
 ### Hot reload: edits are picked up within 30 seconds
 
@@ -225,7 +226,7 @@ Bind this chat as a task's delivery target in one step — send it **in the chat
 | Command | What it does |
 | --- | --- |
 | `agent-bridge schedule add` | Interactive wizard: name the task (globally unique — no channel selection), enter the schedule (validated, with examples), optionally set the working directory, timeout and a per-task model, then write the task file with an example prompt and print the targeting instruction. |
-| `agent-bridge schedule list` | Table of every task across all channels: Channel, Task, Schedule, Enabled (`yes`/`no`), Target (`yes`/`no`), Next run (computed from the grammar at the current clock) and Status (`ERROR:`/`WARN:` notes such as missing schedule, invalid timeout, empty body, unknown keys). |
+| `agent-bridge schedule list` | Table of every task across all channels: Task, Schedule, Enabled (`yes`/`no`), Target (`yes`/`no`), Next run (computed from the grammar at the current clock) and Status (`ERROR:`/`WARN:` notes such as missing schedule, invalid timeout, empty body, unknown keys). |
 | `agent-bridge schedule remove <task-name>` | Delete the task file directly. Task names are globally unique, so no disambiguation or `--channel` option is needed. |
 
 Task files are plain Markdown: diffable, git-trackable, and hot-reloaded — there is no runtime binding state and no channel-state schema change.
@@ -243,7 +244,7 @@ Check in order:
 
 1. `agent-bridge schedule list` — is the task listed? Is `Enabled` `yes`? Is `Next run` a real time rather than "invalid schedule"? Are there `ERROR:`/`WARN:` notes in `Status`?
 2. Is `target` set (`Target: yes`)? Without it the fire is silently skipped by design.
-3. Is the task's `Channel` column set to a running channel? Only tasks whose `channel` line matches a channel fire on schedule — an unbound task (no `channel` line) never fires; bind it with `/schedule-here` first.
+3. Does the task's file carry a `channel` line matching a running channel? Only tasks whose `channel` line matches a channel fire on schedule — an unbound task (no `channel` line) never fires; bind it with `/schedule-here` first. (`schedule list` no longer shows a Channel column; ownership lives in the file.)
 4. Was the change recent? Front matter edits and new/deleted files take effect on the next 30 s tick; the prompt body is read at fire time.
 5. Is the channel running? A stopped channel never fires, and missed fires are not made up on restart.
 6. Check the bridge's logs — fire failures, invalid-directory skips, no-target skips and delivery errors are logged under the `[schedule]` scope.

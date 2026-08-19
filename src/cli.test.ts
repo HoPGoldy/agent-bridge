@@ -38,6 +38,7 @@ const saveConfig = vi.fn(async () => {});
 const mkdir = vi.fn(async () => {});
 const writeFile = vi.fn(async () => {});
 const unlink = vi.fn(async () => {});
+const rm = vi.fn(async () => {});
 // Queue command tests run the real queue-file writers against a fixed temp
 // root, so the fs mock also needs the access/rename plumbing they touch.
 const access = vi.fn(async () => {});
@@ -95,7 +96,7 @@ vi.mock("./config/session-bindings", () => ({
   removeSessionBindingStore: vi.fn(async () => {}),
 }));
 
-vi.mock("node:fs/promises", () => ({ mkdir, writeFile, unlink, access, readFile, readdir, rename }));
+vi.mock("node:fs/promises", () => ({ mkdir, writeFile, unlink, rm, access, readFile, readdir, rename }));
 
 vi.mock("./modules/schedule/task-file", async (importOriginal) => {
   const original = await importOriginal<typeof import("./modules/schedule/task-file")>();
@@ -532,12 +533,12 @@ describe("runCli schedule list", () => {
     }
 
     const out = logs.lines.join("\n");
-    expect(out).toContain("Channel");
+    // T2: Task is the first column; the Channel column is dropped entirely.
+    expect(out).not.toContain("Channel");
+    expect(out).toMatch(/^\s*Task\s+Schedule/);
     expect(out).toContain("Next run");
-    expect(out).toContain("alpha");
     expect(out).toContain("daily-report");
     expect(out).toContain("daily 09:00");
-    expect(out).toContain("beta");
     expect(out).toContain("broken");
     expect(out).toContain("ERROR: invalid schedule");
     // alpha row: enabled yes, target no; broken row: enabled no
@@ -557,7 +558,7 @@ describe("runCli schedule list", () => {
     expect(logs.lines.join("\n")).toContain("No scheduled tasks found");
   });
 
-  it("shows a dash in the Channel column for unbound tasks", async () => {
+  it("lists an unbound task without a Channel column (T2)", async () => {
     loadAllTasks.mockResolvedValue([makeLoadedTask()]);
     const { runCli } = await import("./cli");
     const logs = captureLogs();
@@ -567,7 +568,8 @@ describe("runCli schedule list", () => {
       logs.restore();
     }
     expect(logs.lines.join("\n")).toContain("daily-report");
-    expect(logs.lines.join("\n")).toMatch(/Channel[\s\S]*-/);
+    // Header has no Channel anywhere (neither header nor any cell).
+    expect(logs.lines.join("\n")).not.toMatch(/Channel/);
   });
 });
 
@@ -689,15 +691,18 @@ describe("runCli queue add", () => {
       logs.restore();
     }
 
+    // No channel step anymore (T1): name, workers, model only.
     expect(promptCalls).toEqual([
       "input:Queue name",
-      "select:Select channel",
       "input:Workers (default 1)",
       "input:Model (optional, blank = channel default)",
     ]);
+    expect(promptCalls.some((call) => call.startsWith("select"))).toBe(false);
     expect(writeFile).toHaveBeenCalledTimes(1);
     const [, content] = writeFile.mock.calls[0] as [string, string, string];
-    expect(content).toContain("channel: demo");
+    // No channel line: the queue is unbound until `/queue-here` writes both
+    // channel and target (T1).
+    expect(content).not.toContain("channel:");
     expect(content).toContain("workers: 1");
     // Blank model answer writes no model: line.
     expect(content).not.toContain("model:");
@@ -736,18 +741,17 @@ describe("runCli queue add", () => {
 
     const [, content] = writeFile.mock.calls[0] as [string, string, string];
     expect(content).toContain("model: azure-openai-responses/gpt-5.6-terra");
+    expect(content).not.toContain("channel:");
   });
 
-  it("refuses to create a queue when no channels are configured", async () => {
+  it("creates a queue even when no channels are configured (no channel step anymore)", async () => {
     loadConfig.mockImplementation(async () => ({
       channels: {},
       defaults: { agentIdleTimeoutMs: 60_000 },
     }));
     const { runCli } = await import("./cli");
-    await expect(runCli(["node", "agent-bridge", "queue", "add"])).rejects.toThrow(
-      "No channels configured",
-    );
-    expect(writeFile).not.toHaveBeenCalled();
+    await runCli(["node", "agent-bridge", "queue", "add"]);
+    expect(writeFile).toHaveBeenCalledTimes(1);
     expect(close).toHaveBeenCalledTimes(1);
   });
 });
@@ -841,13 +845,16 @@ describe("runCli queue list", () => {
 
   it("prints a table with per-queue model, bound and task counts", async () => {
     listQueueDefinitions.mockResolvedValue([
+      // Bound queue with an owning channel (written at bind time).
       makeQueueDefinition({
         name: "inbox",
         workers: 2,
+        channel: "demo",
         model: "azure-openai-responses/gpt-5.6-terra",
         target: "chat:1",
       }),
-      makeQueueDefinition({ name: "todo" }),
+      // Unbound queue: no channel, no target — the Channel column shows `-`.
+      makeQueueDefinition({ name: "todo", channel: undefined }),
     ]);
     listQueueTasks.mockImplementation(async (name: string) => {
       if (name === "inbox") {
@@ -877,6 +884,9 @@ describe("runCli queue list", () => {
     expect(out).toContain("gpt-5.6-terra");
     expect(out).toContain("yes");
     expect(out).toContain("no");
+    // Bound queue shows its owning channel; the unbound one shows `-`.
+    expect(out).toContain("demo");
+    expect(out).toContain("-");
     // Counts: inbox 2 pending + 1 running; todo 1 pending + 0 running.
     expect(out).toContain("2");
     expect(out).toContain("0");
@@ -893,5 +903,63 @@ describe("runCli queue list", () => {
     }
     expect(logs.lines.join("\n")).toContain("No queues found");
     expect(listQueueTasks).not.toHaveBeenCalled();
+  });
+});
+
+describe("runCli queue remove", () => {
+  beforeEach(() => {
+    resetPromptMocks();
+    listQueueDefinitions.mockClear();
+    unlink.mockClear();
+    rm.mockClear();
+  });
+
+  it("deletes the queue definition file AND its tasks directory recursively", async () => {
+    listQueueDefinitions.mockResolvedValue([
+      makeQueueDefinition({ name: "inbox", channel: undefined }),
+    ]);
+    // Real (unmocked) path helpers from the mocked module, imported lazily so
+    // the vi.mock hoisting is unaffected.
+    const { getQueueFilePath, getQueueTasksDir } = await import("./modules/queue/queue-file");
+    const { runCli } = await import("./cli");
+    const logs = captureLogs();
+    try {
+      await runCli(["node", "agent-bridge", "queue", "remove", "inbox"]);
+    } finally {
+      logs.restore();
+    }
+
+    // No prompts, no confirmation — direct delete, like `schedule remove`.
+    expect(promptCalls).toEqual([]);
+    // The tasks dir is removed recursively (pending tasks die with the queue)
+    // and the definition file is unlinked.
+    expect(rm).toHaveBeenCalledWith(getQueueTasksDir("inbox"), {
+      recursive: true,
+      force: true,
+    });
+    expect(unlink).toHaveBeenCalledWith(getQueueFilePath("inbox"));
+    // Both paths are printed.
+    const out = logs.lines.join("\n");
+    expect(out).toContain(`Deleted ${getQueueTasksDir("inbox")}`);
+    expect(out).toContain(`Deleted ${getQueueFilePath("inbox")}`);
+  });
+
+  it("rejects an invalid queue name without touching the filesystem", async () => {
+    const { runCli } = await import("./cli");
+    await expect(runCli(["node", "agent-bridge", "queue", "remove", "Bad_Name"])).rejects.toThrow(
+      "Queue name must be [a-z0-9-]+",
+    );
+    expect(rm).not.toHaveBeenCalled();
+    expect(unlink).not.toHaveBeenCalled();
+  });
+
+  it("reports when no queue with that name exists", async () => {
+    listQueueDefinitions.mockResolvedValue([]);
+    const { runCli } = await import("./cli");
+    await expect(runCli(["node", "agent-bridge", "queue", "remove", "inbox"])).rejects.toThrow(
+      'No queue "inbox" found.',
+    );
+    expect(rm).not.toHaveBeenCalled();
+    expect(unlink).not.toHaveBeenCalled();
   });
 });

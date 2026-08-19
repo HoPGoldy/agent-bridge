@@ -44,16 +44,16 @@ async function makeTempQueuesDir(tempDirs: string[]): Promise<string> {
   return dir;
 }
 
-/** Seeds a queue definition file: `queues/<name>.md` with a `channel` and optional extra fields. */
+/** Seeds a queue definition file: `queues/<name>.md` with an optional `channel` and optional extra fields. */
 async function writeQueueDefinitionFile(
   queuesRoot: string,
   name: string,
-  channel: string,
+  channel?: string,
   extra: Record<string, string> = {},
 ): Promise<void> {
   const frontMatter = [
     "---",
-    `channel: ${channel}`,
+    ...(channel !== undefined ? [`channel: ${channel}`] : []),
     ...Object.entries(extra).map(([key, value]) => `${key}: ${value}`),
     "---",
   ];
@@ -3552,9 +3552,10 @@ describe("GatewayCore", () => {
     }
   });
 
-  it("binds this chat as a queue's delivery target on /queue-here and mentions the next tick", async () => {
+  it("binds a channel-less queue on /queue-here by writing BOTH channel and target", async () => {
     const queuesRoot = await makeTempQueuesDir(tempDirs);
-    await writeQueueDefinitionFile(queuesRoot, "build", "feishu-dev");
+    // `queue add` writes no `channel` (T1): the file only carries workers etc.
+    await writeQueueDefinitionFile(queuesRoot, "build");
     const imAdapter = new FakeIMAdapter();
     const createdAdapters: FakeAgentAdapter[] = [];
 
@@ -3579,15 +3580,15 @@ describe("GatewayCore", () => {
       expect(imAdapter.outputs).toContainEqual({
         type: "assistant.message",
         clientSessionId: "chat:build-results",
-        text: "Queue \"build\" is now bound to this chat — pending tasks will start draining on the next tick.",
+        text: 'Queue "build" is now bound to this chat.',
       });
     });
-
-    // The binding is a plain file write (spec D4): `target` holds the sending
-    // chat's clientSessionId — the exact format the queue controller's
-    // deliver callback consumes (same as /schedule-here's target). The
-    // controller picks it up on its next tick reload.
+    // The binding is a plain file write (spec D4): BOTH the current
+    // channel's config name and the sending chat's clientSessionId land in
+    // the front matter in one atomic write (`bindQueue`). The controller
+    // picks the binding up on its next tick reload.
     const content = await readFile(path.join(queuesRoot, "build.md"), "utf8");
+    expect(content).toContain("channel: feishu-dev");
     expect(content).toContain("target: chat:build-results");
     // A pure command message never touches the agent session.
     expect(createdAdapters).toHaveLength(0);
@@ -3623,8 +3624,11 @@ describe("GatewayCore", () => {
     });
   });
 
-  it("refuses to bind a queue that belongs to another channel with a localized reply", async () => {
+  it("rebinds a queue with a stale channel line to the current channel (no ownership check anymore)", async () => {
     const queuesRoot = await makeTempQueuesDir(tempDirs);
+    // A legacy file may still carry a `channel`; `/queue-here` always
+    // overwrites it with the current channel at bind time (T1) — the
+    // "belongs to another channel" refusal is gone.
     await writeQueueDefinitionFile(queuesRoot, "build", "feishu-dev");
     const imAdapter = new FakeIMAdapter();
 
@@ -3633,8 +3637,6 @@ describe("GatewayCore", () => {
       agentModule: makeFakeModule(),
       agentConfig: {},
       agentIdleTimeoutMs: 60_000,
-      // A wecom-dev chat cannot bind a feishu-dev queue; the reply is
-      // localized to the chat's own language (zh-CN here).
       common: { channelName: "wecom-dev", language: "zh-CN" },
       queuesRoot,
     });
@@ -3651,17 +3653,19 @@ describe("GatewayCore", () => {
       expect(imAdapter.outputs).toContainEqual({
         type: "assistant.message",
         clientSessionId: "client-1",
-        text: '队列 "build" 归属于 channel "feishu-dev"。',
+        text: '队列 "build" 已绑定到本会话。',
       });
     });
-    // Nothing was written: the queue file still has no target line.
+    // Both the channel and the target were written (localized to the chat's
+    // own language, zh-CN here).
     const content = await readFile(path.join(queuesRoot, "build.md"), "utf8");
-    expect(content).not.toContain("target:");
+    expect(content).toContain("channel: wecom-dev");
+    expect(content).toContain("target: client-1");
   });
 
   it("refuses to rebind a queue that already has a target", async () => {
     const queuesRoot = await makeTempQueuesDir(tempDirs);
-    await writeQueueDefinitionFile(queuesRoot, "build", "feishu-dev", {
+    await writeQueueDefinitionFile(queuesRoot, "build", undefined, {
       target: "chat:old-owner",
     });
     const imAdapter = new FakeIMAdapter();

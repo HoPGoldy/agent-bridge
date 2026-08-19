@@ -1,4 +1,4 @@
-import { mkdir, unlink, writeFile } from "node:fs/promises";
+import { mkdir, rm, unlink, writeFile } from "node:fs/promises";
 import { createRequire } from "node:module";
 import path from "node:path";
 import process from "node:process";
@@ -29,6 +29,8 @@ import {
   type ScheduleTask,
 } from "./modules/schedule/task-file";
 import {
+  getQueueFilePath,
+  getQueueTasksDir,
   insertQueueTask,
   isValidQueueName,
   listQueueDefinitions,
@@ -328,7 +330,6 @@ async function addScheduleTask(): Promise<void> {
 }
 
 interface ScheduleTaskRow {
-  channel: string | undefined;
   task: ScheduleTask;
   errors: string[];
   warnings: string[];
@@ -353,7 +354,6 @@ function formatNextRun(task: ScheduleTask, now: Date): string {
 async function listScheduleTasks(): Promise<void> {
   const now = new Date();
   const rows: ScheduleTaskRow[] = (await loadAllTasks()).map(({ task, errors, warnings }) => ({
-    channel: task.channel,
     task,
     errors,
     warnings,
@@ -364,8 +364,8 @@ async function listScheduleTasks(): Promise<void> {
     return;
   }
 
+  // Task name is the first column; Channel is intentionally dropped (T2).
   const columns: Array<{ header: string; get: (row: ScheduleTaskRow) => string }> = [
-    { header: "Channel", get: (row) => row.channel ?? "-" },
     { header: "Task", get: (row) => row.task.name },
     { header: "Schedule", get: (row) => row.task.scheduleRaw ?? "-" },
     { header: "Enabled", get: (row) => (row.task.enabled ? "yes" : "no") },
@@ -407,11 +407,11 @@ async function removeScheduleTask(taskName: string): Promise<void> {
 // queue command group (spec: docs/event-queue-spec.md "D4 — Commands")
 //
 // Queue definitions live at `~/.config/agent-bridge/queues/<name>.md` (T1
-// queue-file.ts owns the format). A queue belongs to one channel and carries
-// a worker count and an optional pinned model. The add wizard mirrors the
-// schedule wizard; `target` is bound later by `/queue-here` in chat. Tasks
-// are inserted with `queue insert` and consumed FIFO by the per-channel
-// controller once the queue is bound (spec D2).
+// queue-file.ts owns the format). The add wizard mirrors the schedule wizard:
+// a name, a worker count and an optional pinned model — NO channel step (a
+// channel is only assigned when `/queue-here` binds a chat, writing both
+// `channel` and `target`). Tasks are inserted with `queue insert` and consumed
+// FIFO by the per-channel controller once the queue is bound (spec D2).
 // ---------------------------------------------------------------------------
 
 /** Validates a queue-name input: slug shape plus global uniqueness (spec D4). */
@@ -443,13 +443,6 @@ async function addQueue(): Promise<void> {
   const ctx = createPromptContext();
   try {
     const t = getTranslatorForCommon();
-    const config = await loadConfig();
-    const channelNames = Object.keys(config.channels).sort();
-    if (channelNames.length === 0) {
-      // The definition requires an owning channel (spec D1) — nothing to
-      // bind the queue to without one.
-      throw new Error(t("cli.noChannelsConfigured"));
-    }
 
     const existing = await listQueueDefinitions();
     const existingNames = new Set(existing.map((definition) => definition.name));
@@ -458,11 +451,6 @@ async function addQueue(): Promise<void> {
       required: true,
       validate: (value) => validateQueueNameInput(value, existingNames),
     });
-
-    const channel = await ctx.select(
-      t("cli.channelPrompt"),
-      channelNames.map((channelName) => ({ label: channelName, value: channelName })),
-    );
 
     const workers = await ctx.input(t("cli.workersPrompt"), {
       defaultValue: "1",
@@ -475,9 +463,10 @@ async function addQueue(): Promise<void> {
       placeholder: "Example: azure-openai-responses/gpt-5.6-terra",
     });
 
+    // No `channel` is written: a queue stays ownerless and unbound until
+    // `/queue-here` binds a chat (writing both `channel` and `target`).
     const result = await writeQueueDefinition({
       name,
-      channel,
       workers: Number(workers),
       // Blank = channel default; the storage layer rejects a present-but-blank model.
       model: model.trim() === "" ? undefined : model,
@@ -550,7 +539,8 @@ async function listQueues(): Promise<void> {
 
   const columns: Array<{ header: string; get: (row: QueueListRow) => string }> = [
     { header: "Name", get: (row) => row.definition.name },
-    { header: "Channel", get: (row) => row.definition.channel },
+    // Channel is only written at bind time; an unbound queue shows `-`.
+    { header: "Channel", get: (row) => row.definition.channel ?? "-" },
     { header: "Workers", get: (row) => String(row.definition.workers) },
     { header: "Model", get: (row) => row.definition.model ?? "-" },
     { header: "Bound", get: (row) => (row.definition.target !== undefined ? "yes" : "no") },
@@ -565,6 +555,32 @@ async function listQueues(): Promise<void> {
   for (const row of rows) {
     console.log(columns.map((column, i) => column.get(row).padEnd(widths[i])).join("  ").trimEnd());
   }
+}
+
+/**
+ * `agent-bridge queue remove <queue-name>`: delete the queue definition file
+ * AND the queue's `<name>.tasks/` directory recursively (pending tasks die
+ * with the queue), no prompts. Mirrors `removeScheduleTask` above: same
+ * name-shape validation and missing-queue error, plain English CLI output.
+ */
+async function removeQueue(queueName: string): Promise<void> {
+  if (!isValidQueueName(queueName)) {
+    throw new Error("Queue name must be [a-z0-9-]+ (lowercase letters, digits and hyphens only)");
+  }
+
+  const definitions = await listQueueDefinitions();
+  if (!definitions.some((definition) => definition.name === queueName)) {
+    throw new Error(`No queue "${queueName}" found.`);
+  }
+
+  const filePath = getQueueFilePath(queueName);
+  const tasksDir = getQueueTasksDir(queueName);
+  // The tasks dir may not exist yet (a fresh queue with no inserts): removing
+  // it is still idempotent and the file delete is the real requirement.
+  await rm(tasksDir, { recursive: true, force: true });
+  await unlink(filePath);
+  console.log(`Deleted ${tasksDir}`);
+  console.log(`Deleted ${filePath}`);
 }
 
 export async function runCli(argv = process.argv): Promise<void> {
@@ -654,6 +670,14 @@ export async function runCli(argv = process.argv): Promise<void> {
     .description("List queues with task counts")
     .action(async () => {
       await listQueues();
+    });
+
+  queue
+    .command("remove")
+    .description("Remove a queue by name (deletes the queue and its pending tasks)")
+    .argument("<queue-name>")
+    .action(async (queueName: string) => {
+      await removeQueue(queueName);
     });
 
   await program.parseAsync(argv);

@@ -102,6 +102,8 @@ export interface SchedulerOptions {
   loadTasks?: (schedulesRoot?: string) => Promise<LoadedTask[]>;
   /** Overridable schedules root (defaults to the shared `SCHEDULES_DIR`). */
   schedulesRoot?: string;
+  /** Overridable run-outputs root for the per-run accumulator (tests). */
+  outputsDir?: string;
 }
 
 interface TaskRow {
@@ -133,6 +135,7 @@ export class Scheduler {
   readonly #logger: Logger;
   readonly #loadTasks: (schedulesRoot?: string) => Promise<LoadedTask[]>;
   readonly #schedulesRoot?: string;
+  readonly #outputsDir?: string;
 
   /** In-memory task table, re-synced from disk on every tick (spec D8). */
   readonly #tasks = new Map<string, TaskRow>();
@@ -162,6 +165,7 @@ export class Scheduler {
     // field, not in the directory layout).
     this.#loadTasks = options.loadTasks ?? ((schedulesRoot) => loadAllTasks(schedulesRoot));
     this.#schedulesRoot = options.schedulesRoot;
+    this.#outputsDir = options.outputsDir;
   }
 
   /**
@@ -190,9 +194,9 @@ export class Scheduler {
     for (const record of this.#runs.values()) {
       clearTimeout(record.timer);
       record.probe.stop();
-      // Stop contract (T3, unchanged): dispose accumulators WITHOUT
-      // delivering their accumulated content.
-      await record.accumulator.dispose();
+      // Stop contract (T3, unchanged): nothing is delivered after stop, and
+      // the accumulation file is KEPT — it may hold partial work that is
+      // still readable at run-outputs/<run-id>.md.
     }
     this.#runs.clear();
   }
@@ -203,12 +207,14 @@ export class Scheduler {
    *
    * `assistant.message` no longer ends the run: it is classified against the
    * DONE-marker protocol, appended to the run's accumulator and pokes the
-   * silence probe. When DONE is detected the run ends and the FULL
-   * accumulated text (with all attachments) is delivered once. Every other
-   * live-run event merely pokes the probe (activity resets the silence
-   * window). A terminal `error` ends the run with a localized failure notice
-   * (plus any accumulated partial content). Events whose run-unique id has no
-   * active run are orphaned: dropped and logged.
+   * silence probe. When DONE is detected the run ends and the LAST assistant
+   * message (with all attachments collected across the run) is delivered
+   * once; the full transcript stays in the kept accumulation file that the
+   * suffix references. Every other live-run event merely pokes the probe
+   * (activity resets the silence window). A terminal `error` ends the run
+   * with a localized failure notice (the partial transcript is not inlined).
+   * Events whose run-unique id has no active run are orphaned: dropped and
+   * logged.
    */
   async handleOutput(event: ClientInputEvent): Promise<void> {
     const parsed = parseSyntheticSessionId(event.clientSessionId);
@@ -255,40 +261,54 @@ export class Scheduler {
     await this.#deliverDone(record);
   }
 
-  /** Reads the full accumulation and delivers ONE result message (or no-output). */
+  /**
+   * Delivers the run's LAST assistant message (marker stripped) plus an
+   * italic suffix referencing the kept accumulation file (or a no-output
+   * notice when the last message is empty). Attachments collected across the
+   * whole run still go with the delivery.
+   */
   async #deliverDone(record: RunRecord): Promise<void> {
     const { task } = record;
     const target = task.target;
     if (target === undefined) {
       this.#logger.warn(`[schedule] task "${task.name}" has no target to deliver its result to`);
-      await record.accumulator.dispose();
       return;
     }
-    const fullText = (await record.accumulator.readAll()).trimEnd();
-    if (fullText.trim() === "") {
-      // Spec edge case: never deliver silence.
-      void this.#deliverToTarget(
-        target,
-        this.#t("schedule.taskNoOutput", { name: task.name }),
-      );
+    const filePath = record.accumulator.filePath;
+    const lastMessage = record.accumulator.lastMessage.trim();
+    const attachments = record.accumulator.collectedAttachments.map((a) => ({
+      kind: "file" as const,
+      filePath: a.filePath,
+      ...(a.fileName !== undefined ? { fileName: a.fileName } : {}),
+    }));
+    // The accumulation file is kept: the suffix points recipients at it.
+    if (lastMessage === "") {
+      // Spec edge case: never deliver silence. Attachments collected across
+      // the whole run still go with the delivery (same as the non-empty
+      // branch): the no-output notice is the text payload when they exist.
+      const suffix = this.#t("schedule.taskNoOutputSuffix", { name: task.name, path: filePath });
+      if (attachments.length === 0) {
+        void this.#deliverToTarget(target, suffix);
+      } else {
+        void this.#deliverToTarget(target, {
+          type: "assistant.message",
+          clientSessionId: target,
+          text: suffix,
+          attachments,
+        });
+      }
     } else {
-      const header = this.#t("schedule.taskResultHeader", { name: task.name });
-      const attachments = record.accumulator.collectedAttachments.map((a) => ({
-        kind: "file" as const,
-        filePath: a.filePath,
-        ...(a.fileName !== undefined ? { fileName: a.fileName } : {}),
-      }));
+      const suffix = this.#t("schedule.taskCompletedSuffix", { name: task.name, path: filePath });
       void this.#deliverToTarget(target, {
         type: "assistant.message",
         clientSessionId: target,
-        text: `${header}\n${fullText}`,
+        text: `${lastMessage}\n\n${suffix}`,
         ...(attachments.length > 0 ? { attachments } : {}),
       });
     }
-    await record.accumulator.dispose();
   }
 
-  /** Ends a run on a terminal error, appending any accumulated partial content. */
+  /** Ends a run on a terminal error, delivering the reason (no inlined transcript). */
   async #handleError(
     record: RunRecord,
     event: Extract<ClientInputEvent, { type: "error" }>,
@@ -298,21 +318,17 @@ export class Scheduler {
     this.#endRun(record.sessionId);
     if (target === undefined) {
       this.#logger.warn(`[schedule] task "${task.name}" has no target to deliver its failure to`);
-      await record.accumulator.dispose();
       return;
     }
-    const base = this.#t("schedule.taskFailed", { name: task.name });
-    const detail = event.detail ? ` ${event.detail}` : "";
-    const partial = (await record.accumulator.readAll()).trim();
-    let notice: string;
-    if (partial === "") {
-      notice = `${base}${detail}`;
-    } else {
-      const header = this.#t("schedule.taskResultHeader", { name: task.name });
-      notice = `${header}\n${partial}\n\n${base}${detail}`;
-    }
+    // The reason stays visible; the partial transcript is NOT inlined — it
+    // lives in the kept accumulation file that the suffix references.
+    const suffix = this.#t("schedule.taskFailedSuffix", {
+      name: task.name,
+      path: record.accumulator.filePath,
+    });
+    const detail = (event.detail ?? "").trim();
+    const notice = detail === "" ? suffix : `${detail}\n\n${suffix}`;
     void this.#deliverToTarget(target, notice);
-    await record.accumulator.dispose();
   }
 
   /**
@@ -505,6 +521,8 @@ export class Scheduler {
    * invokers see the real cause (`scheduleRunFailed` prints `{{reason}}`).
    */
   async #failFire(task: ScheduleTask, sessionId: string, reason: string): Promise<FireResult> {
+    // Capture the accumulation-file path before the run record is cleared.
+    const filePath = this.#runs.get(sessionId)?.accumulator.filePath;
     this.#endRun(sessionId);
     this.#logger.warn(`[schedule] fire of "${task.name}" failed: ${reason}`);
     // Stop-race (SF-2): a dispatch that was in flight across a stop resolves
@@ -522,8 +540,13 @@ export class Scheduler {
       this.#logger.warn(`[schedule] task "${task.name}" has no target to deliver its failure to`);
       return { ok: false, reason };
     }
-    const base = this.#t("schedule.taskFailed", { name: task.name });
-    await this.#deliverToTarget(target, `${base} ${reason}`);
+    const suffix = this.#t("schedule.taskFailedSuffix", {
+      name: task.name,
+      ...(filePath !== undefined ? { path: filePath } : {}),
+    });
+    // T1: the real reason stays visible in the content part, the italic
+    // one-liner (with the kept accumulation-file reference) trails it.
+    await this.#deliverToTarget(target, `${reason}\n\n${suffix}`);
     return { ok: false, reason };
   }
 
@@ -633,7 +656,10 @@ export class Scheduler {
       sessionId,
       task,
       startedAt: this.#now().getTime(),
-      accumulator: createRunAccumulator({ sessionId }),
+      accumulator: createRunAccumulator({
+        sessionId,
+        ...(this.#outputsDir !== undefined ? { outputsDir: this.#outputsDir } : {}),
+      }),
       probe,
       timer: setTimeout(() => {
         void this.#handleTimeout(sessionId);
@@ -676,7 +702,6 @@ export class Scheduler {
     const target = task.target;
     if (target === undefined) {
       this.#logger.warn(`[schedule] task "${task.name}" has no target to deliver its timeout notice to`);
-      await record.accumulator.dispose();
       return;
     }
 
@@ -688,17 +713,13 @@ export class Scheduler {
       clientSessionId: sessionId,
     });
 
-    // T3: deliver any accumulated partial content alongside the timeout
-    // notice (layer 3 also flushes partial output).
-    const partial = (await record.accumulator.readAll()).trim();
-    if (partial === "") {
-      await this.#deliverToTarget(target, this.#t("schedule.taskTimedOut", { name: task.name }));
-    } else {
-      const header = this.#t("schedule.taskResultHeader", { name: task.name });
-      const timedOut = this.#t("schedule.taskTimedOut", { name: task.name });
-      await this.#deliverToTarget(target, `${header}\n${partial}\n\n${timedOut}`);
-    }
-    await record.accumulator.dispose();
+    // The partial transcript is NOT inlined — the kept accumulation file is
+    // referenced by the trailing italic one-liner.
+    const suffix = this.#t("schedule.taskTimedOutSuffix", {
+      name: task.name,
+      path: record.accumulator.filePath,
+    });
+    await this.#deliverToTarget(target, suffix);
   }
 
   #endRun(sessionId: string): void {

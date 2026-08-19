@@ -1,4 +1,4 @@
-import { mkdtemp, readFile, readdir, realpath, rm, writeFile } from "node:fs/promises";
+import { mkdtemp, readFile, readdir, realpath, rm, stat, writeFile } from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
@@ -9,6 +9,7 @@ import {
   DONE_MARKER,
   buildProbeMessage,
   buildTaskPrompt,
+  sanitizeSessionId,
 } from "../run-completion";
 import { DEFAULT_TIMEOUT_MS, type LoadedTask, type ScheduleTask } from "./task-file";
 import { Scheduler } from "./scheduler";
@@ -80,14 +81,39 @@ interface Harness {
   logger: MockLogger;
   tasks: LoadedTask[];
   scheduler: Scheduler;
+  /** Isolated run-outputs dir for this harness's accumulators (cleaned up). */
+  outputsDir: string;
 }
 
 const schedulers: Scheduler[] = [];
+let outSeq = 0;
+const outDirs: string[] = [];
+
+/** Absolute path a run's accumulation file lands at (session id -> file). */
+function runOutputPath(outputsDir: string, sessionId: string): string {
+  return path.join(outputsDir, `${sanitizeSessionId(sessionId)}.md`);
+}
+function completedSuffix(h: Harness, task: string, sessionId: string): string {
+  return `*Scheduled task "${task}" completed · full output: ${runOutputPath(h.outputsDir, sessionId)}*`;
+}
+function failedSuffix(h: Harness, task: string, sessionId: string): string {
+  return `*Scheduled task "${task}" failed · full output: ${runOutputPath(h.outputsDir, sessionId)}*`;
+}
+function timedOutSuffix(h: Harness, task: string, sessionId: string): string {
+  return `*Scheduled task "${task}" timed out · full output: ${runOutputPath(h.outputsDir, sessionId)}*`;
+}
+function noOutputSuffix(h: Harness, task: string, sessionId: string): string {
+  return `*Scheduled task "${task}" finished with no output · full output: ${runOutputPath(h.outputsDir, sessionId)}*`;
+}
 
 function createHarness(options: { tasks?: LoadedTask[]; validateTarget?: (id: string) => boolean } = {}): Harness {
   const clock = new FakeClock();
   const dispatched: ClientOutputEvent[] = [];
   const delivered: ClientInputEvent[] = [];
+  // Isolated per-harness outputs dir: the accumulator writes here lazily (no
+  // need for it to pre-exist) and it is cleaned up in afterEach.
+  const outputsDir = path.join(os.tmpdir(), `agent-bridge-sched-runout-${(outSeq += 1)}`);
+  outDirs.push(outputsDir);
   // The real runner wires dispatchClientEvent to core.input, which never
   // rejects; the fake mirrors that contract and succeeds by default, so a
   // fire only proceeds past session.new when the dispatch actually succeeded.
@@ -110,15 +136,30 @@ function createHarness(options: { tasks?: LoadedTask[]; validateTarget?: (id: st
     t: getTranslator("en-US"),
     loadTasks,
     logger,
+    outputsDir,
     ...(options.validateTarget !== undefined ? { validateTarget: options.validateTarget } : {}),
   });
   schedulers.push(scheduler);
-  return { clock, dispatched, delivered, dispatchClientEvent, deliver, loadTasks, logger, tasks, scheduler };
+  return {
+    clock,
+    dispatched,
+    delivered,
+    dispatchClientEvent,
+    deliver,
+    loadTasks,
+    logger,
+    tasks,
+    scheduler,
+    outputsDir,
+  };
 }
 
 afterEach(async () => {
   for (const scheduler of schedulers.splice(0)) {
     await scheduler.stop();
+  }
+  for (const dir of outDirs.splice(0)) {
+    await rm(dir, { recursive: true, force: true });
   }
 });
 
@@ -372,7 +413,11 @@ describe("fire-time validation (D6/D7)", () => {
       text: `done\n${DONE_MARKER}`,
     });
     expect(h.delivered).toEqual([
-      { type: "assistant.message", clientSessionId: TARGET, text: '📋 Scheduled task "ok":\ndone' },
+      {
+        type: "assistant.message",
+        clientSessionId: TARGET,
+        text: `done\n\n${completedSuffix(h, "ok", "schedule:ok:1")}`,
+      },
     ]);
   });
 });
@@ -445,7 +490,7 @@ describe("dispatch failure (T6)", () => {
       {
         type: "assistant.message",
         clientSessionId: TARGET,
-        text: '❌ Scheduled task "report" failed. boom: model not available',
+        text: `boom: model not available\n\n${failedSuffix(h, "report", "schedule:report:1")}`,
       },
     ]);
 
@@ -475,7 +520,7 @@ describe("dispatch failure (T6)", () => {
       {
         type: "assistant.message",
         clientSessionId: TARGET,
-        text: '❌ Scheduled task "report" failed. boom: prompt rejected',
+        text: `boom: prompt rejected\n\n${failedSuffix(h, "report", "schedule:report:1")}`,
       },
     ]);
   });
@@ -506,7 +551,7 @@ describe("timeout (D5)", () => {
     expect(h.delivered[0]).toEqual({
       type: "assistant.message",
       clientSessionId: TARGET,
-      text: '⏰ Scheduled task "slow" timed out.',
+      text: timedOutSuffix(h, "slow", "schedule:slow:1"),
     });
 
     // The run has ended: a late completion is an orphan and delivers nothing.
@@ -515,7 +560,7 @@ describe("timeout (D5)", () => {
     expect(h.logger.info).toHaveBeenCalledWith(expect.stringContaining("orphan"));
   });
 
-  it("delivers the timeout notice plus accumulated partial content", async () => {
+  it("delivers only the timeout notice (no inlined partial transcript) referencing the kept file", async () => {
     const h = createHarness({
       tasks: [makeLoaded(makeTask({ name: "slow", target: TARGET, timeoutMs: 100 }))],
     });
@@ -531,8 +576,12 @@ describe("timeout (D5)", () => {
     expect(h.delivered[0]).toEqual({
       type: "assistant.message",
       clientSessionId: TARGET,
-      text: '📋 Scheduled task "slow":\npartial work\n\n⏰ Scheduled task "slow" timed out.',
+      text: timedOutSuffix(h, "slow", "schedule:slow:1"),
     });
+    // The partial transcript is NOT inlined.
+    expect(h.delivered[0]!.text).not.toContain("partial work");
+    // The accumulation file (with the partial work) is still on disk.
+    await expect(stat(runOutputPath(h.outputsDir, "schedule:slow:1"))).resolves.toBeDefined();
   });
 });
 
@@ -574,7 +623,9 @@ describe("silence probe (T3, layer 2)", () => {
     });
     expect(h.delivered).toEqual([]);
 
-    // DONE after the probe: delivered exactly once with the full accumulation.
+    // DONE after the probe: delivered exactly once — the LAST assistant
+    // message only (the probe answer is dropped from the delivery, but the
+    // kept accumulation file still holds the full transcript).
     await h.scheduler.handleOutput({
       type: "assistant.message",
       clientSessionId: "schedule:report:1",
@@ -584,7 +635,7 @@ describe("silence probe (T3, layer 2)", () => {
       {
         type: "assistant.message",
         clientSessionId: TARGET,
-        text: '📋 Scheduled task "report":\nstill working\n\ndone now',
+        text: `done now\n\n${completedSuffix(h, "report", "schedule:report:1")}`,
       },
     ]);
   });
@@ -612,7 +663,7 @@ describe("silence probe (T3, layer 2)", () => {
 });
 
 describe("stop() mid-run (T3)", () => {
-  it("stop mid-run disposes the accumulator without delivering", async () => {
+  it("stop mid-run keeps the accumulation file without delivering (T2)", async () => {
     const h = createHarness({ tasks: [makeLoaded(makeTask({ name: "report", target: TARGET }))] });
     await h.scheduler.start();
     await h.scheduler.runNow("report");
@@ -624,6 +675,8 @@ describe("stop() mid-run (T3)", () => {
     });
     await h.scheduler.stop();
     expect(h.delivered).toEqual([]);
+    // The partial transcript stays readable on disk (decision: no dispose()).
+    await expect(stat(runOutputPath(h.outputsDir, "schedule:report:1"))).resolves.toBeDefined();
 
     // A late completion after stop is an orphan: nothing delivered.
     await h.scheduler.handleOutput({
@@ -658,7 +711,8 @@ describe("handleOutput / three-layer completion (T3)", () => {
     });
     expect(h.delivered).toEqual([]);
 
-    // DONE: a single delivery carrying BOTH texts in order, marker stripped.
+    // DONE: a single delivery carrying ONLY the last message, marker stripped
+    // (the earlier steps live in the kept accumulation file).
     await h.scheduler.handleOutput({
       type: "assistant.message",
       clientSessionId: "schedule:report:1",
@@ -668,10 +722,11 @@ describe("handleOutput / three-layer completion (T3)", () => {
       {
         type: "assistant.message",
         clientSessionId: TARGET,
-        text: '📋 Scheduled task "report":\nstep one\n\nstep two\n\nstep three',
+        text: `step three\n\n${completedSuffix(h, "report", "schedule:report:1")}`,
       },
     ]);
     expect(h.delivered[0]!.text).not.toContain(DONE_MARKER);
+    expect(h.delivered[0]!.text).not.toContain("step one");
 
     // The run ended: a second completion is an orphan.
     await h.scheduler.handleOutput({
@@ -701,10 +756,12 @@ describe("handleOutput / three-layer completion (T3)", () => {
       text: `second\n${DONE_MARKER}`,
       attachments: a2,
     });
+    // Only the last message is delivered as text, but attachments from BOTH
+    // messages still travel with it.
     expect(h.delivered[0]).toEqual({
       type: "assistant.message",
       clientSessionId: TARGET,
-      text: '📋 Scheduled task "report":\nfirst\n\nsecond',
+      text: `second\n\n${completedSuffix(h, "report", "schedule:report:1")}`,
       attachments: [...a1, ...a2],
     });
   });
@@ -724,9 +781,45 @@ describe("handleOutput / three-layer completion (T3)", () => {
       {
         type: "assistant.message",
         clientSessionId: TARGET,
-        text: 'Scheduled task "quiet" finished with no output.',
+        text: noOutputSuffix(h, "quiet", "schedule:quiet:1"),
       },
     ]);
+    // Even a no-output delivery keeps the (empty/whitespace) accumulation file.
+    await expect(stat(runOutputPath(h.outputsDir, "schedule:quiet:1"))).resolves.toBeDefined();
+  });
+
+  it("carries attachments from earlier messages on a no-output (empty last message) delivery", async () => {
+    const h = createHarness({ tasks: [makeLoaded(makeTask({ name: "report", target: TARGET }))] });
+    await h.scheduler.start();
+    await h.scheduler.runNow("report");
+
+    // Early message with an attachment (accumulated; no delivery yet).
+    const a1: OutboundAttachment[] = [{ kind: "file", filePath: "/tmp/a.txt", fileName: "a.txt" }];
+    await h.scheduler.handleOutput({
+      type: "assistant.message",
+      clientSessionId: "schedule:report:1",
+      text: "first",
+      attachments: a1,
+    });
+    expect(h.delivered).toEqual([]);
+
+    // Empty last message (DONE only): the no-output suffix is the text, but
+    // the attachment collected earlier still travels with the delivery.
+    await h.scheduler.handleOutput({
+      type: "assistant.message",
+      clientSessionId: "schedule:report:1",
+      text: DONE_MARKER,
+    });
+    expect(h.delivered).toEqual([
+      {
+        type: "assistant.message",
+        clientSessionId: TARGET,
+        text: noOutputSuffix(h, "report", "schedule:report:1"),
+        attachments: a1,
+      },
+    ]);
+    // The kept accumulation file exists even with an empty last message.
+    await expect(stat(runOutputPath(h.outputsDir, "schedule:report:1"))).resolves.toBeDefined();
   });
 
   it("a bare message without DONE does not end the run", async () => {
@@ -750,7 +843,7 @@ describe("handleOutput / three-layer completion (T3)", () => {
     expect(h.delivered).toHaveLength(1);
   });
 
-  it("delivers a failure notice with accumulated partial content on a terminal error", async () => {
+  it("delivers only the reason (not the partial transcript) on a terminal error (T2)", async () => {
     const h = createHarness({ tasks: [makeLoaded(makeTask({ name: "report", target: TARGET }))] });
     await h.scheduler.start();
     await h.scheduler.runNow("report");
@@ -770,9 +863,11 @@ describe("handleOutput / three-layer completion (T3)", () => {
       {
         type: "assistant.message",
         clientSessionId: TARGET,
-        text: '📋 Scheduled task "report":\npartial work\n\n❌ Scheduled task "report" failed. boom',
+        text: `boom\n\n${failedSuffix(h, "report", "schedule:report:1")}`,
       },
     ]);
+    // The partial transcript is NOT inlined.
+    expect(h.delivered[0]!.text).not.toContain("partial work");
 
     // The run ended: a second error is an orphan.
     await h.scheduler.handleOutput({ type: "error", clientSessionId: "schedule:report:1", kind: "agent.run.failed" });
@@ -794,7 +889,7 @@ describe("handleOutput / three-layer completion (T3)", () => {
       {
         type: "assistant.message",
         clientSessionId: TARGET,
-        text: '❌ Scheduled task "report" failed. boom',
+        text: `boom\n\n${failedSuffix(h, "report", "schedule:report:1")}`,
       },
     ]);
   });
@@ -847,14 +942,18 @@ describe("concurrent runs of the same task (D5)", () => {
       "schedule:report:2",
     ]);
 
-    // Run 1 completes: its result is delivered (accumulated) and run 2 is untouched.
+    // Run 1 completes: its result is delivered and run 2 is untouched.
     await h.scheduler.handleOutput({
       type: "assistant.message",
       clientSessionId: "schedule:report:1",
       text: `first\n${DONE_MARKER}`,
     });
     expect(h.delivered).toEqual([
-      { type: "assistant.message", clientSessionId: TARGET, text: '📋 Scheduled task "report":\nfirst' },
+      {
+        type: "assistant.message",
+        clientSessionId: TARGET,
+        text: `first\n\n${completedSuffix(h, "report", "schedule:report:1")}`,
+      },
     ]);
 
     // A late event from the ended run 1 is an orphan — it can never be
@@ -873,7 +972,7 @@ describe("concurrent runs of the same task (D5)", () => {
     expect(h.delivered[1]).toEqual({
       type: "assistant.message",
       clientSessionId: TARGET,
-      text: '📋 Scheduled task "report":\nsecond',
+      text: `second\n\n${completedSuffix(h, "report", "schedule:report:2")}`,
     });
   });
 
@@ -905,7 +1004,7 @@ describe("concurrent runs of the same task (D5)", () => {
     expect(h.delivered[1]).toEqual({
       type: "assistant.message",
       clientSessionId: TARGET,
-      text: '⏰ Scheduled task "report" timed out.',
+      text: timedOutSuffix(h, "report", "schedule:report:2"),
     });
   });
 });
@@ -1011,7 +1110,7 @@ describe("stop() races (SF-2)", () => {
 
     // The failure is reported to the caller but nothing is delivered: a
     // post-stop dispatch failure is not a task failure (no spurious
-    // `taskFailed` notice in the target chat).
+    // task-failed notice in the target chat).
     expect(await firePromise).toEqual({ ok: false, reason: "gateway is not running" });
     expect(h.delivered).toEqual([]);
 
@@ -1069,6 +1168,7 @@ summarize the logs
       deliver,
       t: getTranslator("en-US"),
       schedulesRoot: tempRoot,
+      outputsDir: path.join(tempRoot, "run-outputs"),
       logger,
     });
     schedulers.push(scheduler);
@@ -1092,9 +1192,16 @@ summarize the logs
       clientSessionId: "schedule:report:1",
       text: `done!\n${DONE_MARKER}`,
     });
+    const reportOut = runOutputPath(path.join(tempRoot, "run-outputs"), "schedule:report:1");
     expect(delivered).toEqual([
-      { type: "assistant.message", clientSessionId: TARGET, text: '📋 Scheduled task "report":\ndone!' },
+      {
+        type: "assistant.message",
+        clientSessionId: TARGET,
+        text: `done!\n\n*Scheduled task "report" completed · full output: ${reportOut}*`,
+      },
     ]);
+    // The accumulation file is still on disk after delivery.
+    await expect(stat(reportOut)).resolves.toBeDefined();
   });
 
   it("binds an unbound task by writing the target and channel lines, and refuses a rebind", async () => {

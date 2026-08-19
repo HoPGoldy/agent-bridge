@@ -24,23 +24,47 @@ describe("i18n", () => {
     expect(zh("gateway.failedToResumeSession", { detail: "boom" })).toBe(
       "恢复智能体会话失败：boom\n请使用 `/new` 开始新会话。",
     );
-    expect(en("queue.taskCompleted", { queue: "q", taskId: "1-2ab3", result: "done" })).toBe(
-      '✅ Queue "q" · task 1-2ab3 completed:\ndone',
+    expect(en("queue.taskCompletedSuffix", { queue: "q", path: "/p/q.md" })).toBe(
+      '*Queue "q" task completed · full output: /p/q.md*',
     );
-    expect(zh("queue.taskCompleted", { queue: "q", taskId: "1-2ab3", result: "完成" })).toBe(
-      '✅ 队列 "q" · 任务 1-2ab3 已完成：\n完成',
+    expect(zh("queue.taskCompletedSuffix", { queue: "q", path: "/p/q.md" })).toBe(
+      '*队列 "q" 任务执行完成 · 完整内容见 /p/q.md*',
     );
-    expect(en("queue.taskFailed", { queue: "q", taskId: "1-2ab3", reason: "boom" })).toBe(
-      '❌ Queue "q" · task 1-2ab3 failed: boom',
+    expect(en("queue.taskFailedSuffix", { queue: "q", path: "/p/q.md" })).toBe(
+      '*Queue "q" task failed · full output: /p/q.md*',
     );
-    expect(zh("queue.taskFailed", { queue: "q", taskId: "1-2ab3", reason: "失败" })).toBe(
-      '❌ 队列 "q" · 任务 1-2ab3 执行失败：失败',
+    expect(zh("queue.taskFailedSuffix", { queue: "q", path: "/p/q.md" })).toBe(
+      '*队列 "q" 任务执行失败 · 完整内容见 /p/q.md*',
     );
-    expect(en("queue.taskTimedOut", { queue: "q", taskId: "1-2ab3" })).toBe(
-      '⏰ Queue "q" · task 1-2ab3 timed out.',
+    expect(en("queue.taskTimedOutSuffix", { queue: "q", path: "/p/q.md" })).toBe(
+      '*Queue "q" task timed out · full output: /p/q.md*',
     );
-    expect(zh("queue.taskTimedOut", { queue: "q", taskId: "1-2ab3" })).toBe(
-      '⏰ 队列 "q" · 任务 1-2ab3 已超时。',
+    expect(zh("queue.taskTimedOutSuffix", { queue: "q", path: "/p/q.md" })).toBe(
+      '*队列 "q" 任务超时 · 完整内容见 /p/q.md*',
+    );
+    expect(en("schedule.taskCompletedSuffix", { name: "daily-report", path: "/p/r.md" })).toBe(
+      '*Scheduled task "daily-report" completed · full output: /p/r.md*',
+    );
+    expect(zh("schedule.taskCompletedSuffix", { name: "daily-report", path: "/p/r.md" })).toBe(
+      '*定时任务 "daily-report" 执行完成 · 完整内容见 /p/r.md*',
+    );
+    expect(en("schedule.taskFailedSuffix", { name: "daily-report", path: "/p/r.md" })).toBe(
+      '*Scheduled task "daily-report" failed · full output: /p/r.md*',
+    );
+    expect(zh("schedule.taskFailedSuffix", { name: "daily-report", path: "/p/r.md" })).toBe(
+      '*定时任务 "daily-report" 执行失败 · 完整内容见 /p/r.md*',
+    );
+    expect(en("schedule.taskTimedOutSuffix", { name: "daily-report", path: "/p/r.md" })).toBe(
+      '*Scheduled task "daily-report" timed out · full output: /p/r.md*',
+    );
+    expect(zh("schedule.taskTimedOutSuffix", { name: "daily-report", path: "/p/r.md" })).toBe(
+      '*定时任务 "daily-report" 超时 · 完整内容见 /p/r.md*',
+    );
+    expect(en("schedule.taskNoOutputSuffix", { name: "daily-report", path: "/p/r.md" })).toBe(
+      '*Scheduled task "daily-report" finished with no output · full output: /p/r.md*',
+    );
+    expect(zh("schedule.taskNoOutputSuffix", { name: "daily-report", path: "/p/r.md" })).toBe(
+      '*定时任务 "daily-report" 执行完成，无输出 · 完整内容见 /p/r.md*',
     );
     expect(en("cli.queueInserted", { name: "inbox", taskId: "1-2ab3" })).toBe(
       'Inserted task 1-2ab3 into queue "inbox".',
@@ -59,19 +83,11 @@ describe("i18n", () => {
     expect(en("cli.queueNotFound", { name: "inbox" })).toBe('Queue "inbox" not found.');
     expect(zh("cli.queueNotFound", { name: "inbox" })).toBe('未找到队列 "inbox"。');
     expect(en("client.queueHereBound", { name: "build" })).toBe(
-      'Queue "build" is now bound to this chat — pending tasks will start draining on the next tick.',
+      'Queue "build" is now bound to this chat.',
     );
-    expect(zh("client.queueHereBound", { name: "build" })).toBe(
-      '队列 "build" 已绑定到本会话——积压任务将在下一个 tick 开始被消费。',
-    );
+    expect(zh("client.queueHereBound", { name: "build" })).toBe('队列 "build" 已绑定到本会话。');
     expect(en("client.queueHereQueueNotFound", { name: "build" })).toBe('Queue "build" was not found.');
     expect(zh("client.queueHereQueueNotFound", { name: "build" })).toBe('未找到队列 "build"。');
-    expect(en("client.queueHereWrongChannel", { name: "build", channel: "feishu-dev" })).toBe(
-      'Queue "build" belongs to channel "feishu-dev".',
-    );
-    expect(zh("client.queueHereWrongChannel", { name: "build", channel: "feishu-dev" })).toBe(
-      '队列 "build" 归属于 channel "feishu-dev"。',
-    );
     expect(en("client.queueHereAlreadyBound", { name: "build" })).toBe(
       'Queue "build" is already bound to a chat. To rebind, edit the queue file with AI.',
     );

@@ -13,7 +13,7 @@ import { weixinClientModule } from "./weixin";
 // The adapters do not parse it (an unrecognized slash command passes through
 // as a plain `user.message`), and the core recognizes the raw text itself —
 // see `GatewayCore#handleQueueHereCommand` — writing the binding with
-// queue-file's `setQueueTarget`. No command shape needs surfacing here.
+// queue-file's `bindQueue`. No command shape needs surfacing here.
 export type { OnScheduleHere, OnScheduleRun, ScheduleHereResult, ScheduleRunResult } from "../../types";
 
 const registry = new Map<string, ClientModule<any, any>>([
