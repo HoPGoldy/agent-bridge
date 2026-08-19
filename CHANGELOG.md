@@ -2,6 +2,15 @@
 
 All notable changes to this project will be documented in this file. See [commit-and-tag-version](https://github.com/absolute-version/commit-and-tag-version) for commit guidelines.
 
+## [0.8.2](https://github.com/HoPGoldy/agent-bridge/compare/v0.8.1...v0.8.2) (2026-08-19)
+
+
+### Features
+
+* accumulate run output, complete on DONE marker; idle reap by event-idle ([212d552](https://github.com/HoPGoldy/agent-bridge/commit/212d55277248106afe4174b7dca797a6bc1c2dc3))
+* add event queues with worker concurrency ([477b20f](https://github.com/HoPGoldy/agent-bridge/commit/477b20f83c1b81019a9bf952560a9ee3c883a3f2))
+* support per-task model for scheduled tasks ([3ed75ba](https://github.com/HoPGoldy/agent-bridge/commit/3ed75ba2a76ae3b3b7789d60865f1b621ed08cb9))
+
 ## [0.8.1](https://github.com/HoPGoldy/agent-bridge/compare/v0.8.0...v0.8.1) (2026-08-18)
 
 
