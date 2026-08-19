@@ -1,6 +1,7 @@
 import { beforeEach, describe, expect, it, vi } from "vitest";
 import type { ChannelConfig, ChannelCommonContext, ClientInputEvent, ClientOutputEvent } from "../types";
 import type { SchedulerOptions } from "../modules/schedule/scheduler";
+import type { QueueControllerOptions } from "../modules/queue/controller";
 
 const createClientAdapter = vi.fn();
 const imAdapterInput = vi.fn(async () => {});
@@ -39,6 +40,20 @@ const schedulerCtor = vi.fn().mockImplementation((options: SchedulerOptions) => 
     runNow: schedulerRunNow,
     claimTarget: schedulerClaimTarget,
     handleOutput: schedulerHandleOutput,
+  };
+});
+
+const queueControllerStart = vi.fn(async () => {});
+const queueControllerStop = vi.fn(async () => {});
+const queueControllerHandleOutput = vi.fn();
+/** Options captured from the runner's `new QueueController(...)` call, per test. */
+let queueControllerOptions: QueueControllerOptions | undefined;
+const queueControllerCtor = vi.fn().mockImplementation((options: QueueControllerOptions) => {
+  queueControllerOptions = options;
+  return {
+    start: queueControllerStart,
+    stop: queueControllerStop,
+    handleOutput: queueControllerHandleOutput,
   };
 });
 
@@ -82,6 +97,10 @@ vi.mock("../modules/schedule/scheduler", () => ({
   Scheduler: schedulerCtor,
 }));
 
+vi.mock("../modules/queue/controller", () => ({
+  QueueController: queueControllerCtor,
+}));
+
 vi.mock("../modules/client", () => ({
   getTypedClientModule: () => clientModule,
 }));
@@ -122,6 +141,11 @@ describe("runChannel", () => {
     schedulerClaimTarget.mockClear();
     schedulerHandleOutput.mockClear();
     schedulerOptions = undefined;
+    queueControllerCtor.mockClear();
+    queueControllerStart.mockClear();
+    queueControllerStop.mockClear();
+    queueControllerHandleOutput.mockClear();
+    queueControllerOptions = undefined;
     clientModule.validateSessionId.mockClear();
   });
 
@@ -303,6 +327,7 @@ describe("runChannel", () => {
 
     await runner.stop();
     expect(schedulerStop).toHaveBeenCalledTimes(1);
+    expect(queueControllerStop).toHaveBeenCalledTimes(1);
     expect(gatewayCoreStop).toHaveBeenCalledTimes(1);
     // runner.stop() shuts the scheduler down before the core (spec D9).
     expect(gatewayCoreStop.mock.invocationCallOrder[0]).toBeGreaterThan(
@@ -371,6 +396,135 @@ describe("runChannel", () => {
 
     // t is the per-channel translator.
     expect(typeof schedulerOptions!.t).toBe("function");
+  });
+
+  it("starts the queue controller after the scheduler and stops it before the core", async () => {
+    const { runChannel } = await import("./channel-runner");
+    const channelConfig: ChannelConfig = {
+      common: { language: "en-US" },
+      client: {
+        type: "wecom",
+        config: { botId: "bot-id", secret: "secret" },
+      },
+      agent: {
+        type: "pi-coding-agent",
+        config: {},
+      },
+    };
+
+    const runner = await runChannel({
+      channelName: "demo-channel",
+      channelConfig,
+      defaults: { agentIdleTimeoutMs: 60_000 },
+    });
+
+    expect(queueControllerStart).toHaveBeenCalledTimes(1);
+    // core.start() → scheduler.start() → queueController.start().
+    expect(queueControllerStart.mock.invocationCallOrder[0]).toBeGreaterThan(
+      schedulerStart.mock.invocationCallOrder[0]!,
+    );
+
+    await runner.stop();
+    expect(queueControllerStop).toHaveBeenCalledTimes(1);
+    // runner.stop() shuts the controller down before the core.
+    expect(gatewayCoreStop.mock.invocationCallOrder[0]).toBeGreaterThan(
+      queueControllerStop.mock.invocationCallOrder[0]!,
+    );
+  });
+
+  it("wires the queue controller callbacks to the core input and adapter input", async () => {
+    const { runChannel } = await import("./channel-runner");
+    const channelConfig: ChannelConfig = {
+      common: { language: "en-US" },
+      client: {
+        type: "wecom",
+        config: { botId: "bot-id", secret: "secret" },
+      },
+      agent: {
+        type: "pi-coding-agent",
+        config: {},
+      },
+    };
+
+    await runChannel({
+      channelName: "demo-channel",
+      channelConfig,
+      defaults: { agentIdleTimeoutMs: 60_000 },
+    });
+
+    expect(queueControllerOptions).toBeDefined();
+    expect(queueControllerOptions!.channelName).toBe("demo-channel");
+
+    // dispatchClientEvent → core.input: synthetic fires enter the core's public ingress.
+    await queueControllerOptions!.dispatchClientEvent({
+      type: "command.session.new",
+      clientSessionId: "queue:q:1-2ab3",
+      workingDirectory: "/tmp",
+      workingDirectorySource: "default",
+    });
+    await queueControllerOptions!.dispatchClientEvent({
+      type: "user.message",
+      clientSessionId: "queue:q:1-2ab3",
+      text: "summarize",
+    });
+    expect(gatewayCoreInput).toHaveBeenCalledTimes(2);
+    expect(gatewayCoreInput).toHaveBeenNthCalledWith(1, {
+      type: "command.session.new",
+      clientSessionId: "queue:q:1-2ab3",
+      workingDirectory: "/tmp",
+      workingDirectorySource: "default",
+    });
+    expect(gatewayCoreInput).toHaveBeenNthCalledWith(2, {
+      type: "user.message",
+      clientSessionId: "queue:q:1-2ab3",
+      text: "summarize",
+    });
+
+    // deliver → imAdapter.input: egress to a queue's target chat.
+    const egress: ClientInputEvent = {
+      type: "assistant.message",
+      clientSessionId: "wecom:dm:oc_abc",
+      text: "done",
+    };
+    await queueControllerOptions!.deliver(egress);
+    expect(imAdapterInput).toHaveBeenCalledWith(egress);
+
+    // t is the per-channel translator.
+    expect(typeof queueControllerOptions!.t).toBe("function");
+  });
+
+  it("diverts queue output from the core to the queue controller", async () => {
+    const { runChannel } = await import("./channel-runner");
+    const channelConfig: ChannelConfig = {
+      common: { language: "en-US" },
+      client: {
+        type: "wecom",
+        config: { botId: "bot-id", secret: "secret" },
+      },
+      agent: {
+        type: "pi-coding-agent",
+        config: {},
+      },
+    };
+
+    await runChannel({
+      channelName: "demo-channel",
+      channelConfig,
+      defaults: { agentIdleTimeoutMs: 60_000 },
+    });
+
+    const coreOptions = gatewayCoreCtor.mock.calls[0]![0] as {
+      onQueueOutput: (event: ClientInputEvent) => void;
+    };
+    expect(typeof coreOptions.onQueueOutput).toBe("function");
+
+    const result: ClientInputEvent = {
+      type: "assistant.message",
+      clientSessionId: "queue:q:1-2ab3",
+      text: "the result",
+    };
+    coreOptions.onQueueOutput(result);
+    expect(queueControllerHandleOutput).toHaveBeenCalledWith(result);
   });
 
   it("diverts schedule output from the core to the scheduler", async () => {

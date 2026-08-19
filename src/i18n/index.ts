@@ -19,7 +19,7 @@ const resources = {
       client: {
         processing: "Processing...",
         helpMessage:
-          "Available commands:\n\n- `/new [path]` (`/n [path]`) - Start a new agent session; optionally start it in a specific directory, e.g. `/new /path/to/project`. A directory given once is remembered and reused by later `/new` without a path\n- `/compact` (`/c`) - Compact the current session context\n- `/stop` (`/s`) - Stop the active agent run\n- `/status` (`/st`) - Show the current agent session status\n- `/model` (`/m`) - List available models, or switch with `/model provider/modelId`\n- `/schedule-run <task-name>` - Run a scheduled task once now (the result is sent to the task's target chat)\n- `/schedule-here <task-name>` - Bind this chat as a task's result destination and set the task's owning channel (send this in the chat that should receive the results; an already-bound task must be unbound first)\n- `/help` (`/h`) - Show this help message",
+          "Available commands:\n\n- `/new [path]` (`/n [path]`) - Start a new agent session; optionally start it in a specific directory, e.g. `/new /path/to/project`. A directory given once is remembered and reused by later `/new` without a path\n- `/compact` (`/c`) - Compact the current session context\n- `/stop` (`/s`) - Stop the active agent run\n- `/status` (`/st`) - Show the current agent session status\n- `/model` (`/m`) - List available models, or switch with `/model provider/modelId`\n- `/schedule-run <task-name>` - Run a scheduled task once now (the result is sent to the task's target chat)\n- `/schedule-here <task-name>` - Bind this chat as a task's result destination and set the task's owning channel (send this in the chat that should receive the results; an already-bound task must be unbound first)\n- `/queue-here <queue-name>` - Bind this chat as a queue's result destination (send this in the chat that should receive the results; an already-bound queue must be unbound by editing its file with AI)\n- `/help` (`/h`) - Show this help message",
         messageDeliveryFailedTitle: "[agent-bridge error] Message delivery failed",
         invalidNewWorkingDirectory:
           "Cannot start a new session: the working directory `{{workingDirectory}}` is invalid ({{detail}}).",
@@ -41,6 +41,14 @@ const resources = {
         scheduleHereAlreadyBound:
           'Task "{{name}}" is already bound to a chat. To rebind it, remove the `target`/`channel` lines from its task file (ask the AI in its current bound chat, or edit the file manually).',
         scheduleHereUsage: 'Usage: `/schedule-here <task-name>` (task names match `[a-z0-9-]+`).',
+        queueHereBound:
+          'Queue "{{name}}" is now bound to this chat — pending tasks will start draining on the next tick.',
+        queueHereQueueNotFound: 'Queue "{{name}}" was not found.',
+        queueHereWrongChannel: 'Queue "{{name}}" belongs to channel "{{channel}}".',
+        queueHereAlreadyBound:
+          'Queue "{{name}}" is already bound to a chat. To rebind, edit the queue file with AI.',
+        queueHereFailed: 'Failed to bind queue "{{name}}": {{reason}}',
+        queueHereUsage: 'Usage: `/queue-here <queue-name>` (queue names match `[a-z0-9-]+`).',
         statusTitle: "Current session status",
         statusSessionId: "Session ID",
         statusModel: "Model",
@@ -72,6 +80,26 @@ const resources = {
       cli: {
         examplePrompt:
           "Tell me what time it is right now, in one sentence. (This is the example prompt — replace it.)",
+        queueNamePrompt: "Queue name",
+        queueNameInvalid:
+          "Queue name must be [a-z0-9-]+ (lowercase letters, digits and hyphens only)",
+        queueNameExists: 'A queue named "{{name}}" already exists.',
+        channelPrompt: "Select channel",
+        noChannelsConfigured: "No channels configured. Add one with `agent-bridge add` first.",
+        workersPrompt: "Workers (default 1)",
+        workersInvalid: "Workers must be a positive integer (>= 1).",
+        modelPrompt: "Model (optional, blank = channel default)",
+        queueCreated: "Created successfully!",
+        queueCreatedGuideFile: "Edit {{filePath}} to set the shared context.",
+        queueCreatedGuideBind: "Send `/queue-here {{name}}` in chat app to bind a chat.",
+        queueCreatedGuideInsert:
+          'Insert tasks with `agent-bridge queue insert {{name}} --prompt "..."`.',
+        queueInserted: 'Inserted task {{taskId}} into queue "{{name}}".',
+        queueInsertPromptRequired: "--prompt is required and must be a non-empty string.",
+        queueInsertUnboundWarning:
+          "Warning: the queue has no target yet — tasks wait until `/queue-here` binds a chat.",
+        queueNotFound: 'Queue "{{name}}" not found.',
+        noQueues: "No queues found. Add one with `agent-bridge queue add`.",
       },
       schedule: {
         taskResultHeader: '📋 Scheduled task "{{name}}":',
@@ -79,6 +107,11 @@ const resources = {
         taskTimedOut: '⏰ Scheduled task "{{name}}" timed out.',
         taskNoOutput: 'Scheduled task "{{name}}" finished with no output.',
         fireError: '❌ Scheduled task "{{name}}" could not start: {{detail}}',
+      },
+      queue: {
+        taskCompleted: '✅ Queue "{{queue}}" · task {{taskId}} completed:\n{{result}}',
+        taskFailed: '❌ Queue "{{queue}}" · task {{taskId}} failed: {{reason}}',
+        taskTimedOut: '⏰ Queue "{{queue}}" · task {{taskId}} timed out.',
       },
     },
   },
@@ -97,7 +130,7 @@ const resources = {
       client: {
         processing: "正在处理中...",
         helpMessage:
-          "可用命令：\n\n- `/new [path]` (`/n [path]`) - 开始一个新会话；可选指定工作目录，例如 `/new /path/to/project`。指定过的目录会被记住，之后不带路径的 `/new` 会继续使用它\n- `/compact` (`/c`) - 压缩当前会话上下文\n- `/stop` (`/s`) - 停止当前正在运行的任务\n- `/status` (`/st`) - 查看当前智能体会话状态\n- `/model` (`/m`) - 查看可用模型，或使用 `/model provider/modelId` 切换模型\n- `/schedule-run <任务名>` - 立即运行一次定时任务（结果会发送到该任务的目标聊天）\n- `/schedule-here <任务名>` - 把本会话设为该任务结果的发送目标并确定其归属 channel（请在希望接收结果的聊天里发送；已绑定的任务需先解绑）\n- `/help` (`/h`) - 查看这条帮助信息",
+          "可用命令：\n\n- `/new [path]` (`/n [path]`) - 开始一个新会话；可选指定工作目录，例如 `/new /path/to/project`。指定过的目录会被记住，之后不带路径的 `/new` 会继续使用它\n- `/compact` (`/c`) - 压缩当前会话上下文\n- `/stop` (`/s`) - 停止当前正在运行的任务\n- `/status` (`/st`) - 查看当前智能体会话状态\n- `/model` (`/m`) - 查看可用模型，或使用 `/model provider/modelId` 切换模型\n- `/schedule-run <任务名>` - 立即运行一次定时任务（结果会发送到该任务的目标聊天）\n- `/schedule-here <任务名>` - 把本会话设为该任务结果的发送目标并确定其归属 channel（请在希望接收结果的聊天里发送；已绑定的任务需先解绑）\n- `/queue-here <队列名>` - 把本会话设为队列结果的发送目标（请在希望接收结果的聊天里发送；已绑定的队列需编辑文件解绑）\n- `/help` (`/h`) - 查看这条帮助信息",
         messageDeliveryFailedTitle: "[agent-bridge 错误] 消息发送失败",
         invalidNewWorkingDirectory:
           "无法开始新会话：工作目录 `{{workingDirectory}}` 无效（{{detail}}）。",
@@ -118,6 +151,12 @@ const resources = {
         scheduleHereAlreadyBound:
           '任务 "{{name}}" 已绑定到某聊天。要重新绑定，请删除其任务文件中的 `target`/`channel` 行（可在它当前绑定的聊天里让 AI 处理，或手动编辑文件）。',
         scheduleHereUsage: '用法：`/schedule-here <任务名>`（任务名需匹配 `[a-z0-9-]+`）。',
+        queueHereBound: '队列 "{{name}}" 已绑定到本会话——积压任务将在下一个 tick 开始被消费。',
+        queueHereQueueNotFound: '未找到队列 "{{name}}"。',
+        queueHereWrongChannel: '队列 "{{name}}" 归属于 channel "{{channel}}"。',
+        queueHereAlreadyBound: '队列 "{{name}}" 已绑定到某个会话。如需重新绑定，请用 AI 编辑队列文件。',
+        queueHereFailed: '无法绑定队列 "{{name}}"：{{reason}}',
+        queueHereUsage: '用法：`/queue-here <队列名>`（队列名需匹配 `[a-z0-9-]+`）。',
         statusTitle: "当前会话状态",
         statusSessionId: "Session ID",
         statusModel: "模型",
@@ -147,6 +186,24 @@ const resources = {
       },
       cli: {
         examplePrompt: "告诉我现在几点了，一句话就好。（这是示例 prompt，请替换成你自己的任务。）",
+        queueNamePrompt: "队列名称",
+        queueNameInvalid: "队列名称只能由小写字母、数字和连字符组成（[a-z0-9-]+）",
+        queueNameExists: '已存在名为 "{{name}}" 的队列。',
+        channelPrompt: "选择 channel",
+        noChannelsConfigured: "尚未配置任何 channel。请先用 `agent-bridge add` 添加。",
+        workersPrompt: "并发数（默认 1）",
+        workersInvalid: "并发数必须是大于等于 1 的整数。",
+        modelPrompt: "模型（可选，留空使用 channel 默认模型）",
+        queueCreated: "创建成功！",
+        queueCreatedGuideFile: "编辑 {{filePath}} 设置共享上下文。",
+        queueCreatedGuideBind: "在聊天应用中发送 `/queue-here {{name}}` 绑定聊天。",
+        queueCreatedGuideInsert: '使用 `agent-bridge queue insert {{name}} --prompt "..."` 插入任务。',
+        queueInserted: '已向队列 "{{name}}" 插入任务 {{taskId}}。',
+        queueInsertPromptRequired: "--prompt 为必填项，且不能为空。",
+        queueInsertUnboundWarning:
+          "警告：该队列尚未绑定目标聊天——任务将一直等待，直到通过 `/queue-here` 绑定。",
+        queueNotFound: '未找到队列 "{{name}}"。',
+        noQueues: "尚未创建任何队列。请使用 `agent-bridge queue add` 创建。",
       },
       schedule: {
         taskResultHeader: '📋 定时任务 "{{name}}"：',
@@ -154,6 +211,11 @@ const resources = {
         taskTimedOut: '⏰ 定时任务 "{{name}}" 已超时。',
         taskNoOutput: '定时任务 "{{name}}" 已完成，但没有输出。',
         fireError: '❌ 定时任务 "{{name}}" 无法启动：{{detail}}',
+      },
+      queue: {
+        taskCompleted: '✅ 队列 "{{queue}}" · 任务 {{taskId}} 已完成：\n{{result}}',
+        taskFailed: '❌ 队列 "{{queue}}" · 任务 {{taskId}} 执行失败：{{reason}}',
+        taskTimedOut: '⏰ 队列 "{{queue}}" · 任务 {{taskId}} 已超时。',
       },
     },
   },

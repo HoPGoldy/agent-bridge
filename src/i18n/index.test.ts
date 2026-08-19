@@ -24,6 +24,72 @@ describe("i18n", () => {
     expect(zh("gateway.failedToResumeSession", { detail: "boom" })).toBe(
       "恢复智能体会话失败：boom\n请使用 `/new` 开始新会话。",
     );
+    expect(en("queue.taskCompleted", { queue: "q", taskId: "1-2ab3", result: "done" })).toBe(
+      '✅ Queue "q" · task 1-2ab3 completed:\ndone',
+    );
+    expect(zh("queue.taskCompleted", { queue: "q", taskId: "1-2ab3", result: "完成" })).toBe(
+      '✅ 队列 "q" · 任务 1-2ab3 已完成：\n完成',
+    );
+    expect(en("queue.taskFailed", { queue: "q", taskId: "1-2ab3", reason: "boom" })).toBe(
+      '❌ Queue "q" · task 1-2ab3 failed: boom',
+    );
+    expect(zh("queue.taskFailed", { queue: "q", taskId: "1-2ab3", reason: "失败" })).toBe(
+      '❌ 队列 "q" · 任务 1-2ab3 执行失败：失败',
+    );
+    expect(en("queue.taskTimedOut", { queue: "q", taskId: "1-2ab3" })).toBe(
+      '⏰ Queue "q" · task 1-2ab3 timed out.',
+    );
+    expect(zh("queue.taskTimedOut", { queue: "q", taskId: "1-2ab3" })).toBe(
+      '⏰ 队列 "q" · 任务 1-2ab3 已超时。',
+    );
+    expect(en("cli.queueInserted", { name: "inbox", taskId: "1-2ab3" })).toBe(
+      'Inserted task 1-2ab3 into queue "inbox".',
+    );
+    expect(zh("cli.queueInserted", { name: "inbox", taskId: "1-2ab3" })).toBe(
+      '已向队列 "inbox" 插入任务 1-2ab3。',
+    );
+    expect(en("cli.queueInsertUnboundWarning")).toBe(
+      "Warning: the queue has no target yet — tasks wait until `/queue-here` binds a chat.",
+    );
+    expect(zh("cli.queueInsertUnboundWarning")).toBe(
+      "警告：该队列尚未绑定目标聊天——任务将一直等待，直到通过 `/queue-here` 绑定。",
+    );
+    expect(en("cli.noQueues")).toBe("No queues found. Add one with `agent-bridge queue add`.");
+    expect(zh("cli.noQueues")).toBe("尚未创建任何队列。请使用 `agent-bridge queue add` 创建。");
+    expect(en("cli.queueNotFound", { name: "inbox" })).toBe('Queue "inbox" not found.');
+    expect(zh("cli.queueNotFound", { name: "inbox" })).toBe('未找到队列 "inbox"。');
+    expect(en("client.queueHereBound", { name: "build" })).toBe(
+      'Queue "build" is now bound to this chat — pending tasks will start draining on the next tick.',
+    );
+    expect(zh("client.queueHereBound", { name: "build" })).toBe(
+      '队列 "build" 已绑定到本会话——积压任务将在下一个 tick 开始被消费。',
+    );
+    expect(en("client.queueHereQueueNotFound", { name: "build" })).toBe('Queue "build" was not found.');
+    expect(zh("client.queueHereQueueNotFound", { name: "build" })).toBe('未找到队列 "build"。');
+    expect(en("client.queueHereWrongChannel", { name: "build", channel: "feishu-dev" })).toBe(
+      'Queue "build" belongs to channel "feishu-dev".',
+    );
+    expect(zh("client.queueHereWrongChannel", { name: "build", channel: "feishu-dev" })).toBe(
+      '队列 "build" 归属于 channel "feishu-dev"。',
+    );
+    expect(en("client.queueHereAlreadyBound", { name: "build" })).toBe(
+      'Queue "build" is already bound to a chat. To rebind, edit the queue file with AI.',
+    );
+    expect(zh("client.queueHereAlreadyBound", { name: "build" })).toBe(
+      '队列 "build" 已绑定到某个会话。如需重新绑定，请用 AI 编辑队列文件。',
+    );
+    expect(en("client.queueHereFailed", { name: "build", reason: "boom" })).toBe(
+      'Failed to bind queue "build": boom',
+    );
+    expect(zh("client.queueHereFailed", { name: "build", reason: "失败" })).toBe(
+      '无法绑定队列 "build"：失败',
+    );
+    expect(en("client.queueHereUsage")).toBe(
+      "Usage: `/queue-here <queue-name>` (queue names match `[a-z0-9-]+`).",
+    );
+    expect(zh("client.queueHereUsage")).toBe(
+      "用法：`/queue-here <队列名>`（队列名需匹配 `[a-z0-9-]+`）。",
+    );
   });
 
   it("does not leak locale state across fixed translators", () => {

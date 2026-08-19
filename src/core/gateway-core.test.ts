@@ -1,3 +1,6 @@
+import { mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
+import os from "node:os";
+import path from "node:path";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { GatewayCore } from "./gateway-core";
 import { emptyChannelState } from "../config/channel-state";
@@ -32,6 +35,29 @@ async function waitFor(assertion: () => void | Promise<void>, timeoutMs = 1000):
     }
   }
   await assertion();
+}
+
+/** Creates a temporary queue-definitions root for `/queue-here` tests (spec D1). */
+async function makeTempQueuesDir(tempDirs: string[]): Promise<string> {
+  const dir = await mkdtemp(path.join(os.tmpdir(), "agent-bridge-queues-"));
+  tempDirs.push(dir);
+  return dir;
+}
+
+/** Seeds a queue definition file: `queues/<name>.md` with a `channel` and optional extra fields. */
+async function writeQueueDefinitionFile(
+  queuesRoot: string,
+  name: string,
+  channel: string,
+  extra: Record<string, string> = {},
+): Promise<void> {
+  const frontMatter = [
+    "---",
+    `channel: ${channel}`,
+    ...Object.entries(extra).map(([key, value]) => `${key}: ${value}`),
+    "---",
+  ];
+  await writeFile(path.join(queuesRoot, `${name}.md`), `${frontMatter.join("\n")}\n`);
 }
 
 class FakeIMAdapter implements IMAdapter {
@@ -394,10 +420,14 @@ class BlockingInputAdapter extends FakeAgentAdapter {
 
 describe("GatewayCore", () => {
   const running: Array<{ stop: () => Promise<void> }> = [];
+  const tempDirs: string[] = [];
 
   afterEach(async () => {
     while (running.length > 0) {
       await running.pop()!.stop();
+    }
+    while (tempDirs.length > 0) {
+      await rm(tempDirs.pop()!, { recursive: true, force: true });
     }
   });
 
@@ -3208,5 +3238,495 @@ describe("GatewayCore", () => {
     } finally {
       logSpy.mockRestore();
     }
+  });
+
+  it("diverts every queue:* output event to onQueueOutput and never to the IM adapter", async () => {
+    const imAdapter = new FakeIMAdapter();
+    const store = makeStore();
+    const createdAdapters: FakeAgentAdapter[] = [];
+    const queueDiverted: ClientInputEvent[] = [];
+    const scheduleDiverted: ClientInputEvent[] = [];
+    const logSpy = vi.spyOn(console, "log").mockImplementation(() => {});
+
+    try {
+      const agentModule = makeFakeModule({ createdAdapters });
+
+      const core = new GatewayCore({
+        imAdapter,
+        agentModule,
+        agentConfig: {},
+        agentIdleTimeoutMs: 60_000,
+        channelStateStore: store,
+        onScheduleOutput: (event) => {
+          scheduleDiverted.push(event);
+        },
+        onQueueOutput: (event) => {
+          queueDiverted.push(event);
+        },
+      });
+      running.push(core);
+      await core.start();
+
+      // Fire a queue run through the public ingress (spec D1/D3): session.new
+      // first, then the prompt as a user.message.
+      await core.input({
+        type: "command.session.new",
+        clientSessionId: "queue:build:1",
+        workingDirectory: "/tmp/project-a",
+        workingDirectorySource: "default",
+      });
+      await core.input({
+        type: "user.message",
+        clientSessionId: "queue:build:1",
+        text: "run the build",
+      });
+      await waitFor(() => {
+        expect(createdAdapters).toHaveLength(1);
+      });
+      const queueAdapter = createdAdapters[0]!;
+
+      // Progress, completion and terminal-error events are all diverted to the
+      // queue callback with the substituted clientSessionId.
+      await queueAdapter.emit({
+        type: "assistant.thinking",
+        agentSessionId: queueAdapter.agentSessionId,
+        text: "hmm",
+      });
+      await queueAdapter.emit({
+        type: "assistant.tool.running",
+        agentSessionId: queueAdapter.agentSessionId,
+        toolName: "read_file",
+        text: undefined,
+      });
+      await queueAdapter.emitAssistant("the build output");
+      await queueAdapter.emit({
+        type: "error",
+        agentSessionId: queueAdapter.agentSessionId,
+        kind: "agent.run.failed",
+        detail: "boom",
+      });
+
+      await waitFor(() => {
+        expect(queueDiverted).toHaveLength(4);
+      });
+      expect(queueDiverted.map(({ type, clientSessionId }) => ({ type, clientSessionId }))).toEqual([
+        { type: "assistant.thinking", clientSessionId: "queue:build:1" },
+        { type: "assistant.tool.running", clientSessionId: "queue:build:1" },
+        { type: "assistant.message", clientSessionId: "queue:build:1" },
+        { type: "error", clientSessionId: "queue:build:1" },
+      ]);
+      expect(queueDiverted[2]).toMatchObject({ text: "the build output" });
+      expect(queueDiverted[3]).toMatchObject({ kind: "agent.run.failed", detail: "boom" });
+      // Nothing reached the IM adapter, and the queue:* binding stayed out of
+      // the state file.
+      expect(imAdapter.outputs).toEqual([]);
+      expect(Object.keys(store.state.bindings).filter((key) => key.startsWith("queue:"))).toEqual([]);
+
+      // Each controller gets only its own events: a schedule run diverts to
+      // the schedule callback, never the queue one.
+      await core.input({
+        type: "command.session.new",
+        clientSessionId: "schedule:report:1",
+        workingDirectory: "/tmp/project-a",
+        workingDirectorySource: "default",
+      });
+      await waitFor(() => {
+        expect(createdAdapters).toHaveLength(2);
+      });
+      const scheduleAdapter = createdAdapters[1]!;
+      await scheduleAdapter.emitAssistant("a scheduled reply");
+      await waitFor(() => {
+        expect(scheduleDiverted).toHaveLength(1);
+      });
+      expect(scheduleDiverted[0]).toMatchObject({
+        type: "assistant.message",
+        clientSessionId: "schedule:report:1",
+        text: "a scheduled reply",
+      });
+      expect(queueDiverted.some((event) => event.clientSessionId.startsWith("schedule:"))).toBe(false);
+      expect(scheduleDiverted.some((event) => event.clientSessionId.startsWith("queue:"))).toBe(false);
+
+      // A normal chat session is completely unaffected: same handler, same
+      // delivery path, and its binding is still persisted.
+      await imAdapter.emit({
+        type: "user.message",
+        clientSessionId: "client-1",
+        text: "hello",
+      });
+      await waitFor(() => {
+        expect(createdAdapters).toHaveLength(3);
+      });
+      const chatAdapter = createdAdapters[2]!;
+      await chatAdapter.emitAssistant("a normal reply");
+      await waitFor(() => {
+        expect(imAdapter.outputs.some((event) => event.text === "a normal reply")).toBe(true);
+        expect(store.state.bindings["client-1"]).toBe(chatAdapter.agentSessionId);
+      });
+      expect(queueDiverted.some((event) => event.clientSessionId === "client-1")).toBe(false);
+      expect(scheduleDiverted.some((event) => event.clientSessionId === "client-1")).toBe(false);
+    } finally {
+      logSpy.mockRestore();
+    }
+  });
+
+  it("falls back to the IM adapter path for queue:* output when no onQueueOutput is injected", async () => {
+    const imAdapter = new FakeIMAdapter();
+    const createdAdapters: FakeAgentAdapter[] = [];
+
+    const agentModule = makeFakeModule({ createdAdapters });
+
+    const core = new GatewayCore({
+      imAdapter,
+      agentModule,
+      agentConfig: {},
+      agentIdleTimeoutMs: 60_000,
+    });
+    running.push(core);
+    await core.start();
+
+    await core.input({
+      type: "command.session.new",
+      clientSessionId: "queue:build:1",
+      workingDirectory: "/tmp/project-a",
+      workingDirectorySource: "default",
+    });
+    await waitFor(() => {
+      expect(createdAdapters).toHaveLength(1);
+    });
+
+    await createdAdapters[0]!.emitAssistant("fallback reply");
+    await waitFor(() => {
+      expect(imAdapter.outputs).toContainEqual({
+        type: "assistant.message",
+        clientSessionId: "queue:build:1",
+        text: "fallback reply",
+      });
+    });
+  });
+
+  it("swallows a throwing onQueueOutput without affecting the core", async () => {
+    const imAdapter = new FakeIMAdapter();
+    const createdAdapters: FakeAgentAdapter[] = [];
+    const logSpy = vi.spyOn(console, "error").mockImplementation(() => {});
+
+    try {
+      const agentModule = makeFakeModule({ createdAdapters });
+
+      const core = new GatewayCore({
+        imAdapter,
+        agentModule,
+        agentConfig: {},
+        agentIdleTimeoutMs: 60_000,
+        onQueueOutput: () => {
+          throw new Error("divert boom");
+        },
+      });
+      running.push(core);
+      await core.start();
+
+      await core.input({
+        type: "command.session.new",
+        clientSessionId: "queue:build:1",
+        workingDirectory: "/tmp/project-a",
+        workingDirectorySource: "default",
+      });
+      await waitFor(() => {
+        expect(createdAdapters).toHaveLength(1);
+      });
+
+      await createdAdapters[0]!.emitAssistant("boom");
+      await sleep(30);
+
+      // The divert error was logged and swallowed: no unhandled rejection,
+      // nothing delivered to the IM adapter, and the core keeps working.
+      expect(imAdapter.outputs).toEqual([]);
+      expect(logSpy).toHaveBeenCalledWith(
+        expect.stringContaining("[core]"),
+        "failed to divert queue output for queue:build:1:",
+        expect.any(Error),
+      );
+    } finally {
+      logSpy.mockRestore();
+    }
+  });
+
+  it("surfaces a failed queue session.new as { ok: false } without delivering to the IM adapter", async () => {
+    const imAdapter = new FakeIMAdapter();
+    const store = makeStore();
+    const createdAdapters: FakeAgentAdapter[] = [];
+
+    // A session creation failure (for example an invalid/unavailable worker
+    // model rejected by the adapter) for a queue:* id.
+    const agentModule = makeFakeModule({
+      createdAdapters,
+      create: async () => {
+        throw new Error("boom: model not available");
+      },
+    });
+
+    const core = new GatewayCore({
+      imAdapter,
+      agentModule,
+      agentConfig: {},
+      agentIdleTimeoutMs: 60_000,
+      channelStateStore: store,
+    });
+    running.push(core);
+    await core.start();
+
+    const result = await core.input({
+      type: "command.session.new",
+      clientSessionId: "queue:build:1",
+      workingDirectory: "/tmp/project-a",
+      workingDirectorySource: "default",
+    });
+    expect(result).toEqual({ ok: false, reason: "boom: model not available" });
+
+    // Nothing reached the IM adapter: a queue:* id cannot be resolved by any
+    // adapter, so the failure surfaces through the ingress result only (T6) —
+    // the queue controller delivers the failure to the queue's target chat.
+    expect(imAdapter.outputs).toEqual([]);
+    expect(createdAdapters).toHaveLength(0);
+  });
+
+  it("drops a user.message for an unbound queue:* id, keeps bound runs memory-only, and deletes the record on release", async () => {
+    const imAdapter = new FakeIMAdapter();
+    const store = makeStore();
+    const createdAdapters: FakeAgentAdapter[] = [];
+    const logSpy = vi.spyOn(console, "warn").mockImplementation(() => {});
+
+    try {
+      const agentModule = makeFakeModule({ createdAdapters });
+
+      const core = new GatewayCore({
+        imAdapter,
+        agentModule,
+        agentConfig: {},
+        agentIdleTimeoutMs: 60_000,
+        channelStateStore: store,
+      });
+      running.push(core);
+      await core.start();
+
+      // A user.message with no prior session.new must never auto-create a
+      // session (T6): queue:* sessions are created exclusively by their
+      // synthetic session.new (spec D1/D3). The orphan message is logged and
+      // dropped; the intentional drop counts as handled.
+      await expect(
+        core.input({
+          type: "user.message",
+          clientSessionId: "queue:build:1",
+          text: "run the build",
+        }),
+      ).resolves.toEqual({ ok: true });
+      expect(createdAdapters).toHaveLength(0);
+      expect(imAdapter.outputs).toEqual([]);
+      expect(logSpy).toHaveBeenCalledWith(
+        expect.stringContaining("[core]"),
+        expect.stringContaining("dropping user.message for unbound queue session queue:build:1"),
+      );
+
+      // A bound queue session still works: session.new then user.message,
+      // and the binding stays memory-only (spec D3).
+      await core.input({
+        type: "command.session.new",
+        clientSessionId: "queue:build:1",
+        workingDirectory: "/tmp/project-a",
+        workingDirectorySource: "default",
+      });
+      await core.input({
+        type: "user.message",
+        clientSessionId: "queue:build:1",
+        text: "run the build",
+      });
+      await waitFor(() => {
+        expect(createdAdapters).toHaveLength(1);
+        expect(createdAdapters[0]!.inputs).toEqual([{ type: "user.message", text: "run the build" }]);
+      });
+      expect(store.state.bindings).toEqual({});
+
+      // SF-1: releasing the runtime (stop path) deletes the ephemeral queue
+      // record too, so a restart leaves no residue in the state file.
+      const agentSessionId = createdAdapters[0]!.agentSessionId;
+      await core.stop();
+      expect(store.state.agentSessions[agentSessionId]).toBeUndefined();
+    } finally {
+      logSpy.mockRestore();
+    }
+  });
+
+  it("binds this chat as a queue's delivery target on /queue-here and mentions the next tick", async () => {
+    const queuesRoot = await makeTempQueuesDir(tempDirs);
+    await writeQueueDefinitionFile(queuesRoot, "build", "feishu-dev");
+    const imAdapter = new FakeIMAdapter();
+    const createdAdapters: FakeAgentAdapter[] = [];
+
+    const core = new GatewayCore({
+      imAdapter,
+      agentModule: makeFakeModule({ createdAdapters }),
+      agentConfig: {},
+      agentIdleTimeoutMs: 60_000,
+      common: { channelName: "feishu-dev", language: "en-US" },
+      queuesRoot,
+    });
+    running.push(core);
+    await core.start();
+
+    await imAdapter.emit({
+      type: "user.message",
+      clientSessionId: "chat:build-results",
+      text: "/queue-here build",
+    });
+
+    await waitFor(() => {
+      expect(imAdapter.outputs).toContainEqual({
+        type: "assistant.message",
+        clientSessionId: "chat:build-results",
+        text: "Queue \"build\" is now bound to this chat — pending tasks will start draining on the next tick.",
+      });
+    });
+
+    // The binding is a plain file write (spec D4): `target` holds the sending
+    // chat's clientSessionId — the exact format the queue controller's
+    // deliver callback consumes (same as /schedule-here's target). The
+    // controller picks it up on its next tick reload.
+    const content = await readFile(path.join(queuesRoot, "build.md"), "utf8");
+    expect(content).toContain("target: chat:build-results");
+    // A pure command message never touches the agent session.
+    expect(createdAdapters).toHaveLength(0);
+  });
+
+  it("replies with a localized error when the queue does not exist", async () => {
+    const queuesRoot = await makeTempQueuesDir(tempDirs);
+    const imAdapter = new FakeIMAdapter();
+
+    const core = new GatewayCore({
+      imAdapter,
+      agentModule: makeFakeModule(),
+      agentConfig: {},
+      agentIdleTimeoutMs: 60_000,
+      common: { channelName: "feishu-dev", language: "en-US" },
+      queuesRoot,
+    });
+    running.push(core);
+    await core.start();
+
+    await imAdapter.emit({
+      type: "user.message",
+      clientSessionId: "client-1",
+      text: "/queue-here missing",
+    });
+
+    await waitFor(() => {
+      expect(imAdapter.outputs).toContainEqual({
+        type: "assistant.message",
+        clientSessionId: "client-1",
+        text: "Queue \"missing\" was not found.",
+      });
+    });
+  });
+
+  it("refuses to bind a queue that belongs to another channel with a localized reply", async () => {
+    const queuesRoot = await makeTempQueuesDir(tempDirs);
+    await writeQueueDefinitionFile(queuesRoot, "build", "feishu-dev");
+    const imAdapter = new FakeIMAdapter();
+
+    const core = new GatewayCore({
+      imAdapter,
+      agentModule: makeFakeModule(),
+      agentConfig: {},
+      agentIdleTimeoutMs: 60_000,
+      // A wecom-dev chat cannot bind a feishu-dev queue; the reply is
+      // localized to the chat's own language (zh-CN here).
+      common: { channelName: "wecom-dev", language: "zh-CN" },
+      queuesRoot,
+    });
+    running.push(core);
+    await core.start();
+
+    await imAdapter.emit({
+      type: "user.message",
+      clientSessionId: "client-1",
+      text: "/queue-here build",
+    });
+
+    await waitFor(() => {
+      expect(imAdapter.outputs).toContainEqual({
+        type: "assistant.message",
+        clientSessionId: "client-1",
+        text: '队列 "build" 归属于 channel "feishu-dev"。',
+      });
+    });
+    // Nothing was written: the queue file still has no target line.
+    const content = await readFile(path.join(queuesRoot, "build.md"), "utf8");
+    expect(content).not.toContain("target:");
+  });
+
+  it("refuses to rebind a queue that already has a target", async () => {
+    const queuesRoot = await makeTempQueuesDir(tempDirs);
+    await writeQueueDefinitionFile(queuesRoot, "build", "feishu-dev", {
+      target: "chat:old-owner",
+    });
+    const imAdapter = new FakeIMAdapter();
+
+    const core = new GatewayCore({
+      imAdapter,
+      agentModule: makeFakeModule(),
+      agentConfig: {},
+      agentIdleTimeoutMs: 60_000,
+      common: { channelName: "feishu-dev", language: "en-US" },
+      queuesRoot,
+    });
+    running.push(core);
+    await core.start();
+
+    await imAdapter.emit({
+      type: "user.message",
+      clientSessionId: "client-1",
+      text: "/queue-here build",
+    });
+
+    await waitFor(() => {
+      expect(imAdapter.outputs).toContainEqual({
+        type: "assistant.message",
+        clientSessionId: "client-1",
+        text: expect.stringContaining('Queue "build" is already bound'),
+      });
+    });
+    // The existing binding is untouched (rebinding is an AI file edit).
+    const content = await readFile(path.join(queuesRoot, "build.md"), "utf8");
+    expect(content).toContain("target: chat:old-owner");
+  });
+
+  it("shows a usage reply for a malformed /queue-here without touching the agent session", async () => {
+    const queuesRoot = await makeTempQueuesDir(tempDirs);
+    const imAdapter = new FakeIMAdapter();
+    const createdAdapters: FakeAgentAdapter[] = [];
+
+    const core = new GatewayCore({
+      imAdapter,
+      agentModule: makeFakeModule({ createdAdapters }),
+      agentConfig: {},
+      agentIdleTimeoutMs: 60_000,
+      common: { channelName: "feishu-dev", language: "en-US" },
+      queuesRoot,
+    });
+    running.push(core);
+    await core.start();
+
+    await imAdapter.emit({
+      type: "user.message",
+      clientSessionId: "client-1",
+      text: "/queue-here",
+    });
+
+    await waitFor(() => {
+      expect(imAdapter.outputs).toContainEqual({
+        type: "assistant.message",
+        clientSessionId: "client-1",
+        text: "Usage: `/queue-here <queue-name>` (queue names match `[a-z0-9-]+`).",
+      });
+    });
+    expect(createdAdapters).toHaveLength(0);
   });
 });

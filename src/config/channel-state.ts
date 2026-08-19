@@ -25,6 +25,9 @@ const STATE_DIR = path.join(os.homedir(), ".config", "agent-bridge", "session-bi
 /** Root directory of scheduled task files (`schedules/<channel>/<task>.md`, spec D3). */
 export const SCHEDULES_DIR = path.join(os.homedir(), ".config", "agent-bridge", "schedules");
 
+/** Root directory of event queue files (`queues/<name>.md` + `<name>.tasks/`, spec D1). */
+export const QUEUES_DIR = path.join(os.homedir(), ".config", "agent-bridge", "queues");
+
 /** Bridge agent session id prefixes for the built-in agent modules. */
 const KNOWN_AGENT_TYPE_PREFIXES: ReadonlyArray<readonly [prefix: string, agentType: string]> = [
   ["pi-coding-agent:", "pi-coding-agent"],

@@ -1,5 +1,6 @@
 import { beforeEach, describe, expect, it, vi } from "vitest";
 import type { LoadedTask, ScheduleTask } from "./modules/schedule/task-file";
+import type { QueueDefinition, QueueTask } from "./modules/queue/queue-file";
 
 const promptCalls: string[] = [];
 const close = vi.fn();
@@ -16,6 +17,8 @@ const input = vi.fn(async (label: string) => {
   if (label === "Working directory (optional, blank = bridge cwd)") return "";
   if (label === "Timeout (default 10m)") return "10m";
   if (label === "Model (optional, blank = channel default)") return "";
+  if (label === "Queue name") return "inbox";
+  if (label === "Workers (default 1)") return "1";
   throw new Error(`unexpected input prompt: ${label}`);
 });
 const select = vi.fn(async (label: string) => {
@@ -35,6 +38,12 @@ const saveConfig = vi.fn(async () => {});
 const mkdir = vi.fn(async () => {});
 const writeFile = vi.fn(async () => {});
 const unlink = vi.fn(async () => {});
+// Queue command tests run the real queue-file writers against a fixed temp
+// root, so the fs mock also needs the access/rename plumbing they touch.
+const access = vi.fn(async () => {});
+const readFile = vi.fn(async () => "");
+const readdir = vi.fn(async () => []);
+const rename = vi.fn(async () => {});
 const loadAllTasks = vi.fn(async () => []);
 const getSchedulesDir = vi.fn(() => "/tmp/schedules");
 
@@ -86,11 +95,35 @@ vi.mock("./config/session-bindings", () => ({
   removeSessionBindingStore: vi.fn(async () => {}),
 }));
 
-vi.mock("node:fs/promises", () => ({ mkdir, writeFile, unlink }));
+vi.mock("node:fs/promises", () => ({ mkdir, writeFile, unlink, access, readFile, readdir, rename }));
 
 vi.mock("./modules/schedule/task-file", async (importOriginal) => {
   const original = await importOriginal<typeof import("./modules/schedule/task-file")>();
   return { ...original, loadAllTasks, getSchedulesDir };
+});
+
+/** Fixed temp root used by the mocked queue-file module (the CLI never sees it). */
+const TEST_QUEUES_ROOT = "/tmp/queues-test";
+const listQueueDefinitions = vi.fn(async () => []);
+const loadQueueDefinition = vi.fn(async () => null);
+const insertQueueTask = vi.fn(async () => "1750000000000-abcd");
+const listQueueTasks = vi.fn(async () => []);
+
+vi.mock("./modules/queue/queue-file", async (importOriginal) => {
+  const original = await importOriginal<typeof import("./modules/queue/queue-file")>();
+  return {
+    ...original,
+    listQueueDefinitions,
+    loadQueueDefinition,
+    insertQueueTask,
+    listQueueTasks,
+    // The real writer runs against the mocked node:fs/promises with a fixed
+    // temp root, so the wizard test can assert the exact front matter passed
+    // to writeFile (mirroring the schedule add tests).
+    writeQueueDefinition: vi.fn(async (input) =>
+      original.writeQueueDefinition(input, TEST_QUEUES_ROOT),
+    ),
+  };
 });
 
 describe("runCli add", () => {
@@ -134,6 +167,34 @@ describe("runCli add", () => {
     expect(close).toHaveBeenCalledTimes(1);
   });
 });
+
+function makeQueueDefinition(overrides: Partial<QueueDefinition> = {}): QueueDefinition {
+  return {
+    name: "inbox",
+    channel: "demo",
+    workers: 1,
+    model: undefined,
+    target: undefined,
+    body: "",
+    filePath: `${TEST_QUEUES_ROOT}/inbox.md`,
+    ...overrides,
+  };
+}
+
+function makeQueueTask(overrides: Partial<QueueTask> = {}): QueueTask {
+  return {
+    id: "1750000000000-abcd",
+    state: "pending",
+    enqueuedAt: "2026-08-19T08:00:00.000Z",
+    prompt: "Do the thing.",
+    filePath: `${TEST_QUEUES_ROOT}/inbox.tasks/1750000000000-abcd.md`,
+    ...overrides,
+  };
+}
+
+function enoentError(): NodeJS.ErrnoException {
+  return Object.assign(new Error("ENOENT"), { code: "ENOENT" });
+}
 
 function makeLoadedTask(
   taskOverrides: Partial<ScheduleTask> = {},
@@ -579,5 +640,258 @@ describe("runCli schedule with no channels", () => {
       logs.restore();
     }
     expect(logs.lines.join("\n")).toContain("daily-report");
+  });
+});
+
+describe("queue wizard validators", () => {
+  it("validateQueueNameInput enforces the slug shape and uniqueness", async () => {
+    const { validateQueueNameInput } = await import("./cli");
+    expect(validateQueueNameInput("inbox", new Set())).toBeNull();
+    expect(validateQueueNameInput("Inbox", new Set())).toContain("[a-z0-9-]+");
+    expect(validateQueueNameInput("inbox_x", new Set())).toContain("[a-z0-9-]+");
+    expect(validateQueueNameInput("", new Set())).toContain("[a-z0-9-]+");
+    expect(validateQueueNameInput("inbox", new Set(["inbox"]))).toContain("already exists");
+  });
+
+  it("validateWorkersInput accepts integers >= 1 and rejects everything else", async () => {
+    const { validateWorkersInput } = await import("./cli");
+    expect(validateWorkersInput("1")).toBeNull();
+    expect(validateWorkersInput("12")).toBeNull();
+    expect(validateWorkersInput("0")).toContain("positive integer");
+    expect(validateWorkersInput("-1")).toContain("positive integer");
+    expect(validateWorkersInput("2.5")).toContain("positive integer");
+    expect(validateWorkersInput("abc")).toContain("positive integer");
+  });
+});
+
+describe("runCli queue add", () => {
+  beforeEach(() => {
+    resetPromptMocks();
+    delete inputOverrides["Queue name"];
+    delete inputOverrides["Workers (default 1)"];
+    delete inputOverrides["Model (optional, blank = channel default)"];
+    loadConfig.mockImplementation(async () => CHANNEL_WITH_DEMO);
+    mkdir.mockClear();
+    writeFile.mockClear();
+    access.mockClear();
+    rename.mockClear();
+    access.mockRejectedValue(enoentError());
+    listQueueDefinitions.mockClear();
+    listQueueDefinitions.mockResolvedValue([]);
+  });
+
+  it("writes a queue file with the collected values and prints binding + insert guidance", async () => {
+    const { runCli } = await import("./cli");
+    const logs = captureLogs();
+    try {
+      await runCli(["node", "agent-bridge", "queue", "add"]);
+    } finally {
+      logs.restore();
+    }
+
+    expect(promptCalls).toEqual([
+      "input:Queue name",
+      "select:Select channel",
+      "input:Workers (default 1)",
+      "input:Model (optional, blank = channel default)",
+    ]);
+    expect(writeFile).toHaveBeenCalledTimes(1);
+    const [, content] = writeFile.mock.calls[0] as [string, string, string];
+    expect(content).toContain("channel: demo");
+    expect(content).toContain("workers: 1");
+    // Blank model answer writes no model: line.
+    expect(content).not.toContain("model:");
+    // Atomic write commits to the queue file path.
+    expect(rename).toHaveBeenCalledWith(expect.any(String), "/tmp/queues-test/inbox.md");
+    const out = logs.lines.join("\n");
+    expect(out).toContain("Created successfully!");
+    expect(out).toContain("- Edit /tmp/queues-test/inbox.md to set the shared context.");
+    expect(out).toContain("- Send `/queue-here inbox` in chat app to bind a chat.");
+    expect(out).toContain("Insert tasks with `agent-bridge queue insert inbox --prompt");
+    expect(close).toHaveBeenCalledTimes(1);
+  });
+
+  it("writes workers: 2 when a workers value is answered", async () => {
+    inputOverrides["Workers (default 1)"] = "2";
+    const { runCli } = await import("./cli");
+    try {
+      await runCli(["node", "agent-bridge", "queue", "add"]);
+    } finally {
+      // no-op; logs not needed here
+    }
+
+    const [, content] = writeFile.mock.calls[0] as [string, string, string];
+    expect(content).toContain("workers: 2");
+  });
+
+  it("writes a model: line when a model is answered", async () => {
+    inputOverrides["Model (optional, blank = channel default)"] =
+      "azure-openai-responses/gpt-5.6-terra";
+    const { runCli } = await import("./cli");
+    try {
+      await runCli(["node", "agent-bridge", "queue", "add"]);
+    } finally {
+      // no-op; logs not needed here
+    }
+
+    const [, content] = writeFile.mock.calls[0] as [string, string, string];
+    expect(content).toContain("model: azure-openai-responses/gpt-5.6-terra");
+  });
+
+  it("refuses to create a queue when no channels are configured", async () => {
+    loadConfig.mockImplementation(async () => ({
+      channels: {},
+      defaults: { agentIdleTimeoutMs: 60_000 },
+    }));
+    const { runCli } = await import("./cli");
+    await expect(runCli(["node", "agent-bridge", "queue", "add"])).rejects.toThrow(
+      "No channels configured",
+    );
+    expect(writeFile).not.toHaveBeenCalled();
+    expect(close).toHaveBeenCalledTimes(1);
+  });
+});
+
+describe("runCli queue insert", () => {
+  beforeEach(() => {
+    resetPromptMocks();
+    loadQueueDefinition.mockClear();
+    loadQueueDefinition.mockResolvedValue(null);
+    insertQueueTask.mockClear();
+    insertQueueTask.mockResolvedValue("1750000000000-abcd");
+  });
+
+  it("inserts a task and prints a confirmation with no warning when bound", async () => {
+    loadQueueDefinition.mockResolvedValue(makeQueueDefinition({ target: "chat:123" }));
+    const { runCli } = await import("./cli");
+    const logs = captureLogs();
+    try {
+      await runCli([
+        "node",
+        "agent-bridge",
+        "queue",
+        "insert",
+        "inbox",
+        "--prompt",
+        "Do the thing.",
+      ]);
+    } finally {
+      logs.restore();
+    }
+
+    expect(insertQueueTask).toHaveBeenCalledWith("inbox", "Do the thing.");
+    const out = logs.lines.join("\n");
+    expect(out).toContain('Inserted task 1750000000000-abcd into queue "inbox".');
+    expect(out).not.toContain("no target yet");
+  });
+
+  it("prints a warning when the queue has no target", async () => {
+    loadQueueDefinition.mockResolvedValue(makeQueueDefinition());
+    const { runCli } = await import("./cli");
+    const logs = captureLogs();
+    try {
+      await runCli([
+        "node",
+        "agent-bridge",
+        "queue",
+        "insert",
+        "inbox",
+        "--prompt",
+        "Do the thing.",
+      ]);
+    } finally {
+      logs.restore();
+    }
+
+    expect(insertQueueTask).toHaveBeenCalledWith("inbox", "Do the thing.");
+    expect(logs.lines.join("\n")).toContain("Warning: the queue has no target yet");
+  });
+
+  it("fails with a non-zero exit when the queue is missing", async () => {
+    const { runCli } = await import("./cli");
+    await expect(
+      runCli(["node", "agent-bridge", "queue", "insert", "nope", "--prompt", "hi"]),
+    ).rejects.toThrow('Queue "nope" not found.');
+    expect(insertQueueTask).not.toHaveBeenCalled();
+  });
+
+  it("fails with a non-zero exit when the prompt is empty", async () => {
+    const { runCli } = await import("./cli");
+    await expect(
+      runCli(["node", "agent-bridge", "queue", "insert", "inbox", "--prompt", "   "]),
+    ).rejects.toThrow("--prompt is required");
+    expect(insertQueueTask).not.toHaveBeenCalled();
+  });
+
+  it("fails with a non-zero exit when --prompt is omitted", async () => {
+    const { runCli } = await import("./cli");
+    await expect(runCli(["node", "agent-bridge", "queue", "insert", "inbox"])).rejects.toThrow(
+      "--prompt is required",
+    );
+    expect(insertQueueTask).not.toHaveBeenCalled();
+  });
+});
+
+describe("runCli queue list", () => {
+  beforeEach(() => {
+    resetPromptMocks();
+    listQueueDefinitions.mockClear();
+    listQueueTasks.mockClear();
+  });
+
+  it("prints a table with per-queue model, bound and task counts", async () => {
+    listQueueDefinitions.mockResolvedValue([
+      makeQueueDefinition({
+        name: "inbox",
+        workers: 2,
+        model: "azure-openai-responses/gpt-5.6-terra",
+        target: "chat:1",
+      }),
+      makeQueueDefinition({ name: "todo" }),
+    ]);
+    listQueueTasks.mockImplementation(async (name: string) => {
+      if (name === "inbox") {
+        return [
+          makeQueueTask({ state: "pending" }),
+          makeQueueTask({ id: "1750000000001-0001", state: "pending" }),
+          makeQueueTask({ id: "1750000000002-0002", state: "running" }),
+        ];
+      }
+      return [makeQueueTask({ id: "1750000000003-0003", state: "pending" })];
+    });
+
+    const { runCli } = await import("./cli");
+    const logs = captureLogs();
+    try {
+      await runCli(["node", "agent-bridge", "queue", "list"]);
+    } finally {
+      logs.restore();
+    }
+
+    const out = logs.lines.join("\n");
+    for (const header of ["Name", "Channel", "Workers", "Model", "Bound", "Pending", "Running"]) {
+      expect(out).toContain(header);
+    }
+    expect(out).toContain("inbox");
+    expect(out).toContain("todo");
+    expect(out).toContain("gpt-5.6-terra");
+    expect(out).toContain("yes");
+    expect(out).toContain("no");
+    // Counts: inbox 2 pending + 1 running; todo 1 pending + 0 running.
+    expect(out).toContain("2");
+    expect(out).toContain("0");
+  });
+
+  it("prints a friendly hint when no queues exist", async () => {
+    listQueueDefinitions.mockResolvedValue([]);
+    const { runCli } = await import("./cli");
+    const logs = captureLogs();
+    try {
+      await runCli(["node", "agent-bridge", "queue", "list"]);
+    } finally {
+      logs.restore();
+    }
+    expect(logs.lines.join("\n")).toContain("No queues found");
+    expect(listQueueTasks).not.toHaveBeenCalled();
   });
 });

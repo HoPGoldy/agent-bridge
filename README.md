@@ -46,6 +46,9 @@ The CLI currently provides these commands:
 - `agent-bridge ls`
 - `agent-bridge remove <channel-name>`
 - `agent-bridge start <channel-name>`
+- `agent-bridge queue add`
+- `agent-bridge queue insert <queue-name> --prompt "..."`
+- `agent-bridge queue list`
 
 Create a channel interactively:
 
@@ -86,6 +89,10 @@ Architecture overview: [`docs/architecture-design.md`](./docs/architecture-desig
 Command usage across IM adapters: [`docs/command-system.md`](./docs/command-system.md)
 
 Scheduled tasks (cron-style agent sessions with file-based prompts): [`docs/scheduled-tasks.md`](./docs/scheduled-tasks.md)
+
+Event queues (FIFO agent task queues with file-based prompts, worker concurrency and chat-bound result delivery): [`docs/event-queue.md`](./docs/event-queue.md)
+
+Event queues let you run a stream of agent prompts through the same pipeline as scheduled tasks: a queue definition (`queues/<name>.md`) carries a worker count, an optional model and a shared-context body appended to every task; tasks are inserted with `agent-bridge queue insert` and consumed FIFO by the owning channel's controller, which delivers each result (or failure/timeout notice) to the chat bound with `/queue-here`. Like scheduled tasks, queue runs are fully isolated from the target chat's own session.
 
 ## Start a session in a specific directory
 

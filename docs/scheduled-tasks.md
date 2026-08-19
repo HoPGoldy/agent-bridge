@@ -144,7 +144,7 @@ Both carry a synthetic, run-unique client session id of the form `schedule:<task
 - **Bindings are memory-only**: `schedule:*` bindings are never written to the channel state file (a unique id per run would grow the file forever, and ephemeral runs have no resume semantics anyway).
 - **No confirmation**: the usual "Started a new session" reply is suppressed for task runs — it would be mistaken for the task result.
 
-Because the synthetic id never collides with a real chat's clientSessionId, the target chat's own session binding is never touched.
+Because the synthetic id never collides with a real chat's clientSessionId, the target chat's own session binding is never touched. Event queues reuse this exact synthetic-session machinery under `queue:<queue>:<taskId>` ids (same divert, memory-only bindings and orphan guard; see `docs/event-queue.md`).
 
 ### The run ends by completing or by timing out
 

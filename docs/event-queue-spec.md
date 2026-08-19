@@ -1,7 +1,9 @@
 # Event Queue (Agent Task Queue) — design spec
 
-Status: design (grill complete, not yet implemented). Grill decisions:
-`docs/grill-context/qa-log.md` (2026-08-19 section).
+Status: implemented (T1–T5, branch `feat/event-queue`). Grill decisions:
+`docs/grill-context/qa-log.md` (2026-08-19 section). The user-facing
+documentation is `docs/event-queue.md`; implementation drift found during the
+docs pass (T6) is reflected inline below.
 
 ## Overview
 
@@ -73,11 +75,18 @@ ownership rule as the scheduler).
   queue's `target` chat (queue + task identified in the notice), deletes the
   task file and ends the run. With `workers > 1` results are delivered in
   completion order (may be out of FIFO order) — documented, not enforced.
-- **Failure (fail-and-drop, decided)**: session-creation failure
-  (`IngressResult.ok === false`), runtime `error` event, or timeout →
-  deliver a failure notice with the real reason to `target`, delete the task
-  file, end the run. No retry, no head-of-line blocking; to re-run, insert
-  again.
+- **Failure (fail-and-drop, decided)**: any failed synthetic dispatch
+  (`IngressResult.ok === false` for either `session.new` or the follow-up
+  `user.message`), a runtime `error` event, or a timeout → end the run,
+  deliver a failure notice to `target`, delete the task file, end the run.
+  No retry, no head-of-line blocking; to re-run, insert again. The failure
+  notice carries the real reason (`❌ Queue "<queue>" · task <taskId>
+  failed: <reason>`) for dispatch failures and runtime errors; a timeout
+  delivers a dedicated timeout notice (`⏰ Queue "<queue>" · task <taskId>
+  timed out.`). Stop-race (SF-2): a synthetic dispatch in flight across a
+  `stop()` resolves `{ ok: false, reason: "gateway is not running" }` — that
+  is not a task failure; nothing is delivered and the task file stays
+  `running` so the next start re-enqueues it (at-least-once).
 - **Stop**: in-flight runs are forgotten; their task files stay `running`
   and are re-enqueued at the next start. No delivery after stop (same
   contract as the scheduler).
@@ -105,8 +114,10 @@ Chat sessions and `schedule:*` behavior are unchanged.
 
 - `agent-bridge queue add` — wizard: queue name (unique; invalid/existing
   name re-asked), channel select, workers (default 1), model (optional,
-  blank = channel default). Writes `queues/<name>.md`. Success message points
-  to `/queue-here` and `queue insert`.
+  blank = channel default). Writes `queues/<name>.md` with an empty body
+  (the body is the shared context, set by editing the file). Success message
+  points to editing the file for the shared context, `/queue-here` and
+  `queue insert`.
 - `agent-bridge queue insert <name> --prompt "..."` — validates the queue
   exists, appends a task file. If the queue has no `target`, prints a
   warning that tasks wait until `/queue-here` binds a chat (decided).

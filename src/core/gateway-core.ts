@@ -11,18 +11,27 @@ import type {
   IngressResult,
 } from "../types";
 import { createAgentSessionStateRegistry } from "../config/agent-session-state";
-import { createInMemoryChannelStateStore } from "../config/channel-state";
+import { createInMemoryChannelStateStore, QUEUES_DIR } from "../config/channel-state";
 import { SYNTHETIC_SESSION_PREFIX } from "../modules/schedule/scheduler";
+import {
+  isValidQueueName,
+  loadQueueDefinition,
+  QUEUE_SESSION_PREFIX,
+  setQueueTarget,
+  type QueueDefinition,
+} from "../modules/queue/queue-file";
 import { getTranslatorForCommon, type Translator } from "../i18n";
 import { createLogger, type Logger } from "./logger";
 
 /**
  * Constructor options for `GatewayCore`: the shared `GatewayCoreOptions` plus
- * the optional schedule-output divert callback (spec D2). Declared here rather
- * than in `types.ts` because the divert target is a core-internal mechanism —
- * the channel runner wires it to the per-channel scheduler. The callback type
- * is structural; the only scheduler import is the shared `SYNTHETIC_SESSION_PREFIX`
- * constant, so core and scheduler can never drift on the `schedule:` prefix.
+ * the optional synthetic-output divert callbacks (spec D2/D3). Declared here
+ * rather than in `types.ts` because the divert targets are core-internal
+ * mechanisms — the channel runner wires them to the per-channel scheduler and
+ * queue controller. The callback types are structural; the only synthetic-
+ * session imports are the shared `SYNTHETIC_SESSION_PREFIX` and
+ * `QUEUE_SESSION_PREFIX` constants, so core and controllers can never drift on
+ * the `schedule:` / `queue:` prefixes.
  */
 export interface GatewayCoreConstructorOptions extends GatewayCoreOptions {
   /**
@@ -34,6 +43,24 @@ export interface GatewayCoreConstructorOptions extends GatewayCoreOptions {
    * `schedule:*` output falls back to the normal adapter path (defensive).
    */
   onScheduleOutput?: (event: ClientInputEvent) => void | Promise<void>;
+  /**
+   * Optional divert target for agent output of `queue:*` sessions (spec D3).
+   * Same mechanics as `onScheduleOutput`: every output event whose resolved
+   * clientSessionId starts with `queue:` is handed to this callback (with the
+   * replaced clientSessionId) instead of the IM adapter, a throwing callback
+   * is logged and swallowed, and without the callback `queue:*` output falls
+   * back to the normal adapter path (defensive). Each controller receives
+   * only its own prefix's events.
+   */
+  onQueueOutput?: (event: ClientInputEvent) => void | Promise<void>;
+  /**
+   * Root directory of the event-queue definition files (`queues/<name>.md`,
+   * spec D1). Read by the core-routed `/queue-here` command (spec D4) to
+   * check existence, ownership and binding before writing the chat's
+   * `clientSessionId` into the `target` line; defaults to the built-in
+   * `QUEUES_DIR`. Tests point this at a temporary directory.
+   */
+  queuesRoot?: string;
 }
 
 interface AgentRuntime {
@@ -60,6 +87,13 @@ export class GatewayCore {
    * the channel runner to the scheduler's `handleOutput`.
    */
   readonly #onScheduleOutput?: (event: ClientInputEvent) => void | Promise<void>;
+  /**
+   * Optional divert target for `queue:*` agent output (spec D3), wired by the
+   * channel runner to the queue controller's output handler.
+   */
+  readonly #onQueueOutput?: (event: ClientInputEvent) => void | Promise<void>;
+  /** Queue-definition root read and written by `/queue-here` (spec D4). */
+  readonly #queuesRoot: string;
   /** Pure routing map: client session id -> agent session id. */
   readonly #clientToAgentSession = new Map<string, string>();
   readonly #agentRuntimes = new Map<string, AgentRuntime>();
@@ -82,6 +116,8 @@ export class GatewayCore {
     agentSessionStateRegistry,
     common,
     onScheduleOutput,
+    onQueueOutput,
+    queuesRoot,
   }: GatewayCoreConstructorOptions) {
     this.#imAdapter = imAdapter;
     this.#agentModule = agentModule;
@@ -94,6 +130,8 @@ export class GatewayCore {
     this.#common = common;
     this.#t = getTranslatorForCommon(common);
     this.#onScheduleOutput = onScheduleOutput;
+    this.#onQueueOutput = onQueueOutput;
+    this.#queuesRoot = queuesRoot ?? QUEUES_DIR;
   }
 
   async start(): Promise<void> {
@@ -240,21 +278,36 @@ export class GatewayCore {
       return { ok: true };
     }
 
+    // Core-routed `/queue-here <name>` (spec D4): the IM adapters do not
+    // parse this command, so an unrecognized slash command arrives here as a
+    // plain chat-originated `user.message` — the core recognizes the raw
+    // text itself. Synthetic (`schedule:*` / `queue:*`) sessions never take
+    // this path: their user.message texts are controller-injected prompts.
+    if (
+      event.type === "user.message" &&
+      !this.#isSyntheticClientSession(event.clientSessionId) &&
+      (await this.#handleQueueHereCommand(event.clientSessionId, event.text))
+    ) {
+      return { ok: true };
+    }
+
     await this.#handleUserMessage(event.clientSessionId, event.text);
     return { ok: true };
   }
 
   async #handleUserMessage(clientSessionId: string, text: string): Promise<void> {
-    // Defensive invariant (spec D1/T6): a `schedule:*` session is created
-    // exclusively by its synthetic `command.session.new` — the scheduler
-    // always dispatches session.new first and stops on failure. A
-    // `user.message` for an unbound `schedule:*` id must never auto-create a
-    // session: that path would run without the task's model override (the
-    // pre-T6 silent fallback). Log and drop; the intentional drop counts as
-    // handled (`{ ok: true }`).
-    if (this.#isSyntheticScheduleSession(clientSessionId) && !this.#clientToAgentSession.has(clientSessionId)) {
+    // Defensive invariant (spec D1/D3/T6): a synthetic session (`schedule:*`
+    // or `queue:*`) is created exclusively by its synthetic
+    // `command.session.new` — the scheduler / queue controller always
+    // dispatches session.new first and stops on failure. A `user.message` for
+    // an unbound synthetic id must never auto-create a session: that path
+    // would run without the task's model override (the pre-T6 silent
+    // fallback). Log and drop; the intentional drop counts as handled
+    // (`{ ok: true }`).
+    if (this.#isSyntheticClientSession(clientSessionId) && !this.#clientToAgentSession.has(clientSessionId)) {
+      const kind = this.#isSyntheticScheduleSession(clientSessionId) ? "schedule" : "queue";
       this.#logger.warn(
-        `dropping user.message for unbound schedule session ${clientSessionId}`,
+        `dropping user.message for unbound ${kind} session ${clientSessionId}`,
       );
       return;
     }
@@ -264,6 +317,100 @@ export class GatewayCore {
       type: "user.message",
       text,
     });
+  }
+
+  /**
+   * Core-routed `/queue-here <name>` command (spec D4): binds the current
+   * chat as the queue's delivery target by writing the chat's
+   * `clientSessionId` into the queue file's `target` front-matter line (T1's
+   * `setQueueTarget`); the per-channel queue controller picks the binding up
+   * on its next tick reload — no direct controller call. Unlike the
+   * adapter-local `/schedule-here` (which never reaches the core), the IM
+   * adapters do not parse this command, so the raw text arrives as a plain
+   * `user.message` and is recognized here. The `target` string is the sending
+   * chat's `clientSessionId` — the exact format the queue controller's
+   * deliver callback consumes (same as `/schedule-here`). Refuses when the
+   * queue is missing, belongs to another channel, or already carries a
+   * `target` (rebinding is an AI file edit). Returns `true` when `text` was a
+   * `/queue-here` command (handled, never reaching the agent session) and
+   * `false` otherwise.
+   */
+  async #handleQueueHereCommand(clientSessionId: string, text: string): Promise<boolean> {
+    const match = text.match(/^\/queue-here(?:\s+(.*))?$/i);
+    if (match === null) {
+      return false;
+    }
+    // Queue files are lowercased slugs; normalize so `/queue-here Build`
+    // binds the `build` queue (same normalization as `/schedule-here`).
+    const name = (match[1]?.trim() ?? "").toLowerCase();
+    if (!isValidQueueName(name)) {
+      await this.#deliverClientInput({
+        type: "assistant.message",
+        clientSessionId,
+        text: this.#t("client.queueHereUsage"),
+      });
+      return true;
+    }
+
+    let definition: QueueDefinition | null;
+    try {
+      definition = await loadQueueDefinition(name, this.#queuesRoot);
+    } catch (error) {
+      const detail = error instanceof Error ? error.message : String(error);
+      this.#logger.error(`failed to load queue "${name}" for /queue-here:`, error);
+      await this.#deliverClientInput({
+        type: "assistant.message",
+        clientSessionId,
+        text: this.#t("client.queueHereFailed", { name, reason: detail }),
+      });
+      return true;
+    }
+    if (definition === null) {
+      await this.#deliverClientInput({
+        type: "assistant.message",
+        clientSessionId,
+        text: this.#t("client.queueHereQueueNotFound", { name }),
+      });
+      return true;
+    }
+    // Ownership check: the queue controller only consumes queues whose
+    // `channel` matches its own channel, so a queue bound from a chat of
+    // another channel could never receive its results.
+    if (definition.channel !== this.#common?.channelName) {
+      await this.#deliverClientInput({
+        type: "assistant.message",
+        clientSessionId,
+        text: this.#t("client.queueHereWrongChannel", {
+          name,
+          channel: definition.channel,
+        }),
+      });
+      return true;
+    }
+    if (definition.target !== undefined) {
+      await this.#deliverClientInput({
+        type: "assistant.message",
+        clientSessionId,
+        text: this.#t("client.queueHereAlreadyBound", { name }),
+      });
+      return true;
+    }
+
+    const result = await setQueueTarget(name, clientSessionId, this.#queuesRoot);
+    if (!result.ok) {
+      await this.#deliverClientInput({
+        type: "assistant.message",
+        clientSessionId,
+        text: this.#t("client.queueHereFailed", { name, reason: result.reason }),
+      });
+      return true;
+    }
+    await this.#deliverClientInput({
+      type: "assistant.message",
+      clientSessionId,
+      text: this.#t("client.queueHereBound", { name }),
+    });
+    return true;
   }
 
   async #handleSessionCompact(clientSessionId: string): Promise<void> {
@@ -457,11 +604,12 @@ export class GatewayCore {
     } catch (error) {
       const detail = error instanceof Error ? error.message : String(error);
       this.#logger.error(`failed to create new agent session for ${clientSessionId}:`, error);
-      if (!this.#isSyntheticScheduleSession(clientSessionId)) {
+      if (!this.#isSyntheticClientSession(clientSessionId)) {
         // Chat-originated `/new` keeps its localized failure notice (T6: for
-        // `schedule:*` ids the adapters cannot resolve the id and would drop
-        // the notice anyway — the failure surfaces through the ingress
-        // result instead, and the scheduler delivers it to the task target).
+        // synthetic ids the adapters cannot resolve the id and would drop the
+        // notice anyway — the failure surfaces through the ingress result
+        // instead, and the scheduler / queue controller delivers it to the
+        // task target).
         await this.#deliverClientInput({
           type: "assistant.message",
           clientSessionId,
@@ -484,7 +632,7 @@ export class GatewayCore {
       const detail = error instanceof Error ? error.message : String(error);
       this.#logger.error(`failed to persist the new binding for ${clientSessionId}:`, error);
       await this.#cleanupNewRuntime(newRuntime);
-      if (!this.#isSyntheticScheduleSession(clientSessionId)) {
+      if (!this.#isSyntheticClientSession(clientSessionId)) {
         await this.#deliverClientInput({
           type: "assistant.message",
           clientSessionId,
@@ -511,9 +659,9 @@ export class GatewayCore {
       }
     }
 
-    if (!this.#isSyntheticScheduleSession(clientSessionId)) {
-      // Spec D1: no "started a new session" confirmation for ephemeral task
-      // runs — it would be mistaken for the task result (T3 review).
+    if (!this.#isSyntheticClientSession(clientSessionId)) {
+      // Spec D1/D3: no "started a new session" confirmation for ephemeral
+      // task runs — it would be mistaken for the task result (T3 review).
       await this.#deliverClientInput({
         type: "assistant.message",
         clientSessionId,
@@ -723,12 +871,13 @@ export class GatewayCore {
    * caller can clean up the new runtime.
    */
   async #bindClientToAgent(clientSessionId: string, agentSessionId: string): Promise<void> {
-    if (this.#isSyntheticScheduleSession(clientSessionId)) {
-      // Spec D1: schedule:* bindings live in memory only. The run-unique id
-      // would grow the state file forever and ephemeral runs have no resume
-      // semantics; a restart dropping the binding matches the "runs are lost
-      // on restart" expectation. There is no durable commit here, so the
-      // caller's rollback path can never trigger.
+    if (this.#isSyntheticClientSession(clientSessionId)) {
+      // Spec D1/D3: synthetic (`schedule:*` / `queue:*`) bindings live in
+      // memory only. The run-unique id would grow the state file forever and
+      // ephemeral runs have no resume semantics; a restart dropping the
+      // binding matches the "runs are lost on restart" expectation. There is
+      // no durable commit here, so the caller's rollback path can never
+      // trigger.
       this.#clientToAgentSession.set(clientSessionId, agentSessionId);
       return;
     }
@@ -754,8 +903,8 @@ export class GatewayCore {
     newAgentSessionId: string,
     previousAgentSessionId?: string,
   ): Promise<void> {
-    if (this.#isSyntheticScheduleSession(clientSessionId)) {
-      // Spec D1: schedule:* bindings are memory-only (see #bindClientToAgent).
+    if (this.#isSyntheticClientSession(clientSessionId)) {
+      // Spec D1/D3: synthetic bindings are memory-only (see #bindClientToAgent).
       this.#clientToAgentSession.set(clientSessionId, newAgentSessionId);
       return;
     }
@@ -846,7 +995,15 @@ export class GatewayCore {
       // its output is not streamed into any chat — every event (including the
       // `assistant.message` completion signal) goes to the injected callback
       // (the scheduler's handleOutput) instead of the IM adapter.
-      await this.#divertScheduleOutput(event, clientSessionId);
+      await this.#divertOutput(event, clientSessionId, this.#onScheduleOutput, "schedule");
+      return;
+    }
+
+    if (this.#isSyntheticQueueSession(clientSessionId) && this.#onQueueOutput !== undefined) {
+      // Spec D3 divert: a `queue:*` run has no real chat behind it either,
+      // same mechanics as the schedule divert, with every event handed to the
+      // queue controller's output callback instead of the IM adapter.
+      await this.#divertOutput(event, clientSessionId, this.#onQueueOutput, "queue");
       return;
     }
 
@@ -879,17 +1036,21 @@ export class GatewayCore {
   }
 
   /**
-   * Spec D2: hands an agent-output event for a `schedule:*` session to the
-   * injected divert callback with the resolved clientSessionId substituted
-   * (the `assistant.message` branch mirrors the normal delivery path so the
-   * scheduler receives exactly what an adapter would have). A throwing
-   * callback is logged and swallowed — it must never surface through the
-   * core's ingress. Only called when a callback was injected; without one
-   * `schedule:*` output falls back to the normal adapter path.
+   * Spec D2/D3: hands an agent-output event for a synthetic session
+   * (`schedule:*` / `queue:*`) to the injected divert callback with the
+   * resolved clientSessionId substituted (the `assistant.message` branch
+   * mirrors the normal delivery path so the controller receives exactly what
+   * an adapter would have). A throwing callback is logged and swallowed — it
+   * must never surface through the core's ingress. Only called when a
+   * callback was injected; without one synthetic output falls back to the
+   * normal adapter path.
    */
-  async #divertScheduleOutput(event: AgentOutputEvent, clientSessionId: string): Promise<void> {
-    const onScheduleOutput = this.#onScheduleOutput;
-    if (onScheduleOutput === undefined) return;
+  async #divertOutput(
+    event: AgentOutputEvent,
+    clientSessionId: string,
+    onOutput: (event: ClientInputEvent) => void | Promise<void>,
+    kind: "schedule" | "queue",
+  ): Promise<void> {
     const diverted: ClientInputEvent =
       event.type === "assistant.message"
         ? {
@@ -900,15 +1061,31 @@ export class GatewayCore {
           }
         : { ...event, clientSessionId };
     try {
-      await onScheduleOutput(diverted);
+      await onOutput(diverted);
     } catch (error) {
-      this.#logger.error(`failed to divert schedule output for ${clientSessionId}:`, error);
+      this.#logger.error(`failed to divert ${kind} output for ${clientSessionId}:`, error);
     }
   }
 
-  /** Spec D1: synthetic task-run sessions use `schedule:<task>:<run-seq>` ids. */
+  /**
+   * Spec D1/D3: synthetic task-run sessions use `schedule:<task>:<run-seq>`
+   * and `queue:<queue>:<taskId>` ids.
+   */
+  #isSyntheticClientSession(clientSessionId: string): boolean {
+    return (
+      clientSessionId.startsWith(SYNTHETIC_SESSION_PREFIX) ||
+      clientSessionId.startsWith(QUEUE_SESSION_PREFIX)
+    );
+  }
+
+  /** Spec D1: `schedule:*` sessions divert to the scheduler's callback. */
   #isSyntheticScheduleSession(clientSessionId: string): boolean {
     return clientSessionId.startsWith(SYNTHETIC_SESSION_PREFIX);
+  }
+
+  /** Spec D3: `queue:*` sessions divert to the queue controller's callback. */
+  #isSyntheticQueueSession(clientSessionId: string): boolean {
+    return clientSessionId.startsWith(QUEUE_SESSION_PREFIX);
   }
 
   #isToolRelatedEvent(
@@ -984,9 +1161,11 @@ export class GatewayCore {
    * Stops the adapter, removes the runtime and revokes every live state handle
    * for the session. The persisted record and binding are left intact for
    * ordinary sessions, so they can be resumed later (idle release, bridge
-   * stop). An ephemeral `schedule:*` session has no resume semantics: its
+   * stop). An ephemeral synthetic session (`schedule:*` / `queue:*`) has no
+   * resume semantics: its
    * record is deleted with the runtime (SF-1 — a unique record per run would
-   * otherwise grow the state file forever). The runtime is always removed from
+   * otherwise grow the state file forever). The runtime is always removed
+   * from
    * the map and the state handle always revoked, even when `isBusy()`, `abort()`
    * or `adapter.stop()` throws, so a stale adapter can never write its state
    * again; the original error still propagates to the caller.
@@ -1009,17 +1188,17 @@ export class GatewayCore {
     } finally {
       this.#agentRuntimes.delete(runtime.agentSessionId);
       await this.#revokeSessionStateBestEffort(runtime.agentSessionId);
-      if (this.#isSyntheticScheduleSession(runtime.clientSessionId)) {
-        // SF-1: a schedule run leaves no residue. The adapter has stopped and
-        // can no longer write state (its only state writes happen inside
-        // #prepareWorkingDirectory during start), so deleting the record here
-        // cannot race a later write. Same deletion semantics as
+      if (this.#isSyntheticClientSession(runtime.clientSessionId)) {
+        // SF-1: a schedule/queue run leaves no residue. The adapter has
+        // stopped and can no longer write state (its only state writes happen
+        // inside #prepareWorkingDirectory during start), so deleting the
+        // record here cannot race a later write. Same deletion semantics as
         // #cleanupNewRuntime (registry revoke + transactional record delete).
         try {
           await this.#agentSessionStateRegistry.delete(runtime.agentSessionId);
         } catch (error) {
           this.#logger.error(
-            `failed to delete schedule agent session state ${runtime.agentSessionId}:`,
+            `failed to delete synthetic agent session state ${runtime.agentSessionId}:`,
             error,
           );
         }

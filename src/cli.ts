@@ -28,6 +28,15 @@ import {
   loadAllTasks,
   type ScheduleTask,
 } from "./modules/schedule/task-file";
+import {
+  insertQueueTask,
+  isValidQueueName,
+  listQueueDefinitions,
+  listQueueTasks,
+  loadQueueDefinition,
+  writeQueueDefinition,
+  type QueueDefinition,
+} from "./modules/queue/queue-file";
 
 const require = createRequire(import.meta.url);
 const { version } = require("../package.json") as { version: string };
@@ -394,6 +403,170 @@ async function removeScheduleTask(taskName: string): Promise<void> {
   console.log(`Deleted ${filePath}`);
 }
 
+// ---------------------------------------------------------------------------
+// queue command group (spec: docs/event-queue-spec.md "D4 — Commands")
+//
+// Queue definitions live at `~/.config/agent-bridge/queues/<name>.md` (T1
+// queue-file.ts owns the format). A queue belongs to one channel and carries
+// a worker count and an optional pinned model. The add wizard mirrors the
+// schedule wizard; `target` is bound later by `/queue-here` in chat. Tasks
+// are inserted with `queue insert` and consumed FIFO by the per-channel
+// controller once the queue is bound (spec D2).
+// ---------------------------------------------------------------------------
+
+/** Validates a queue-name input: slug shape plus global uniqueness (spec D4). */
+export function validateQueueNameInput(
+  value: string,
+  existingNames: ReadonlySet<string>,
+): string | null {
+  const t = getTranslatorForCommon();
+  if (!isValidQueueName(value)) {
+    return t("cli.queueNameInvalid");
+  }
+  if (existingNames.has(value)) {
+    return t("cli.queueNameExists", { name: value });
+  }
+  return null;
+}
+
+/** Validates a workers input: integer >= 1 (spec D1, default 1). */
+export function validateWorkersInput(value: string): string | null {
+  const t = getTranslatorForCommon();
+  if (!/^\d+$/.test(value) || Number(value) < 1) {
+    return t("cli.workersInvalid");
+  }
+  return null;
+}
+
+/** `agent-bridge queue add`: interactive queue-definition creation wizard. */
+async function addQueue(): Promise<void> {
+  const ctx = createPromptContext();
+  try {
+    const t = getTranslatorForCommon();
+    const config = await loadConfig();
+    const channelNames = Object.keys(config.channels).sort();
+    if (channelNames.length === 0) {
+      // The definition requires an owning channel (spec D1) — nothing to
+      // bind the queue to without one.
+      throw new Error(t("cli.noChannelsConfigured"));
+    }
+
+    const existing = await listQueueDefinitions();
+    const existingNames = new Set(existing.map((definition) => definition.name));
+
+    const name = await ctx.input(t("cli.queueNamePrompt"), {
+      required: true,
+      validate: (value) => validateQueueNameInput(value, existingNames),
+    });
+
+    const channel = await ctx.select(
+      t("cli.channelPrompt"),
+      channelNames.map((channelName) => ({ label: channelName, value: channelName })),
+    );
+
+    const workers = await ctx.input(t("cli.workersPrompt"), {
+      defaultValue: "1",
+      validate: validateWorkersInput,
+    });
+
+    // Blank = the channel agent config's model (same resolution as scheduled
+    // tasks); deliberately not validated — a typo fails fast at fire time.
+    const model = await ctx.input(t("cli.modelPrompt"), {
+      placeholder: "Example: azure-openai-responses/gpt-5.6-terra",
+    });
+
+    const result = await writeQueueDefinition({
+      name,
+      channel,
+      workers: Number(workers),
+      // Blank = channel default; the storage layer rejects a present-but-blank model.
+      model: model.trim() === "" ? undefined : model,
+    });
+    if (!result.ok) {
+      throw new Error(result.reason);
+    }
+
+    console.log(t("cli.queueCreated"));
+    console.log(`- ${t("cli.queueCreatedGuideFile", { filePath: result.filePath })}`);
+    console.log(`- ${t("cli.queueCreatedGuideBind", { name })}`);
+    console.log(`- ${t("cli.queueCreatedGuideInsert", { name })}`);
+  } finally {
+    ctx.close();
+  }
+}
+
+/**
+ * `agent-bridge queue insert <name> --prompt "..."`: enqueue a task.
+ * Errors (thrown, non-zero exit) when the prompt is empty or the queue does
+ * not exist. The task is durable the moment the file lands; an unbound queue
+ * simply waits until `/queue-here` binds a chat (spec D4, decided in grill).
+ */
+async function insertQueueCommand(
+  queueName: string,
+  options: { prompt?: string },
+): Promise<void> {
+  const t = getTranslatorForCommon();
+  if (options.prompt === undefined || options.prompt.trim() === "") {
+    throw new Error(t("cli.queueInsertPromptRequired"));
+  }
+
+  const definition = await loadQueueDefinition(queueName);
+  if (definition === null) {
+    throw new Error(t("cli.queueNotFound", { name: queueName }));
+  }
+
+  const taskId = await insertQueueTask(queueName, options.prompt);
+  console.log(t("cli.queueInserted", { name: queueName, taskId }));
+
+  if (definition.target === undefined) {
+    console.log(t("cli.queueInsertUnboundWarning"));
+  }
+}
+
+interface QueueListRow {
+  definition: QueueDefinition;
+  pending: number;
+  running: number;
+}
+
+/** `agent-bridge queue list`: table of every queue with task counts. */
+async function listQueues(): Promise<void> {
+  const t = getTranslatorForCommon();
+  const definitions = await listQueueDefinitions();
+  if (definitions.length === 0) {
+    console.log(t("cli.noQueues"));
+    return;
+  }
+
+  const rows: QueueListRow[] = [];
+  for (const definition of definitions) {
+    const tasks = await listQueueTasks(definition.name);
+    rows.push({
+      definition,
+      pending: tasks.filter((task) => task.state === "pending").length,
+      running: tasks.filter((task) => task.state === "running").length,
+    });
+  }
+
+  const columns: Array<{ header: string; get: (row: QueueListRow) => string }> = [
+    { header: "Name", get: (row) => row.definition.name },
+    { header: "Channel", get: (row) => row.definition.channel },
+    { header: "Workers", get: (row) => String(row.definition.workers) },
+    { header: "Model", get: (row) => row.definition.model ?? "-" },
+    { header: "Bound", get: (row) => (row.definition.target !== undefined ? "yes" : "no") },
+    { header: "Pending", get: (row) => String(row.pending) },
+    { header: "Running", get: (row) => String(row.running) },
+  ];
+  const widths = columns.map((column) =>
+    Math.max(column.header.length, ...rows.map((row) => column.get(row).length)),
+  );
+
+  console.log(columns.map((column, i) => column.header.padEnd(widths[i])).join("  ").trimEnd());
+  for (const row of rows) {
+    console.log(columns.map((column, i) => column.get(row).padEnd(widths[i])).join("  ").trimEnd());
+  }
+}
+
 export async function runCli(argv = process.argv): Promise<void> {
   const program = new Command();
 
@@ -454,6 +627,33 @@ export async function runCli(argv = process.argv): Promise<void> {
     .argument("<task-name>")
     .action(async (taskName: string) => {
       await removeScheduleTask(taskName);
+    });
+
+  const queue = program
+    .command("queue")
+    .description("Manage event queues (Markdown files under ~/.config/agent-bridge/queues)");
+
+  queue
+    .command("add")
+    .description("Interactively create an event queue")
+    .action(async () => {
+      await addQueue();
+    });
+
+  queue
+    .command("insert")
+    .description("Insert a task into a queue")
+    .argument("<queue-name>")
+    .option("--prompt <prompt>", "Task prompt")
+    .action(async (queueName: string, options: { prompt?: string }) => {
+      await insertQueueCommand(queueName, options);
+    });
+
+  queue
+    .command("list")
+    .description("List queues with task counts")
+    .action(async () => {
+      await listQueues();
     });
 
   await program.parseAsync(argv);
