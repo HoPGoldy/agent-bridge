@@ -2,6 +2,13 @@
 
 All notable changes to this project will be documented in this file. See [commit-and-tag-version](https://github.com/absolute-version/commit-and-tag-version) for commit guidelines.
 
+## [0.8.3](https://github.com/HoPGoldy/agent-bridge/compare/v0.8.2...v0.8.3) (2026-08-19)
+
+
+### Features
+
+* simplify queue binding, unify delivery attribution, deliver last message ([509fd1c](https://github.com/HoPGoldy/agent-bridge/commit/509fd1c12053162ec9abfbd2f59f3e0e3ab3258d))
+
 ## [0.8.2](https://github.com/HoPGoldy/agent-bridge/compare/v0.8.1...v0.8.2) (2026-08-19)
 
 
