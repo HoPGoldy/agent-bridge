@@ -1014,6 +1014,121 @@ describe("WeixinIMAdapter", () => {
     expect(fakeClientState.stopTyping).toHaveBeenCalledWith("wxid_user_1");
   });
 
+  it("does not let typing refresh failures block or crash inbound message handling", async () => {
+    const adapter = new WeixinIMAdapter(
+      {
+        accountId: "bot-account",
+        token: "bot-token",
+      },
+      createLogger("test"),
+    );
+    const onOutput = vi.fn(async (_event: ClientOutputEvent) => {});
+
+    await adapter.start(onOutput);
+    fakeClientState.sendTyping.mockRejectedValueOnce(
+      new Error("HTTP request failed: This operation was aborted"),
+    );
+
+    await fakeClientState.onMessage?.({
+      chatId: "wxid_user_1",
+      chatType: "dm",
+      messageId: "msg-typing-fail",
+      text: "hello",
+      mentionedBot: false,
+    });
+
+    // The message must still reach the core even though sendTyping rejected,
+    // and the rejection must not escape the handler (no unhandled rejection).
+    expect(onOutput).toHaveBeenCalledWith({
+      type: "user.message",
+      clientSessionId: "weixin:dm:wxid_user_1",
+      text: "hello",
+    });
+    expect(fakeClientState.sendTyping).toHaveBeenCalledWith("wxid_user_1");
+  });
+
+  it("stops the typing heartbeat after consecutive heartbeat failures instead of failing forever", async () => {
+    vi.useFakeTimers();
+    const warnSpy = vi.spyOn(console, "warn").mockImplementation(() => {});
+
+    try {
+      const adapter = new WeixinIMAdapter(
+        {
+          accountId: "bot-account",
+          token: "bot-token",
+        },
+        createLogger("test"),
+      );
+      const onOutput = vi.fn(async (_event: ClientOutputEvent) => {});
+
+      await adapter.start(onOutput);
+      fakeClientState.sendTyping.mockReset();
+      fakeClientState.sendTyping.mockRejectedValue(new Error("fetch failed"));
+
+      await fakeClientState.onMessage?.({
+        chatId: "wxid_user_1",
+        chatType: "dm",
+        messageId: "msg-heartbeat-fail",
+        text: "hello",
+        mentionedBot: false,
+      });
+
+      // 1 initial (rejected) + 6 heartbeat failures = 7 calls, then the
+      // heartbeat stops itself.
+      await vi.advanceTimersByTimeAsync(10_000 * 6);
+      expect(fakeClientState.sendTyping).toHaveBeenCalledTimes(7);
+
+      await vi.advanceTimersByTimeAsync(10_000 * 3);
+      expect(fakeClientState.sendTyping).toHaveBeenCalledTimes(7);
+
+      // Every failure is logged for diagnosis, plus one final stop notice.
+      const warnMessages = warnSpy.mock.calls
+        .map((call) => call.map(String).join(" "))
+        .filter((text) => text.includes("typing heartbeat failed"));
+      expect(warnMessages).toHaveLength(6);
+      expect(warnSpy.mock.calls.some((call) =>
+        call.map(String).join(" ").includes("typing heartbeat stopped after 6 consecutive failures"),
+      )).toBe(true);
+    } finally {
+      warnSpy.mockRestore();
+    }
+  });
+
+  it("does not report a false delivery failure to the user when only stopTyping fails", async () => {
+    const adapter = new WeixinIMAdapter(
+      {
+        accountId: "bot-account",
+        token: "bot-token",
+      },
+      createLogger("test"),
+    );
+
+    await adapter.start(async () => {});
+    await fakeClientState.onMessage?.({
+      chatId: "wxid_user_1",
+      chatType: "dm",
+      messageId: "msg-cancel-fail",
+      text: "hello",
+      mentionedBot: false,
+    });
+
+    fakeClientState.sendText.mockClear();
+    fakeClientState.stopTyping.mockRejectedValueOnce(new Error("This operation was aborted"));
+
+    await adapter.input({
+      type: "assistant.message",
+      clientSessionId: "weixin:dm:wxid_user_1",
+      text: "final reply",
+    });
+
+    await waitFor(() => fakeClientState.sendText.mock.calls.length === 1);
+
+    // Only the real reply was sent; the typing-cancel failure must not turn
+    // into a spurious "Message delivery failed" notice.
+    const sentTexts = fakeClientState.sendText.mock.calls.map((call) => call[1]);
+    expect(sentTexts).toEqual(["final reply"]);
+  });
+
   it("degrades gracefully when onScheduleHere is absent: logs and replies nothing", async () => {
     const warnSpy = vi.spyOn(console, "warn").mockImplementation(() => {});
     try {

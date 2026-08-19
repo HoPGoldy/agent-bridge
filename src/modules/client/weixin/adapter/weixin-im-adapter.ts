@@ -35,6 +35,10 @@ const MAX_TEXT_CHUNK = 2000;
 const PROGRESS_INTERVAL_MS = 60_000;
 const MESSAGE_DEDUP_TTL_MS = 5 * 60_000;
 const TYPING_REFRESH_INTERVAL_MS = 10_000;
+// Typing indicators are best-effort UX. After this many consecutive heartbeat
+// failures the heartbeat stops itself (it restarts on the next inbound message)
+// so a dead network does not spam one warn every 10 seconds.
+const TYPING_HEARTBEAT_MAX_FAILURES = 6;
 const RATE_LIMIT_WINDOW_MS = 60_000;
 const RATE_LIMIT_THRESHOLD = 2;
 const RATE_LIMIT_COOLDOWN_MS = 60_000;
@@ -122,6 +126,30 @@ export class WeixinIMAdapter implements IMAdapter {
     this.#onOutput = onOutput;
     this.#client = new WeixinClient(this.#config, this.#logger);
     this.#client.setOnMessage(async ({ chatId, chatType, text, messageId }) => {
+      // The SDK monitor loop awaits this handler with no try/catch of its own;
+      // any exception escaping here kills inbound message processing silently.
+      // Catch everything so a bug in one message never takes down the channel,
+      // while still logging the full stack for diagnosis.
+      try {
+        await this.#handleInboundMessage({ chatId, chatType, text, messageId });
+      } catch (error) {
+        this.#logger.error(
+          `inbound message handling failed (chatId=${chatId} messageId=${messageId}):`,
+          error,
+        );
+      }
+    });
+
+    await this.#client.connect();
+    this.#logger.info(`adapter started (baseUrl=${this.#config.baseUrl ?? "https://ilinkai.weixin.qq.com"})`);
+  }
+
+  async #handleInboundMessage({ chatId, chatType, text, messageId }: {
+    chatId: string;
+    chatType: "dm" | "group";
+    text: string;
+    messageId: string;
+  }): Promise<void> {
       if (!this.#onOutput) {
         this.#logger.warn(`dropping inbound message, adapter not ready (chatId=${chatId})`);
         return;
@@ -143,15 +171,14 @@ export class WeixinIMAdapter implements IMAdapter {
 
       const normalizedText = text.trim();
       this.#resetProgressState(clientSessionId);
-      await this.#client?.sendTyping(chatId);
+      await this.#refreshTyping(chatId, clientSessionId);
       this.#startTypingHeartbeat(clientSessionId, chatId);
 
       const helpMarkdown = resolveHelpMarkdown(normalizedText, this.#t);
       if (helpMarkdown) {
         await this.#client?.sendText(chatId, helpMarkdown);
         this.#stopProgressTimer(clientSessionId);
-        this.#stopTypingHeartbeat(clientSessionId);
-        await this.#client?.stopTyping(chatId);
+        await this.#cancelTyping(chatId, clientSessionId);
         return;
       }
 
@@ -189,8 +216,7 @@ export class WeixinIMAdapter implements IMAdapter {
               });
           await this.#client?.sendText(chatId, text);
           this.#stopProgressTimer(clientSessionId);
-          this.#stopTypingHeartbeat(clientSessionId);
-          await this.#client?.stopTyping(chatId);
+          await this.#cancelTyping(chatId, clientSessionId);
           return;
         }
         await this.#onOutput(resolved);
@@ -202,10 +228,6 @@ export class WeixinIMAdapter implements IMAdapter {
         clientSessionId,
         text,
       });
-    });
-
-    await this.#client.connect();
-    this.#logger.info(`adapter started (baseUrl=${this.#config.baseUrl ?? "https://ilinkai.weixin.qq.com"})`);
   }
 
   async stop(): Promise<void> {
@@ -266,8 +288,7 @@ export class WeixinIMAdapter implements IMAdapter {
             if (statusMarkdown) {
               if (isTerminalAgentError(event) || isCompletedCommandResponse(event)) {
                 this.#stopProgressTimer(event.clientSessionId);
-                this.#stopTypingHeartbeat(event.clientSessionId);
-                await this.#client.stopTyping(target.chatId);
+                await this.#cancelTyping(target.chatId, event.clientSessionId);
               }
               await this.#sendTextWithProtection(target.chatId, statusMarkdown);
               continue;
@@ -292,14 +313,12 @@ export class WeixinIMAdapter implements IMAdapter {
               await this.#notifySendFailure(target.chatId, attachmentError);
             }
           }
-          this.#stopTypingHeartbeat(event.clientSessionId);
-          await this.#client.stopTyping(target.chatId);
+          await this.#cancelTyping(target.chatId, event.clientSessionId);
         } catch (error) {
           this.#logger.error("failed to send egress event:", error);
           try {
             const target = parseWeixinSessionId(event.clientSessionId);
-            this.#stopTypingHeartbeat(event.clientSessionId);
-            await this.#client.stopTyping(target.chatId);
+            await this.#cancelTyping(target.chatId, event.clientSessionId);
             await this.#notifySendFailure(target.chatId, error);
           } catch (notifyError) {
             this.#logger.error("failed to handle egress send failure:", notifyError);
@@ -313,8 +332,32 @@ export class WeixinIMAdapter implements IMAdapter {
 
   #startTypingHeartbeat(clientSessionId: string, chatId: string): void {
     this.#stopTypingHeartbeat(clientSessionId);
+    let failures = 0;
     const timer = setInterval(() => {
-      void this.#client?.sendTyping(chatId);
+      // Best-effort UX: a typing refresh must never crash the process (an
+      // unhandled rejection from the old `void` call took down the whole
+      // bridge). Log every failure with the full error for diagnosis, and
+      // stop the heartbeat after repeated failures instead of spamming.
+      this.#client?.sendTyping(chatId).then(
+        () => {
+          failures = 0;
+        },
+        (error) => {
+          failures += 1;
+          this.#logger.warn(
+            `typing heartbeat failed (session=${clientSessionId} chatId=${chatId} ` +
+              `consecutive=${failures}/${TYPING_HEARTBEAT_MAX_FAILURES}):`,
+            error,
+          );
+          if (failures >= TYPING_HEARTBEAT_MAX_FAILURES) {
+            this.#stopTypingHeartbeat(clientSessionId);
+            this.#logger.warn(
+              `typing heartbeat stopped after ${failures} consecutive failures ` +
+                `(session=${clientSessionId} chatId=${chatId}); it will restart on the next inbound message`,
+            );
+          }
+        },
+      );
     }, TYPING_REFRESH_INTERVAL_MS);
     timer.unref?.();
     this.#typingHeartbeatBySession.set(clientSessionId, timer);
@@ -327,6 +370,38 @@ export class WeixinIMAdapter implements IMAdapter {
     }
     clearInterval(timer);
     this.#typingHeartbeatBySession.delete(clientSessionId);
+  }
+
+  /**
+   * Best-effort typing refresh. Typing indicators must never block message
+   * handling: failures are logged (warn) with session context and swallowed.
+   */
+  async #refreshTyping(chatId: string, clientSessionId: string): Promise<void> {
+    try {
+      await this.#client?.sendTyping(chatId);
+    } catch (error) {
+      this.#logger.warn(
+        `typing refresh failed (session=${clientSessionId} chatId=${chatId}):`,
+        error,
+      );
+    }
+  }
+
+  /**
+   * Stop the heartbeat and cancel the typing indicator, best-effort. A failed
+   * cancel must not be mistaken for a reply-delivery failure, so it is logged
+   * (warn) and swallowed rather than propagated to egress error handling.
+   */
+  async #cancelTyping(chatId: string, clientSessionId: string): Promise<void> {
+    this.#stopTypingHeartbeat(clientSessionId);
+    try {
+      await this.#client?.stopTyping(chatId);
+    } catch (error) {
+      this.#logger.warn(
+        `typing cancel failed (session=${clientSessionId} chatId=${chatId}):`,
+        error,
+      );
+    }
   }
 
   async #notifySendFailure(chatId: string, error: unknown): Promise<void> {
@@ -511,8 +586,7 @@ export class WeixinIMAdapter implements IMAdapter {
   ): Promise<void> {
     const cleanup = async (): Promise<void> => {
       this.#stopProgressTimer(clientSessionId);
-      this.#stopTypingHeartbeat(clientSessionId);
-      await this.#client?.stopTyping(chatId);
+      await this.#cancelTyping(chatId, clientSessionId);
     };
 
     if (command.type === "schedule.run.usage") {
@@ -546,8 +620,7 @@ export class WeixinIMAdapter implements IMAdapter {
   ): Promise<void> {
     const cleanup = async (): Promise<void> => {
       this.#stopProgressTimer(clientSessionId);
-      this.#stopTypingHeartbeat(clientSessionId);
-      await this.#client?.stopTyping(chatId);
+      await this.#cancelTyping(chatId, clientSessionId);
     };
 
     if (command.type === "schedule.here.usage") {
