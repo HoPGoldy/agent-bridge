@@ -153,3 +153,20 @@
 问题：Worker 槽位释放后的补充时机（workers=2、4 个任务时一个 tick 立即 fire 2 个；跑完后等 tick 还是立刻补）？
 
 用户回答：A——纯 tick 驱动，跑完等下次 tick（最坏 30s 空转）再取下一个。实现最简单，与 scheduler 完全同构。
+
+## 2026-08-19（二）
+
+背景：包含长期异步 subagent 的会话被 idle 回收器误杀（idle 回收 = 10min 无事件 + isBusy()==false；pi adapter 的 isBusy 只覆盖 turn 流式中，等异步回调期间会话无事件 → 误杀，pi 进程被杀导致后台工作陪葬）。另发现 schedule/queue 的完成信号缺陷：第一条 assistant.message 即结束 run，后续事件丢弃、超时计时器清除，session 被"放生"。
+
+调查结论：pi RPC set_model 无 busy 检查、session.setModel 直接换模型下次调用生效（bridge 的 isBusy 门槛是双重画蛇添足）；异步 subagent 以 pi 子进程运行、完成经扩展内部事件总线 → pi.sendMessage(customType, triggerTurn) 注入自定义消息触发新 turn；pi core 不感知扩展的后台工作，agent_settled 不能当完成信号；子进程检测覆盖不了"触发外部系统异步"的场景（用户指出，撤回）。
+
+决策：
+1. isBusy 从 AgentAdapter 接口整个删除：core 纯转发零附加逻辑（/model 直接丢给 adapter）；防御收回 adapter 内部（abort 内部自行判断 activeRun）；idle 回收改为纯事件 idle 超时，默认 24h（agentIdleTimeoutMs 可配）。
+2. schedule/queue 完成判定三层（用户两次修改后定稿）：
+   - 第一层：agent 完成任务时在最终消息末尾输出 BRIDGE_TASK_STATUS_DONE（中间消息不带任何标记）；bridge 剥离标记。
+   - 第二层（用户改）：静默 N 分钟且无 DONE → 主动向会话发探测消息（"如果结束请返回 DONE，没结束请继续"），不被动宣判；探测无回应不加重启逻辑，靠第三层兜底；探测问答也进累积文件。
+   - 第三层：墙上时钟 run timeout 封顶，到点投递已有累积内容 + 超时通知。
+3. 累积到本地文件：run 期间所有 assistant.message 写入本地文件，结束后统一投递全文（用户拍板）。
+4. WAITING（等异步回调）期间占 worker 槽位（v1）。
+5. N 默认 10 分钟，可在任务/队列定义里配置。
+6. 根治长期路径：pi 上游扩展注册 pending-work 句柄 + RPC 暴露（本版不做）。
