@@ -28,7 +28,7 @@ import { parseSchedule, parseTimeout, type Schedule } from "./grammar";
 /** Default max run duration: `10m` (spec D3). */
 export const DEFAULT_TIMEOUT_MS = 10 * 60_000;
 
-/** Default silence window before a probe is sent: `10m` (qa-log 2026-08-19, layer 2). */
+/** Default silence window before a probe is sent: `10m` (2026-08-19 grill, layer 2). */
 export const DEFAULT_SILENCE_MS = 10 * 60_000;
 
 /** Task names are the `.md` file names without the extension (spec D3). */
@@ -59,7 +59,7 @@ export interface ScheduleTask {
   timeoutMs: number;
   /**
    * Silence window before a probe message is sent into the run session
-   * (qa-log 2026-08-19, layer 2); parsed from `silence:` front matter with
+   * (2026-08-19 grill, layer 2); parsed from `silence:` front matter with
    * the same duration syntax as `timeout:`, defaults to
    * {@link DEFAULT_SILENCE_MS}.
    */
@@ -290,6 +290,93 @@ function nonEmptyString(value: string | undefined): string | undefined {
 
 /** Outcome of binding a task to a channel + delivery target (`/schedule-here`, spec D7). */
 export type BindTaskResult = { ok: true } | { ok: false; reason: string };
+
+/** Outcome of toggling a task's `enabled` front matter (the enable/disable CLI). */
+export type SetTaskEnabledResult = { ok: true } | { ok: false; reason: string };
+
+/**
+ * Sets the task file's `enabled` front-matter field (the persistent disable
+ * switch): `false` pauses the task, `true` re-enables it. The edit is the
+ * same surgical, atomic, single-line rewrite as {@link bindTask}: an
+ * existing `enabled:` line is replaced in place; a file with front matter
+ * but no such line gets one inserted just before the closing `---`; a file
+ * without front matter gets a minimal block prepended; an unterminated front
+ * matter block gets the line appended to the end. The body and every other
+ * line are preserved byte-for-byte. The next scheduler tick (hot reload)
+ * picks the change up.
+ *
+ * Never throws for the expected failures: an invalid task name or a missing
+ * file returns an error result (the CLI reports it).
+ */
+export async function setTaskEnabled(
+  taskName: string,
+  enabled: boolean,
+  schedulesRoot: string = SCHEDULES_DIR,
+): Promise<SetTaskEnabledResult> {
+  if (!isValidTaskName(taskName)) {
+    return { ok: false, reason: "invalid task name" };
+  }
+  const filePath = path.join(getSchedulesDir(schedulesRoot), `${taskName}.md`);
+  let content: string;
+  try {
+    content = await readFile(filePath, "utf8");
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException)?.code === "ENOENT") {
+      return { ok: false, reason: "task not found" };
+    }
+    return { ok: false, reason: `failed to read task file: ${(error as Error).message}` };
+  }
+  try {
+    await writeFileAtomic(filePath, applyFrontMatterField(content, "enabled", enabled ? "true" : "false"));
+  } catch (error) {
+    return { ok: false, reason: `failed to write task file: ${(error as Error).message}` };
+  }
+  return { ok: true };
+}
+
+/**
+ * Returns `content` with the front-matter field `key` set to `value`
+ * (surgical single-line rewrite, same rules as {@link bindTask}'s binding
+ * lines; used by {@link setTaskEnabled}).
+ */
+function applyFrontMatterField(content: string, key: string, value: string): string {
+  const eol = content.includes("\r\n") ? "\r\n" : "\n";
+  const lines = content.split(eol);
+  const line = `${key}: ${value}`;
+
+  if (lines[0]?.trim() === "---") {
+    let closeIndex = -1;
+    for (let i = 1; i < lines.length; i++) {
+      if (lines[i].trim() === "---") {
+        closeIndex = i;
+        break;
+      }
+    }
+    if (closeIndex === -1) {
+      // Unterminated block: the parser treats the rest of the file as front
+      // matter, so appending the line keeps the file's semantics unchanged.
+      lines.push(line);
+      return lines.join(eol);
+    }
+    let replaced = false;
+    for (let i = 1; i < closeIndex; i++) {
+      const colon = lines[i].indexOf(":");
+      const fieldKey = colon === -1 ? lines[i].trim() : lines[i].slice(0, colon).trim();
+      if (fieldKey === key) {
+        lines[i] = line;
+        replaced = true;
+        break;
+      }
+    }
+    if (!replaced) {
+      lines.splice(closeIndex, 0, line);
+    }
+    return lines.join(eol);
+  }
+
+  // No front matter: prepend a minimal block containing only the field.
+  return `---${eol}${line}${eol}---${eol}${content}`;
+}
 
 /**
  * Writes `binding.target` (a chat's clientSessionId) and `binding.channel`

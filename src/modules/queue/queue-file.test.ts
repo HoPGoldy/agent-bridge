@@ -18,6 +18,7 @@ import {
   parseQueueDefinition,
   parseQueueTaskFile,
   bindQueue,
+  setQueueEnabled,
   setQueueTaskState,
   writeQueueDefinition,
 } from "./queue-file";
@@ -80,6 +81,7 @@ describe("parseQueueDefinition", () => {
       silenceMs: DEFAULT_SILENCE_MS,
       model: "azure-openai-responses/gpt-5.6-terra",
       target: "feishu:dm:oc_6f9d408e630098e6dd06bb071d6b60fc",
+      enabled: true,
       body: "Shared context for every task of this queue.",
       filePath: "",
     });
@@ -99,6 +101,7 @@ describe("parseQueueDefinition", () => {
       silenceMs: DEFAULT_SILENCE_MS,
       model: undefined,
       target: undefined,
+      enabled: true,
       body: "",
       filePath: "",
     });
@@ -199,6 +202,7 @@ Body.
       silenceMs: DEFAULT_SILENCE_MS,
       model: undefined,
       target: undefined,
+      enabled: true,
       body: "Body.",
       filePath: "",
     });
@@ -858,6 +862,75 @@ Body.
     expect(await bindQueue("ops", "feishu-dev", "   ", root)).toEqual({
       ok: false,
       reason: "target must be a non-empty string",
+    });
+  });
+});
+
+describe("setQueueEnabled", () => {
+  const tmpDirs: string[] = [];
+
+  afterEach(async () => {
+    while (tmpDirs.length > 0) {
+      await rm(tmpDirs.pop()!, { recursive: true, force: true });
+    }
+  });
+
+  it("disables and re-enables a queue, preserving the body and other lines byte-for-byte", async () => {
+    const root = await mkdtemp(path.join(os.tmpdir(), "agent-bridge-queues-"));
+    tmpDirs.push(root);
+    await writeQueueDefinition({ name: "ops", workers: 2 }, root);
+    await bindQueue("ops", "feishu-dev", "feishu:dm:oc_1", root);
+    const original = await readFile(path.join(root, "ops.md"), "utf8");
+
+    expect(await setQueueEnabled("ops", false, root)).toEqual({ ok: true });
+    let updated = await readFile(path.join(root, "ops.md"), "utf8");
+    expect(updated).toContain("enabled: false");
+    expect((await loadQueueDefinition("ops", root))?.enabled).toBe(false);
+    // Every other line survives untouched; exactly one enabled line exists.
+    expect(updated.match(/^enabled: false$/m)).toHaveLength(1);
+    expect(updated.replace("enabled: false\n", "")).toBe(original);
+
+    expect(await setQueueEnabled("ops", true, root)).toEqual({ ok: true });
+    updated = await readFile(path.join(root, "ops.md"), "utf8");
+    expect(updated).toContain("enabled: true");
+    expect((await loadQueueDefinition("ops", root))?.enabled).toBe(true);
+  });
+
+  it("appends the enabled line to a definition without front matter", async () => {
+    const root = await mkdtemp(path.join(os.tmpdir(), "agent-bridge-queues-"));
+    tmpDirs.push(root);
+    await mkdir(root, { recursive: true });
+    await writeFile(path.join(root, "nofm.md"), "Just a body.\n", "utf8");
+
+    expect(await setQueueEnabled("nofm", false, root)).toEqual({ ok: true });
+    const updated = await readFile(path.join(root, "nofm.md"), "utf8");
+    expect(updated.startsWith("---\nenabled: false\n---\nJust a body.\n")).toBe(true);
+  });
+
+  it("appends the enabled line to an unterminated front matter block", async () => {
+    const root = await mkdtemp(path.join(os.tmpdir(), "agent-bridge-queues-"));
+    tmpDirs.push(root);
+    await writeFile(
+      path.join(root, "open.md"),
+      "---\nworkers: 2\nbody text never separated\n",
+      "utf8",
+    );
+
+    expect(await setQueueEnabled("open", false, root)).toEqual({ ok: true });
+    const updated = await readFile(path.join(root, "open.md"), "utf8");
+    expect(updated).toBe("---\nworkers: 2\nbody text never separated\n\nenabled: false");
+  });
+
+  it("returns error results for a missing queue and an invalid name", async () => {
+    const root = await mkdtemp(path.join(os.tmpdir(), "agent-bridge-queues-"));
+    tmpDirs.push(root);
+    expect(await setQueueEnabled("ghost", false, root)).toEqual({
+      ok: false,
+      reason: "queue not found",
+    });
+    expect(await setQueueEnabled("Bad_Name", false, root)).toEqual({
+      ok: false,
+      reason: "invalid queue name",
     });
   });
 });

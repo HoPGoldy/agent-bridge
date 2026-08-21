@@ -1,5 +1,11 @@
 # 项目术语表
 
+### 禁用（disable / enabled: false）
+
+定义：schedule 定时任务和 queue 两类顶层对象的持久开关（front matter `enabled` 字段，缺省/非 `false` 即启用，仅显式 `false` 禁用）。disable 后：自动调度/消费一律跳过、`/schedule-run` 拒绝、在途 run 不打断、pending 任务保留堆积；显式 enable 后恢复（schedule 的 nextRun 从当前时钟重算不补跑，queue 的 backlog 自动 drain）。切换入口 = CLI `enable/disable` 子命令或 AI 编辑文件（无 IM 命令）。
+
+易混淆点：queue 内单条排队任务没有 disable——"跳过某一条"= 删掉该 task 文件；它也不是一次性跳过（不会自动恢复）。
+
 ### 定时任务（Scheduled Task）
 
 定义：挂在某个 channel 下的声明式任务，由任务文件（见"任务文件"）定义，随 channel 启停的调度器按调度语法触发，每次触发创建一个全新的临时 Agent 会话执行任务文件正文中的提示词，完成后把结果投递到绑定的 IM 聊天。

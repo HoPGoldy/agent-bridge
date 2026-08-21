@@ -220,7 +220,7 @@ export class Scheduler {
 
   /**
    * Routes a diverted agent-output event for a `schedule:*` session (T3,
-   * three-layer completion protocol per qa-log 2026-08-19（二）).
+   * three-layer completion protocol per the 2026-08-19（二）grill).
    *
    * `assistant.message` no longer ends the run: it is classified against the
    * DONE-marker protocol, appended to the run's accumulator and pokes the

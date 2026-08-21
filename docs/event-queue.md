@@ -70,6 +70,7 @@ silence: 10m               # optional; silence window before a probe (same synta
 model: azure-openai-responses/gpt-5.6-terra   # optional; blank/absent = channel default model
 channel: feishu-dev        # owning channel; ABSENT until /queue-here writes it
 target: feishu:dm:oc_6f9d408e630098e6dd06bb071d6b60fc   # written by /queue-here
+enabled: true              # optional; `false` disables the queue (see below)
 ---
 
 You are the release bot. Always answer in one short paragraph.
@@ -87,8 +88,9 @@ You are the release bot. Always answer in one short paragraph.
 | `silence` | no | `10m` | Silence window before a probe is sent into a run: same duration syntax as `timeout`. After this many minutes with no observable run activity, the controller asks the run whether it is finished (see [Completion](#completion)). An invalid value fails validation and the queue is skipped with a log. |
 | `model` | no | — | Optional per-queue agent model override for every run of the queue (same override plumbing as scheduled tasks' per-task model). Blank or absent = the channel agent config's model. Parsing only checks for a non-empty string; validity is enforced at fire time — an invalid model fails the session creation, which fails the task (see [Failure: fail-and-drop](#failure-fail-and-drop)). |
 | `target` | no | — | Delivery address: the destination chat's clientSessionId, written by `/queue-here <name>` sent in that chat. Without it the queue is never consumed — tasks pile up until a chat is bound. |
+| `enabled` | no | `true` | `false` (case-insensitive) disables the queue: the controller never consumes it — pending tasks pile up untouched (in-flight runs are unaffected and finish normally). Any other value or absence means enabled. Re-enabling drains the backlog automatically on the next tick. Toggle with `agent-bridge queue enable|disable <queue-name>` or by editing the file. |
 
-`queue add` writes the front matter with `workers` (default `1`) and `model` (only if you entered a non-empty one), plus an empty body — **no `channel`, no `target`**: a fresh queue is unbound and ownerless until `/queue-here` writes both lines in one atomic edit. It does not offer a `silence` prompt — that field is set (and tuned) by editing the file, defaulting to `10m`.
+`queue add` writes the front matter with `workers` (default `1`) and `model` (only if you entered a non-empty one), plus an empty body — **no `channel`, no `target`, no `enabled`**: a fresh queue is unbound and ownerless until `/queue-here` writes both lines in one atomic edit. It does not offer a `silence` prompt — that field is set (and tuned) by editing the file, defaulting to `10m`.
 
 ## Task files
 
@@ -113,7 +115,9 @@ The task prompt.
 | --- | --- |
 | `agent-bridge queue add` | Interactive wizard: queue name (slug-validated and globally unique), workers (default `1`), optional model — **no channel step**. Writes `queues/<name>.md` (without `channel`/`target`) and prints the file path, the `/queue-here` targeting instruction, and the `queue insert` usage. |
 | `agent-bridge queue insert <queue-name> --prompt "..."` | Validates the queue exists and appends a task file (`queues/<queue-name>.tasks/<id>.md`). Prints `Inserted task <id> into queue "<name>".` If the queue has no `target`, prints a warning that tasks wait until `/queue-here` binds a chat. Insert always succeeds regardless of binding or whether the channel is running — the task is durable the moment the file lands. |
-| `agent-bridge queue list` | Table of every queue: Name, Channel, Workers, Model, Bound (`yes`/`no`), Pending count, Running count. |
+| `agent-bridge queue list` | Table of every queue: Name, Channel, Workers, Model, Enabled (`yes`/`no`), Bound (`yes`/`no`), Pending count, Running count. |
+| `agent-bridge queue enable <queue-name>` | Set `enabled: true` in the queue file (atomic single-line edit). Consumption resumes on the next tick and the pending backlog drains automatically. Errors on an unknown queue or an invalid name. |
+| `agent-bridge queue disable <queue-name>` | Set `enabled: false` — the controller stops consuming the queue; pending tasks pile up untouched and in-flight runs are unaffected. Errors on an unknown queue or an invalid name. |
 | `agent-bridge queue remove <queue-name>` | Delete the queue definition file **and** its `<queue-name>.tasks/` directory recursively — pending tasks die with the queue, no prompts. Errors on an unknown queue or an invalid name. |
 | `agent-bridge queue history <queue-name>` | Newest-first table of the queue's finished runs (Time, Name, Outcome, Duration, Reason, File) from the run-history index. |
 
@@ -185,12 +189,16 @@ With `workers: 1` tasks run strictly one at a time, oldest first. With `workers 
 
 A queue with no `target` (and no `channel`) is never consumed: it belongs to no controller, tasks accumulate (each `queue insert` succeeds, with a warning), and `queue list` shows `Bound: no` and `Channel: -`. Once `/queue-here` binds a chat — writing both the channel and the target — the backlog drains automatically: the controller picks up the oldest pending tasks on the next tick.
 
+### Disabled queues pause, tasks pile up
+
+`agent-bridge queue disable <queue-name>` (or setting `enabled: false` in the file, e.g. by asking the agent to edit it) pauses consumption: the controller skips the queue entirely — pending tasks stay `pending` and untouched, in-flight runs are unaffected and deliver normally. `queue list` shows `Enabled: no`. `agent-bridge queue enable <queue-name>` (or editing the file back) resumes on the next tick and drains the backlog automatically. Disabling is a persistent switch: it survives restarts and never auto-re-enables.
+
 ### Hot reload: edits are picked up within 30 seconds
 
 The controller reloads queue definitions on every tick, so:
 
 - **Edited body (shared context)** → used for every task fired after the next tick.
-- **Edited front matter** (`workers`, `silence`, `model`, `target`) → effective on the next tick; no channel restart needed.
+- **Edited front matter** (`workers`, `silence`, `model`, `target`, `enabled`) → effective on the next tick; no channel restart needed.
 - **New or deleted task files** → appear/disappear on the next tick. Deleting a task file mid-run does not interrupt the in-flight run.
 - There is no file-system watching; 30 s polling is cheap and predictable.
 

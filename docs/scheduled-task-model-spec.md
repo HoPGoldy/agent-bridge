@@ -1,8 +1,8 @@
 # Scheduled task per-task model — design spec
 
 Status: implemented design source of truth for the `feat/scheduled-task-model`
-branch. Grill decisions live in `docs/grill-context/qa-log.md` (2026-08-18
-"定时任务支持 per-task 模型指定" section).
+branch. Grill decisions were made in the 2026-08-18 session
+("定时任务支持 per-task 模型指定").
 
 ## Goal
 

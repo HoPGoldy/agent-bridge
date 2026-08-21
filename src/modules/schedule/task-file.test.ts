@@ -11,6 +11,7 @@ import {
   isValidTaskName,
   loadAllTasks,
   parseTaskFile,
+  setTaskEnabled,
 } from "./task-file";
 
 const WELL_FORMED = `---
@@ -728,6 +729,117 @@ Body.
   it("returns an error result for an invalid task name without throwing", async () => {
     const result = await bindTask("Bad_Name", { target: "feishu:dm:oc_1", channel: "feishu-dev" }, tmpRoot);
     expect(result).toEqual({ ok: false, reason: "invalid task name" });
+  });
+});
+
+describe("setTaskEnabled", () => {
+  let tmpRoot: string;
+
+  beforeEach(async () => {
+    tmpRoot = await mkdtemp(path.join(os.tmpdir(), "agent-bridge-settaskenabled-"));
+  });
+
+  afterEach(async () => {
+    await rm(tmpRoot, { recursive: true, force: true });
+  });
+
+  it("replaces an existing enabled line in place, preserving every other byte", async () => {
+    await writeFile(
+      path.join(tmpRoot, "report.md"),
+      `---
+schedule: daily 09:00
+enabled: true
+target: feishu:dm:oc_1
+---
+
+Body.
+`,
+      "utf8",
+    );
+
+    expect(await setTaskEnabled("report", false, tmpRoot)).toEqual({ ok: true });
+    const disabled = await readFile(path.join(tmpRoot, "report.md"), "utf8");
+    expect(disabled).toBe(
+      `---
+schedule: daily 09:00
+enabled: false
+target: feishu:dm:oc_1
+---
+
+Body.
+`,
+    );
+    const { task } = parseTaskFile("report.md", disabled);
+    expect(task.enabled).toBe(false);
+
+    expect(await setTaskEnabled("report", true, tmpRoot)).toEqual({ ok: true });
+    const enabled = await readFile(path.join(tmpRoot, "report.md"), "utf8");
+    expect(enabled).toBe(
+      `---
+schedule: daily 09:00
+enabled: true
+target: feishu:dm:oc_1
+---
+
+Body.
+`,
+    );
+    expect(parseTaskFile("report.md", enabled).task.enabled).toBe(true);
+  });
+
+  it("inserts the enabled line before the closing --- when absent, and prepends front matter to a bare file", async () => {
+    await writeFile(
+      path.join(tmpRoot, "nokey.md"),
+      `---
+schedule: daily 09:00
+---
+
+Body.
+`,
+      "utf8",
+    );
+    await writeFile(path.join(tmpRoot, "nofm.md"), "Just a body.\n", "utf8");
+
+    expect(await setTaskEnabled("nokey", false, tmpRoot)).toEqual({ ok: true });
+    const nokey = await readFile(path.join(tmpRoot, "nokey.md"), "utf8");
+    expect(nokey).toBe(
+      `---
+schedule: daily 09:00
+enabled: false
+---
+
+Body.
+`,
+    );
+
+    expect(await setTaskEnabled("nofm", false, tmpRoot)).toEqual({ ok: true });
+    const nofm = await readFile(path.join(tmpRoot, "nofm.md"), "utf8");
+    expect(nofm).toBe(`---\nenabled: false\n---\nJust a body.\n`);
+  });
+
+  it("appends the enabled line to an unterminated front matter block", async () => {
+    await writeFile(
+      path.join(tmpRoot, "open.md"),
+      "---\nschedule: daily 09:00\nbody text never separated\n",
+      "utf8",
+    );
+
+    expect(await setTaskEnabled("open", false, tmpRoot)).toEqual({ ok: true });
+    const updated = await readFile(path.join(tmpRoot, "open.md"), "utf8");
+    expect(updated).toBe(
+      "---\nschedule: daily 09:00\nbody text never separated\n\nenabled: false",
+    );
+  });
+
+  it("returns error results for a missing task and an invalid name without throwing", async () => {
+    expect(await setTaskEnabled("ghost", false, tmpRoot)).toEqual({
+      ok: false,
+      reason: "task not found",
+    });
+    expect(await setTaskEnabled("Bad_Name", false, tmpRoot)).toEqual({
+      ok: false,
+      reason: "invalid task name",
+    });
   });
 });
 

@@ -1,6 +1,6 @@
 /**
  * Shared run-completion protocol for scheduled tasks and event queues
- * (decided in `docs/grill-context/qa-log.md`, 2026-08-19（二）, layer 1 + 2).
+ * (decided 2026-08-19（二）, layer 1 + 2).
  *
  * The three-layer completion contract:
  *

@@ -9,6 +9,7 @@ import {
   bindQueue,
   insertQueueTask,
   listQueueTasks,
+  setQueueEnabled,
   setQueueTaskState,
 } from "./queue-file";
 import { buildProbeMessage, buildTaskPrompt, DONE_MARKER, sanitizeSessionId } from "../run-completion";
@@ -441,6 +442,29 @@ describe("fail-and-drop (D2, decided)", () => {
 });
 
 describe("unbound and foreign queues (D2)", () => {
+  it("never consumes a disabled queue; the backlog drains once re-enabled", async () => {
+    const h = await createHarness();
+    await seedQueue(h.root, "q", { workers: 2, target: TARGET }, ["a", "b"]);
+    expect(await setQueueEnabled("q", false, h.root)).toEqual({ ok: true });
+    await h.controller.start();
+
+    await sleep(60);
+    expect(h.dispatched).toEqual([]);
+    expect(h.delivered).toEqual([]);
+    const tasks = await listQueueTasks("q", h.root);
+    expect(tasks.every((t) => t.state === "pending")).toBe(true);
+
+    // Re-enabling (the CLI toggle or an AI file edit — hot reload either
+    // way) resumes consumption: the backlog drains automatically.
+    expect(await setQueueEnabled("q", true, h.root)).toEqual({ ok: true });
+    await waitFor(() => expect(h.dispatched).toHaveLength(4));
+    expect(h.dispatched[1]).toEqual({
+      type: "user.message",
+      clientSessionId: expect.stringMatching(/^queue:q:/),
+      text: buildTaskPrompt("", "a"),
+    });
+  });
+
   it("never consumes an unbound queue; the backlog drains once a target is set", async () => {
     const h = await createHarness();
     await seedQueue(h.root, "q", {}, ["a", "b"]);

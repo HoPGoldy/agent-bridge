@@ -1,5 +1,5 @@
 /**
- * Run output accumulator (decided in `docs/grill-context/qa-log.md`,
+ * Run output accumulator (decided in the 2026-08-19 grill,
  * 2026-08-19（二）, decision 3): during a run, every assistant message
  * (including silence-probe Q&A) is appended to a per-run Markdown file under
  * `RUN_OUTPUTS_DIR`. The accumulator tracks the LAST appended message (used

@@ -47,7 +47,7 @@ const TASK_ID_RE = /^\d+-[0-9a-f]{4}$/;
 
 const TASK_STATES = new Set(["pending", "running"]);
 
-const KNOWN_DEFINITION_KEYS = new Set(["channel", "workers", "silence", "model", "target"]);
+const KNOWN_DEFINITION_KEYS = new Set(["channel", "workers", "silence", "model", "target", "enabled"]);
 const KNOWN_TASK_KEYS = new Set(["state", "enqueuedAt"]);
 
 /** A parsed, validated queue definition (spec D1). */
@@ -65,7 +65,7 @@ export interface QueueDefinition {
   workers: number;
   /**
    * Silence window before a probe message is sent into the run session
-   * (qa-log 2026-08-19, layer 2); parsed from the definition's `silence:`
+   * (2026-08-19 grill, layer 2); parsed from the definition's `silence:`
    * front matter with the same duration syntax as `timeout:`, defaults to
    * {@link DEFAULT_SILENCE_MS}.
    */
@@ -74,6 +74,13 @@ export interface QueueDefinition {
   model: string | undefined;
   /** Delivery address — the destination chat's clientSessionId, written by `/queue-here`. */
   target: string | undefined;
+  /**
+   * Persistent disable switch (same semantics as a scheduled task's
+   * `enabled`): only the exact value `false` disables; absent or any other
+   * value means enabled. A disabled queue is skipped by its controller —
+   * pending tasks pile up untouched until the queue is re-enabled.
+   */
+  enabled: boolean;
   /** Shared context appended to every task prompt of this queue (may be empty). */
   body: string;
   /** Absolute path of the definition file. */
@@ -214,6 +221,9 @@ export function parseQueueDefinition(
           silenceMs,
           model: nonEmptyString(fields.model),
           target: nonEmptyString(fields.target),
+          // Only the exact value `false` (case-insensitive) disables; same
+          // rule as a scheduled task's `enabled` field.
+          enabled: !(fields.enabled !== undefined && fields.enabled.toLowerCase() === "false"),
           body: body.trim(),
           filePath,
         }
@@ -598,6 +608,47 @@ export async function bindQueue(
       target,
     );
     await writeFileAtomic(filePath, updated);
+  } catch (error) {
+    return { ok: false, reason: `failed to write queue file: ${(error as Error).message}` };
+  }
+  return { ok: true };
+}
+
+/** Outcome of toggling a queue's `enabled` front matter (the enable/disable CLI). */
+export type SetQueueEnabledResult = { ok: true } | { ok: false; reason: string };
+
+/**
+ * Sets the queue definition's `enabled` front-matter field (the persistent
+ * disable switch, mirroring {@link setTaskEnabled} for scheduled tasks):
+ * `false` pauses consumption — pending tasks pile up untouched; `true`
+ * re-enables it and the backlog drains on the next controller tick. The edit
+ * is the same surgical, atomic, single-line rewrite as {@link bindQueue}.
+ * Never throws for the expected failures: an invalid queue name or a missing
+ * file returns an error result (the CLI reports it).
+ */
+export async function setQueueEnabled(
+  name: string,
+  enabled: boolean,
+  queuesRoot: string = QUEUES_DIR,
+): Promise<SetQueueEnabledResult> {
+  if (!isValidQueueName(name)) {
+    return { ok: false, reason: "invalid queue name" };
+  }
+  const filePath = getQueueFilePath(name, queuesRoot);
+  let content: string;
+  try {
+    content = await readFile(filePath, "utf8");
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException)?.code === "ENOENT") {
+      return { ok: false, reason: "queue not found" };
+    }
+    return { ok: false, reason: `failed to read queue file: ${(error as Error).message}` };
+  }
+  try {
+    await writeFileAtomic(
+      filePath,
+      applyFrontMatterField(content, "enabled", enabled ? "true" : "false"),
+    );
   } catch (error) {
     return { ok: false, reason: `failed to write queue file: ${(error as Error).message}` };
   }

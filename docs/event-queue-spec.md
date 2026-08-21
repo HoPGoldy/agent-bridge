@@ -1,7 +1,7 @@
 # Event Queue (Agent Task Queue) — design spec
 
 Status: implemented (T1–T5, branch `feat/event-queue`). Grill decisions:
-`docs/grill-context/qa-log.md` (2026-08-19 section). The user-facing
+the 2026-08-19 grill session. The user-facing
 documentation is `docs/event-queue.md`; implementation drift found during the
 docs pass (T6) is reflected inline below.
 
@@ -33,6 +33,7 @@ workers: 2                 # max concurrent tasks; integer >= 1, default 1
 silence: 10m               # optional; silence window before a probe (same syntax as timeout, default 10m)
 model: provider/model-id   # optional; blank/absent = channel default model
 target: chat:xxx           # delivery address; written by /queue-here
+enabled: true              # optional; `false` = persistent disable switch
 ---
 
 Shared context appended to every task prompt of this queue.
@@ -63,7 +64,8 @@ ownership rule as the scheduler).
   reset to `pending` (at-least-once: a task in flight at shutdown is
   re-executed; no notice is sent for the interruption).
 - **Tick** (30s default): reload queue definitions; for each queue with a
-  non-empty `target`: capacity = `workers - inFlight(queue)`; take the oldest
+  non-empty `target` and `enabled: true` (only the exact value `false`
+  disables): capacity = `workers - inFlight(queue)`; take the oldest
   `pending` tasks up to capacity, mark them `running`, and fire each.
 - **Unbound queue** (empty `target`): never consumed; tasks pile up until
   `/queue-here` binds a chat, then the backlog drains automatically.
@@ -136,7 +138,14 @@ Chat sessions and `schedule:*` behavior are unchanged.
   Insert always succeeds regardless of binding or whether the channel is
   running — the task is durable the moment the file lands.
 - `agent-bridge queue list` — table: name, channel, workers, model,
-  bound (target), pending count, running count.
+  enabled, bound (target), pending count, running count.
+- `agent-bridge queue enable|disable <queue-name>` — toggles the
+  definition's persistent `enabled` front matter (atomic single-line edit,
+  same rules as the bind edit). Disabling pauses consumption: pending tasks
+  pile up untouched, in-flight runs are unaffected; enabling resumes and the
+  backlog drains on the next tick. Decided: no IM command for this (the
+  low-frequency-management-via-AI-file-edits principle; the CLI toggle and
+  file edits both ride the 30 s hot reload).
 
 **IM**:
 
@@ -149,9 +158,11 @@ No IM insert command in this version (decided).
 
 ## D5 — Out of scope (this version)
 
-IM insert; queue remove/clear commands (AI edits files); pause/resume;
-per-task model override at insert time; task priorities or delayed tasks;
-result delivery ordering guarantees under concurrency.
+IM insert; queue remove/clear commands (AI edits files); per-task model
+override at insert time; task priorities or delayed tasks;
+result delivery ordering guarantees under concurrency. (A whole-queue
+persistent disable switch — originally listed here as "pause/resume" — has
+since been implemented; see D4.)
 
 ## D6 — Testing
 

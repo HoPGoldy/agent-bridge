@@ -28,6 +28,7 @@ import {
   getSchedulesDir,
   isValidTaskName,
   loadAllTasks,
+  setTaskEnabled,
   type ScheduleTask,
 } from "./modules/schedule/task-file";
 import {
@@ -39,6 +40,7 @@ import {
   listQueueTasks,
   loadQueueDefinition,
   QUEUE_SESSION_PREFIX,
+  setQueueEnabled,
   writeQueueDefinition,
   type QueueDefinition,
 } from "./modules/queue/queue-file";
@@ -406,6 +408,31 @@ async function removeScheduleTask(taskName: string): Promise<void> {
   console.log(`Deleted ${filePath}`);
 }
 
+/**
+ * `agent-bridge schedule enable|disable <task-name>`: toggle the task's
+ * persistent `enabled` front-matter switch. Disabling skips the task's
+ * scheduled fires (and `/schedule-run` refusals) without deleting it;
+ * in-flight runs are untouched; re-enabling recomputes the next run from the
+ * current clock (no catch-up). The scheduler's hot reload picks the change
+ * up on the next tick — no restart needed.
+ */
+async function setScheduleTaskEnabled(taskName: string, enabled: boolean): Promise<void> {
+  if (!isValidTaskName(taskName)) {
+    throw new Error("Task name must be [a-z0-9-]+ (lowercase letters, digits and hyphens only)");
+  }
+  const loaded = await loadAllTasks();
+  if (!loaded.some((entry) => entry.task.name === taskName)) {
+    throw new Error(`No scheduled task "${taskName}" found.`);
+  }
+  const result = await setTaskEnabled(taskName, enabled);
+  if (!result.ok) {
+    throw new Error(`Failed to ${enabled ? "enable" : "disable"} task "${taskName}": ${result.reason}`);
+  }
+  console.log(
+    `Scheduled task "${taskName}" is now ${enabled ? "enabled" : "disabled (skipped until re-enabled)"}.`,
+  );
+}
+
 // ---------------------------------------------------------------------------
 // queue command group (spec: docs/event-queue-spec.md "D4 — Commands")
 //
@@ -546,6 +573,7 @@ async function listQueues(): Promise<void> {
     { header: "Channel", get: (row) => row.definition.channel ?? "-" },
     { header: "Workers", get: (row) => String(row.definition.workers) },
     { header: "Model", get: (row) => row.definition.model ?? "-" },
+    { header: "Enabled", get: (row) => (row.definition.enabled ? "yes" : "no") },
     { header: "Bound", get: (row) => (row.definition.target !== undefined ? "yes" : "no") },
     { header: "Pending", get: (row) => String(row.pending) },
     { header: "Running", get: (row) => String(row.running) },
@@ -584,6 +612,30 @@ async function removeQueue(queueName: string): Promise<void> {
   await unlink(filePath);
   console.log(`Deleted ${tasksDir}`);
   console.log(`Deleted ${filePath}`);
+}
+
+/**
+ * `agent-bridge queue enable|disable <queue-name>`: toggle the queue's
+ * persistent `enabled` front-matter switch (mirrors the schedule task's).
+ * Disabling pauses consumption — pending tasks pile up untouched, in-flight
+ * runs are untouched; re-enabling drains the backlog automatically on the
+ * controller's next tick.
+ */
+async function setQueueEnabledCommand(queueName: string, enabled: boolean): Promise<void> {
+  if (!isValidQueueName(queueName)) {
+    throw new Error("Queue name must be [a-z0-9-]+ (lowercase letters, digits and hyphens only)");
+  }
+  const definitions = await listQueueDefinitions();
+  if (!definitions.some((definition) => definition.name === queueName)) {
+    throw new Error(`No queue "${queueName}" found.`);
+  }
+  const result = await setQueueEnabled(queueName, enabled);
+  if (!result.ok) {
+    throw new Error(`Failed to ${enabled ? "enable" : "disable"} queue "${queueName}": ${result.reason}`);
+  }
+  console.log(
+    `Queue "${queueName}" is now ${enabled ? "enabled" : "disabled (tasks wait until re-enabled)"}.`,
+  );
 }
 
 // ---------------------------------------------------------------------------
@@ -748,6 +800,22 @@ export async function runCli(argv = process.argv): Promise<void> {
     });
 
   schedule
+    .command("enable")
+    .description("Enable a scheduled task (resume scheduled firing)")
+    .argument("<task-name>")
+    .action(async (taskName: string) => {
+      await setScheduleTaskEnabled(taskName, true);
+    });
+
+  schedule
+    .command("disable")
+    .description("Disable a scheduled task (skip firing until re-enabled)")
+    .argument("<task-name>")
+    .action(async (taskName: string) => {
+      await setScheduleTaskEnabled(taskName, false);
+    });
+
+  schedule
     .command("remove")
     .description("Remove a scheduled task by name")
     .argument("<task-name>")
@@ -788,6 +856,22 @@ export async function runCli(argv = process.argv): Promise<void> {
     .description("List queues with task counts")
     .action(async () => {
       await listQueues();
+    });
+
+  queue
+    .command("enable")
+    .description("Enable a queue (resume consuming pending tasks)")
+    .argument("<queue-name>")
+    .action(async (queueName: string) => {
+      await setQueueEnabledCommand(queueName, true);
+    });
+
+  queue
+    .command("disable")
+    .description("Disable a queue (tasks wait until re-enabled)")
+    .argument("<queue-name>")
+    .action(async (queueName: string) => {
+      await setQueueEnabledCommand(queueName, false);
     });
 
   queue

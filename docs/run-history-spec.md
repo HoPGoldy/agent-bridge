@@ -1,6 +1,6 @@
 # Run History Spec (Schedule/Queue 执行留痕)
 
-> 背景与决策过程见 `docs/grill-context/qa-log.md`（2026-08-20 "Schedule/Queue 运行历史"）。
+> 背景与决策过程见 2026-08-20 的 grill 记录（"Schedule/Queue 运行历史"）。
 > 本 spec 取代 `docs/scheduled-tasks-spec.md` D2 中"There is deliberately no persisted run
 > history or CLI-side observability"的表述（实现时同步修订该句）。
 
@@ -17,7 +17,7 @@ Schedule Task 和 Queue Task 的每次执行留下可回看的痕迹：
 ## Non-Goals
 
 - **不记录 fire 前被校验拒绝/未绑定未触发的 skip**——它们没有 runId，维持进程 warn 日志
-  （2026-08-20 qa-log：用户先要求记录、后回退，定稿不记）。
+  （2026-08-20 grill：用户先要求记录、后回退，定稿不记）。
 - **不记录进行中状态**——JSONL 只记终态；bridge 重启时在途 run 不补记（queue 会
   at-least-once 重跑产生新记录；schedule 的中断从进程日志排查）。
 - **不在 bridge 侧记录 tool call / thinking / SubAgent**——忠实记录完整会话是 agent

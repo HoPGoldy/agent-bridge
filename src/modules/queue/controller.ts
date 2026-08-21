@@ -173,7 +173,7 @@ export class QueueController {
 
   /**
    * Routes a diverted agent-output event for a `queue:*` session (T4,
-   * three-layer completion protocol per qa-log 2026-08-19（二）).
+   * three-layer completion protocol per the 2026-08-19（二）grill).
    *
    * `assistant.message` no longer ends the run: it is classified against the
    * DONE-marker protocol, appended to the run's accumulator and pokes the
@@ -255,6 +255,10 @@ export class QueueController {
       // Ownership filter: only queues bound to this channel are consumed
       // (spec D2). Queues owned by other channels are never touched.
       if (definition.channel !== this.#channelName) continue;
+      // Disabled queue (persistent disable switch): never consumed — its
+      // pending tasks pile up untouched until the queue is re-enabled, then
+      // the backlog drains automatically on a later tick.
+      if (!definition.enabled) continue;
       // Unbound queue (empty `target`): never consumed; tasks pile up until
       // `/queue-here` binds a chat (spec D2).
       if (definition.target === undefined) continue;

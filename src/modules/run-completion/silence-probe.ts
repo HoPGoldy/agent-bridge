@@ -1,5 +1,5 @@
 /**
- * Silence probe (decided in `docs/grill-context/qa-log.md`, 2026-08-19（二）,
+ * Silence probe (decided 2026-08-19（二）,
  * layer 2): after N minutes without any run event, the controller sends a
  * probe message into the session instead of passively declaring the run dead.
  *
