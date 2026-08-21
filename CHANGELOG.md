@@ -2,6 +2,14 @@
 
 All notable changes to this project will be documented in this file. See [commit-and-tag-version](https://github.com/absolute-version/commit-and-tag-version) for commit guidelines.
 
+## [0.8.5](https://github.com/HoPGoldy/agent-bridge/compare/v0.8.4...v0.8.5) (2026-08-21)
+
+
+### Features
+
+* **run-history:** persisted run history and history CLI for schedule/queue tasks ([8267f6b](https://github.com/HoPGoldy/agent-bridge/commit/8267f6bd702db2693659851e8b8bdc0657433881))
+* **schedule,queue:** persistent enable/disable switch for tasks and queues ([12369fe](https://github.com/HoPGoldy/agent-bridge/commit/12369fe5053a7ee2d15ecddbf1908e6924338335))
+
 ## [0.8.4](https://github.com/HoPGoldy/agent-bridge/compare/v0.8.3...v0.8.4) (2026-08-19)
 
 
