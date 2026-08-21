@@ -33,6 +33,7 @@
 import type { ClientInputEvent, ClientOutputEvent, IngressResult } from "../../types";
 import type { Translator } from "../../i18n";
 import { createLogger, type Logger } from "../../core/logger";
+import { appendRunHistory, type RunHistoryOutcome } from "../run-completion/history";
 import { DEFAULT_TIMEOUT_MS } from "../schedule/task-file";
 import {
   buildProbeMessage,
@@ -74,6 +75,11 @@ export interface QueueControllerOptions {
   queuesRoot?: string;
   /** Overridable run-outputs root for the per-run accumulator (tests). */
   outputsDir?: string;
+  /**
+   * Overridable run-history root (tests): each finished run appends one
+   * line to `run-history/queue.jsonl` under it (run-history spec D1/D3).
+   */
+  historyRoot?: string;
   logger?: Logger;
 }
 
@@ -86,11 +92,15 @@ interface RunRecord {
   target: string;
   /** Silence window for the probe, from the queue definition (T4). */
   silentMs: number;
+  /** Registration time (epoch ms); the history line's duration base (D2). */
+  startedAt: number;
   timer: NodeJS.Timeout;
   /** Per-run output accumulator (T4): every assistant message is appended here. */
   accumulator: RunAccumulator;
   /** Per-run silence probe (T4): fires a probing user.message after inactivity. */
   probe: SilenceProbe;
+  /** Captured from the fire's session.new result (run-history spec D5). */
+  agentSessionId?: string;
 }
 
 export class QueueController {
@@ -103,6 +113,7 @@ export class QueueController {
   readonly #logger: Logger;
   readonly #queuesRoot?: string;
   readonly #outputsDir?: string;
+  readonly #historyRoot?: string;
 
   /** Active runs keyed by their run-unique synthetic session id. */
   readonly #runs = new Map<string, RunRecord>();
@@ -119,6 +130,7 @@ export class QueueController {
     this.#t = options.t;
     this.#queuesRoot = options.queuesRoot;
     this.#outputsDir = options.outputsDir;
+    this.#historyRoot = options.historyRoot;
     this.#logger = options.logger ?? createLogger("queue");
   }
 
@@ -294,13 +306,11 @@ export class QueueController {
       return;
     }
 
-    const record = this.#registerRun(definition, task, target);
+    const record = await this.#registerRun(definition, task, target);
     if (record === null) {
-      // SF-2: stopped while the fire was in flight; the task file stays
-      // `running` and is re-enqueued at the next start (at-least-once).
-      this.#logger.warn(
-        `[queue] controller stopped during fire of "${definition.name}:${task.id}"; run not registered`,
-      );
+      // SF-2 (or the header write failed and #registerRun already handled
+      // the fail-and-drop): stopped-path tasks stay `running` and are
+      // re-enqueued at the next start (at-least-once).
       return;
     }
     const sessionId = record.sessionId;
@@ -319,6 +329,12 @@ export class QueueController {
       if (!sessionResult.ok) {
         await this.#failFire(record, sessionResult.reason);
         return;
+      }
+      // Run-history spec D5: capture the agentSessionId from the fire's
+      // session.new result — this is the authoritative value (a later
+      // session-bindings lookup could miss a subsequent /new).
+      if (sessionResult.agentSessionId !== undefined) {
+        record.agentSessionId = sessionResult.agentSessionId;
       }
 
       const text = buildTaskPrompt(definition.body, task.prompt);
@@ -346,11 +362,41 @@ export class QueueController {
    * reason to the queue's `target`, then deletes the task file (fail-and-drop,
    * decided). Stop-race (SF-2): a dispatch in flight across a stop resolves
    * `{ ok: false, reason: "gateway is not running" }` — that is not a task
-   * failure; nothing is delivered and the task file stays `running` so the
-   * next start re-enqueues it (at-least-once).
+   * failure; no history line is written, nothing is delivered and the task
+   * file stays `running` so the next start re-enqueues it (at-least-once).
    */
   async #failFire(record: RunRecord, reason: string): Promise<void> {
+    // SF-2 / run-history D2 / stale-fire guard: identity-check the fire's
+    // local record against the registry BEFORE anything else. The record is
+    // no longer the registered one in two cases, and in BOTH the fire's
+    // failure must be fully ignored (no history line, no #endRun, no task
+    // delete, no delivery):
+    //
+    // 1. stop() cleared the run registry (SF-2): a dispatch in flight across
+    //    a stop resolves `{ ok: false, reason: "gateway is not running" }` —
+    //    that is not a task failure; the task file stays `running` for the
+    //    at-least-once re-run at the next start, which writes its own line.
+    // 2. a stop() → start() fast re-run re-fired the SAME taskId (queue run
+    //    ids are restart-stable `queue:<queue>:<taskId>`) and registered a
+    //    NEW record under the SAME id: a mere `registered !== undefined`
+    //    check would let the stale fire write history and — worse — let the
+    //    id-keyed #endRun/delete/deliver below take the NEW run down with
+    //    it. `#endRun` therefore sits INSIDE this guard.
+    //
+    // The scheduler needs no such guard: its ids embed a restart-unique
+    // timestamp, so a re-fire never reuses an id and a stale fire's re-get
+    // finds no record.
+    const registered = this.#runs.get(record.sessionId);
+    if (registered !== record) {
+      this.#logger.warn(
+        `[queue] ignoring stale fire failure of task "${record.taskId}" of queue "${record.queueName}": ${reason}`,
+      );
+      return;
+    }
     this.#endRun(record.sessionId);
+    if (this.#started) {
+      await this.#writeHistory(record, "fire-failed", { reason });
+    }
     this.#logger.warn(`[queue] task "${record.taskId}" of queue "${record.queueName}" failed: ${reason}`);
     if (!this.#started) return;
     await this.#deleteTask(record.queueName, record.taskId);
@@ -375,6 +421,7 @@ export class QueueController {
    * one-liner — no prefix header, task id dropped from the attribution.
    */
   async #completeTask(record: RunRecord): Promise<void> {
+    await this.#writeHistory(record, "completed");
     const { queueName, taskId, target } = record;
     const filePath = record.accumulator.filePath;
     const lastMessage = record.accumulator.lastMessage.trim();
@@ -411,6 +458,7 @@ export class QueueController {
 
   /** Failure from a diverted `error` event (T4): notice + reason, no partial transcript. */
   async #failTask(record: RunRecord, reason: string): Promise<void> {
+    await this.#writeHistory(record, "failed", { reason });
     const { queueName, taskId, target } = record;
     // The reason stays visible; the partial transcript is NOT inlined — it
     // lives in the kept accumulation file that the suffix references.
@@ -432,6 +480,9 @@ export class QueueController {
     this.#logger.warn(
       `[queue] task "${taskId}" of queue "${queueName}" timed out after ${this.#runTimeoutMs}ms`,
     );
+    await this.#writeHistory(record, "timeout", {
+      reason: `timed out after ${this.#runTimeoutMs}ms`,
+    });
     // Abort this run's own session (same core command as the scheduler).
     await this.#dispatchSafe({
       type: "command.session.stop",
@@ -448,8 +499,8 @@ export class QueueController {
     await this.#deliverToTarget(target, suffix);
   }
 
-  /** Registers the run, its timeout timer, accumulator and silence probe; `null` when stopped (SF-2). */
-  #registerRun(definition: QueueDefinition, task: QueueTask, target: string): RunRecord | null {
+  /** Registers the run (writing its Output File header), its timeout timer, accumulator and silence probe; `null` when stopped (SF-2). */
+  async #registerRun(definition: QueueDefinition, task: QueueTask, target: string): Promise<RunRecord | null> {
     if (!this.#started) return null;
     const sessionId = `${QUEUE_SESSION_PREFIX}${definition.name}:${task.id}`;
     // T4: per-run output accumulator and silence probe, alongside the
@@ -469,6 +520,7 @@ export class QueueController {
       taskId: task.id,
       target,
       silentMs: definition.silenceMs,
+      startedAt: Date.now(),
       accumulator: createRunAccumulator({
         sessionId,
         ...(this.#outputsDir !== undefined ? { outputsDir: this.#outputsDir } : {}),
@@ -477,10 +529,69 @@ export class QueueController {
       timer: setTimeout(() => {
         void this.#handleTimeout(sessionId);
       }, this.#runTimeoutMs),
+      // agentSessionId lands here right after session.new succeeds (D5).
     };
     record.timer.unref?.();
     this.#runs.set(sessionId, record);
+    // Run-history spec D6: write the header (front matter + the RAW prompt —
+    // the queue body plus the task prompt, WITHOUT buildTaskPrompt's
+    // completion-protocol block) so the Output File is self-contained; a
+    // registered run always has a file. The agentSessionId is unknown until
+    // session.new succeeds and the header can only be written once, so the
+    // `agent` line is omitted on purpose.
+    try {
+      await this.#writeRunHeader(record, definition, task);
+    } catch (error) {
+      // Defensive: an fs failure here must not leave a half-registered run
+      // or a stuck `running` task. End the run and fail-and-drop exactly
+      // like a dispatch failure (notice + task deleted), with the run's own
+      // record — no history line is written for it because nothing was ever
+      // dispatched and this path is effectively unreachable on a local fs.
+      this.#logger.error(`[queue] failed to write run header for "${sessionId}":`, error);
+      this.#endRun(sessionId);
+      if (this.#started) {
+        await this.#deleteTask(record.queueName, record.taskId);
+        await this.#deliverToTarget(
+          record.target,
+          `failed to write run output header\n\n${this.#t("queue.taskFailedSuffix", {
+            queue: record.queueName,
+            path: record.accumulator.filePath,
+          })}`,
+        );
+      }
+      return null;
+    }
     return record;
+  }
+
+  /** Builds and writes a queue run's Output File header (run-history spec D6). */
+  async #writeRunHeader(
+    record: RunRecord,
+    definition: QueueDefinition,
+    task: QueueTask,
+  ): Promise<void> {
+    // The RAW prompt (queue body + task prompt) — the protocol block that
+    // buildTaskPrompt wraps around it for the actual dispatch is NOT part
+    // of the header.
+    const rawBody = definition.body.trim();
+    const rawPrompt = rawBody === "" ? task.prompt : `${rawBody}\n\n${task.prompt}`;
+    const lines = [
+      "---",
+      `runId: ${record.sessionId}`,
+      `channel: ${this.#channelName}`,
+      `target: ${record.target}`,
+      `queue: ${record.queueName}`,
+      `taskId: ${record.taskId}`,
+      `startedAt: ${new Date(record.startedAt).toISOString()}`,
+      "---",
+      "# Prompt",
+      "",
+      rawPrompt,
+      "",
+      "---",
+      "",
+    ];
+    await record.accumulator.writeHeader(`${lines.join("\n")}\n`);
   }
 
   /**
@@ -510,6 +621,34 @@ export class QueueController {
     clearTimeout(record.timer);
     record.probe.stop();
     this.#runs.delete(sessionId);
+  }
+
+  /**
+   * Writes the run's single history line (run-history spec D2/D3) at a run
+   * endpoint. One line per finished run; `stop()`-cleared in-flight runs
+   * write nothing, and neither do pre-fire skips (no RunRecord exists for
+   * those). The writer never throws, so this can be awaited anywhere in a
+   * endpoint without risk.
+   */
+  async #writeHistory(
+    record: RunRecord,
+    outcome: RunHistoryOutcome,
+    extra: { reason?: string } = {},
+  ): Promise<void> {
+    await appendRunHistory(
+      "queue",
+      {
+        runId: record.sessionId,
+        ts: new Date(record.startedAt).toISOString(),
+        ms: Date.now() - record.startedAt,
+        outcome,
+        ...(extra.reason !== undefined ? { reason: extra.reason } : {}),
+        channel: this.#channelName,
+        ...(record.agentSessionId !== undefined ? { agent: record.agentSessionId } : {}),
+        file: record.accumulator.filePath,
+      },
+      this.#historyRoot,
+    );
   }
 
   #inFlight(queueName: string): number {

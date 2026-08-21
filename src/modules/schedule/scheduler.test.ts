@@ -11,8 +11,14 @@ import {
   buildTaskPrompt,
   sanitizeSessionId,
 } from "../run-completion";
+import { readRunHistory, type RunHistoryRecord } from "../run-completion/history";
+import * as historyModule from "../run-completion/history";
 import { DEFAULT_TIMEOUT_MS, type LoadedTask, type ScheduleTask } from "./task-file";
-import { Scheduler } from "./scheduler";
+import {
+  Scheduler,
+  parseSyntheticSessionId,
+  syntheticSessionId,
+} from "./scheduler";
 
 const TARGET = "feishu:dm:oc_6f9d408e630098e6dd06bb071d6b60fc";
 
@@ -49,7 +55,7 @@ class FakeClock {
 function makeTask(overrides: Partial<ScheduleTask> & { name: string }): ScheduleTask {
   return {
     name: overrides.name,
-    scheduleRaw: overrides.scheduleRaw ?? "every 30m",
+    scheduleRaw: "scheduleRaw" in overrides ? overrides.scheduleRaw : "every 30m",
     schedule: overrides.schedule ?? { type: "every", intervalMs: 30 * 60_000 },
     directory: overrides.directory,
     timeoutMs: overrides.timeoutMs ?? DEFAULT_TIMEOUT_MS,
@@ -83,6 +89,10 @@ interface Harness {
   scheduler: Scheduler;
   /** Isolated run-outputs dir for this harness's accumulators (cleaned up). */
   outputsDir: string;
+  /** Isolated run-history root for this harness's JSONL index (cleaned up). */
+  historyRoot: string;
+  /** Expected synthetic run id for the nth fire of a task (clock-derived). */
+  runId: (task: string, seq: number) => string;
 }
 
 const schedulers: Scheduler[] = [];
@@ -114,6 +124,8 @@ function createHarness(options: { tasks?: LoadedTask[]; validateTarget?: (id: st
   // need for it to pre-exist) and it is cleaned up in afterEach.
   const outputsDir = path.join(os.tmpdir(), `agent-bridge-sched-runout-${(outSeq += 1)}`);
   outDirs.push(outputsDir);
+  const historyRoot = path.join(os.tmpdir(), `agent-bridge-sched-history-${(outSeq += 1)}`);
+  outDirs.push(historyRoot);
   // The real runner wires dispatchClientEvent to core.input, which never
   // rejects; the fake mirrors that contract and succeeds by default, so a
   // fire only proceeds past session.new when the dispatch actually succeeded.
@@ -137,6 +149,7 @@ function createHarness(options: { tasks?: LoadedTask[]; validateTarget?: (id: st
     loadTasks,
     logger,
     outputsDir,
+    historyRoot,
     ...(options.validateTarget !== undefined ? { validateTarget: options.validateTarget } : {}),
   });
   schedulers.push(scheduler);
@@ -151,6 +164,11 @@ function createHarness(options: { tasks?: LoadedTask[]; validateTarget?: (id: st
     tasks,
     scheduler,
     outputsDir,
+    historyRoot,
+    // Run-history spec D4: ids are `schedule:<task>:<yyyymmdd-hhmmss>-<seq>`
+    // derived from the fake clock's current LOCAL time. Test bodies advance
+    // the clock between fires, so the timestamp is captured at call time.
+    runId: (task: string, seq: number) => syntheticSessionId(task, seq, clock.now()),
   };
 }
 
@@ -176,13 +194,13 @@ describe("tick loop and hot reload (D8)", () => {
 
     expect(h.dispatched[0]).toEqual({
       type: "command.session.new",
-      clientSessionId: "schedule:report:1",
+      clientSessionId: h.runId("report", 1),
       workingDirectory: await realpath(process.cwd()),
       workingDirectorySource: "default",
     });
     expect(h.dispatched[1]).toEqual({
       type: "user.message",
-      clientSessionId: "schedule:report:1",
+      clientSessionId: h.runId("report", 1),
       text: buildTaskPrompt("summarize", ""),
     });
     expect(h.delivered).toEqual([]);
@@ -215,7 +233,7 @@ describe("tick loop and hot reload (D8)", () => {
     await waitFor(() => expect(h.dispatched).toHaveLength(2));
     expect(h.dispatched[1]).toEqual({
       type: "user.message",
-      clientSessionId: "schedule:report:1",
+      clientSessionId: h.runId("report", 1),
       text: buildTaskPrompt("v1", ""),
     });
 
@@ -224,7 +242,7 @@ describe("tick loop and hot reload (D8)", () => {
     await waitFor(() => expect(h.dispatched).toHaveLength(4));
     expect(h.dispatched[3]).toEqual({
       type: "user.message",
-      clientSessionId: "schedule:report:2",
+      clientSessionId: h.runId("report", 2),
       text: buildTaskPrompt("v2", ""),
     });
   });
@@ -239,7 +257,7 @@ describe("tick loop and hot reload (D8)", () => {
     await waitFor(() => expect(h.dispatched).toHaveLength(2));
     expect(h.dispatched[0]).toMatchObject({
       type: "command.session.new",
-      clientSessionId: "schedule:fresh:1",
+      clientSessionId: h.runId("fresh", 1),
     });
   });
 
@@ -292,7 +310,7 @@ describe("tick loop and hot reload (D8)", () => {
     await waitFor(() => expect(h.dispatched).toHaveLength(2));
     await sleep(100);
     // Only the channel-owned task fired — "theirs" and "unbound" were skipped.
-    expect(h.dispatched.every((event) => event.clientSessionId === "schedule:mine:1")).toBe(true);
+    expect(h.dispatched.every((event) => event.clientSessionId === h.runId("mine", 1))).toBe(true);
   });
 });
 
@@ -388,7 +406,7 @@ describe("fire-time validation (D6/D7)", () => {
     await h.scheduler.start();
     expect(await h.scheduler.runNow("legacy")).toEqual({ ok: true });
     expect(h.dispatched).toHaveLength(2);
-    expect(h.dispatched[0]).toMatchObject({ type: "command.session.new", clientSessionId: "schedule:legacy:1" });
+    expect(h.dispatched[0]).toMatchObject({ type: "command.session.new", clientSessionId: h.runId("legacy", 1) });
   });
 
   it("fire and runNow share the same success path", async () => {
@@ -399,24 +417,24 @@ describe("fire-time validation (D6/D7)", () => {
     expect(h.dispatched).toEqual([
       {
         type: "command.session.new",
-        clientSessionId: "schedule:ok:1",
+        clientSessionId: h.runId("ok", 1),
         workingDirectory: await realpath(process.cwd()),
         workingDirectorySource: "default",
       },
-      { type: "user.message", clientSessionId: "schedule:ok:1", text: buildTaskPrompt("hello", "") },
+      { type: "user.message", clientSessionId: h.runId("ok", 1), text: buildTaskPrompt("hello", "") },
     ]);
 
     // A run was registered: its completion signal (DONE marker) is honored.
     await h.scheduler.handleOutput({
       type: "assistant.message",
-      clientSessionId: "schedule:ok:1",
+      clientSessionId: h.runId("ok", 1),
       text: `done\n${DONE_MARKER}`,
     });
     expect(h.delivered).toEqual([
       {
         type: "assistant.message",
         clientSessionId: TARGET,
-        text: `done\n\n${completedSuffix(h, "ok", "schedule:ok:1")}`,
+        text: `done\n\n${completedSuffix(h, "ok", h.runId("ok", 1))}`,
       },
     ]);
   });
@@ -435,14 +453,14 @@ describe("per-task model override (scheduled-task-model spec)", () => {
     expect(await h.scheduler.fire("pinned")).toEqual({ ok: true });
     expect(h.dispatched[0]).toEqual({
       type: "command.session.new",
-      clientSessionId: "schedule:pinned:1",
+      clientSessionId: h.runId("pinned", 1),
       workingDirectory: await realpath(process.cwd()),
       workingDirectorySource: "default",
       model: "azure-openai-responses/gpt-5.6-terra",
     });
     expect(h.dispatched[1]).toEqual({
       type: "user.message",
-      clientSessionId: "schedule:pinned:1",
+      clientSessionId: h.runId("pinned", 1),
       text: buildTaskPrompt("do the thing", ""),
     });
   });
@@ -454,7 +472,7 @@ describe("per-task model override (scheduled-task-model spec)", () => {
     expect("model" in h.dispatched[0]!).toBe(false);
     expect(h.dispatched[0]).toEqual({
       type: "command.session.new",
-      clientSessionId: "schedule:plain:1",
+      clientSessionId: h.runId("plain", 1),
       workingDirectory: await realpath(process.cwd()),
       workingDirectorySource: "default",
     });
@@ -490,12 +508,12 @@ describe("dispatch failure (T6)", () => {
       {
         type: "assistant.message",
         clientSessionId: TARGET,
-        text: `boom: model not available\n\n${failedSuffix(h, "report", "schedule:report:1")}`,
+        text: `boom: model not available\n\n${failedSuffix(h, "report", h.runId("report", 1))}`,
       },
     ]);
 
     // The run has ended: a late completion is an orphan and delivers nothing.
-    h.scheduler.handleOutput({ type: "assistant.message", clientSessionId: "schedule:report:1", text: "late" });
+    h.scheduler.handleOutput({ type: "assistant.message", clientSessionId: h.runId("report", 1), text: "late" });
     expect(h.delivered).toHaveLength(1);
   });
 
@@ -520,7 +538,7 @@ describe("dispatch failure (T6)", () => {
       {
         type: "assistant.message",
         clientSessionId: TARGET,
-        text: `boom: prompt rejected\n\n${failedSuffix(h, "report", "schedule:report:1")}`,
+        text: `boom: prompt rejected\n\n${failedSuffix(h, "report", h.runId("report", 1))}`,
       },
     ]);
   });
@@ -547,15 +565,15 @@ describe("timeout (D5)", () => {
     await h.scheduler.runNow("slow");
 
     await waitFor(() => expect(h.delivered).toHaveLength(1));
-    expect(h.dispatched[2]).toEqual({ type: "command.session.stop", clientSessionId: "schedule:slow:1" });
+    expect(h.dispatched[2]).toEqual({ type: "command.session.stop", clientSessionId: h.runId("slow", 1) });
     expect(h.delivered[0]).toEqual({
       type: "assistant.message",
       clientSessionId: TARGET,
-      text: timedOutSuffix(h, "slow", "schedule:slow:1"),
+      text: timedOutSuffix(h, "slow", h.runId("slow", 1)),
     });
 
     // The run has ended: a late completion is an orphan and delivers nothing.
-    h.scheduler.handleOutput({ type: "assistant.message", clientSessionId: "schedule:slow:1", text: "too late" });
+    h.scheduler.handleOutput({ type: "assistant.message", clientSessionId: h.runId("slow", 1), text: "too late" });
     expect(h.delivered).toHaveLength(1);
     expect(h.logger.info).toHaveBeenCalledWith(expect.stringContaining("orphan"));
   });
@@ -569,19 +587,19 @@ describe("timeout (D5)", () => {
 
     await h.scheduler.handleOutput({
       type: "assistant.message",
-      clientSessionId: "schedule:slow:1",
+      clientSessionId: h.runId("slow", 1),
       text: "partial work",
     });
     await waitFor(() => expect(h.delivered).toHaveLength(1));
     expect(h.delivered[0]).toEqual({
       type: "assistant.message",
       clientSessionId: TARGET,
-      text: timedOutSuffix(h, "slow", "schedule:slow:1"),
+      text: timedOutSuffix(h, "slow", h.runId("slow", 1)),
     });
     // The partial transcript is NOT inlined.
     expect(h.delivered[0]!.text).not.toContain("partial work");
     // The accumulation file (with the partial work) is still on disk.
-    await expect(stat(runOutputPath(h.outputsDir, "schedule:slow:1"))).resolves.toBeDefined();
+    await expect(stat(runOutputPath(h.outputsDir, h.runId("slow", 1)))).resolves.toBeDefined();
   });
 });
 
@@ -618,7 +636,7 @@ describe("silence probe (T3, layer 2)", () => {
     // Probe answer WITHOUT DONE: accumulated, run continues, no delivery.
     await h.scheduler.handleOutput({
       type: "assistant.message",
-      clientSessionId: "schedule:report:1",
+      clientSessionId: h.runId("report", 1),
       text: "still working",
     });
     expect(h.delivered).toEqual([]);
@@ -628,14 +646,14 @@ describe("silence probe (T3, layer 2)", () => {
     // kept accumulation file still holds the full transcript).
     await h.scheduler.handleOutput({
       type: "assistant.message",
-      clientSessionId: "schedule:report:1",
+      clientSessionId: h.runId("report", 1),
       text: `done now\n${DONE_MARKER}`,
     });
     expect(h.delivered).toEqual([
       {
         type: "assistant.message",
         clientSessionId: TARGET,
-        text: `done now\n\n${completedSuffix(h, "report", "schedule:report:1")}`,
+        text: `done now\n\n${completedSuffix(h, "report", h.runId("report", 1))}`,
       },
     ]);
   });
@@ -653,7 +671,7 @@ describe("silence probe (T3, layer 2)", () => {
       await sleep(30);
       await h.scheduler.handleOutput({
         type: "assistant.thinking",
-        clientSessionId: "schedule:report:1",
+        clientSessionId: h.runId("report", 1),
         text: "...",
       });
     }
@@ -670,18 +688,18 @@ describe("stop() mid-run (T3)", () => {
 
     await h.scheduler.handleOutput({
       type: "assistant.message",
-      clientSessionId: "schedule:report:1",
+      clientSessionId: h.runId("report", 1),
       text: "partial work",
     });
     await h.scheduler.stop();
     expect(h.delivered).toEqual([]);
     // The partial transcript stays readable on disk (decision: no dispose()).
-    await expect(stat(runOutputPath(h.outputsDir, "schedule:report:1"))).resolves.toBeDefined();
+    await expect(stat(runOutputPath(h.outputsDir, h.runId("report", 1)))).resolves.toBeDefined();
 
     // A late completion after stop is an orphan: nothing delivered.
     await h.scheduler.handleOutput({
       type: "assistant.message",
-      clientSessionId: "schedule:report:1",
+      clientSessionId: h.runId("report", 1),
       text: `x\n${DONE_MARKER}`,
     });
     expect(h.delivered).toEqual([]);
@@ -698,7 +716,7 @@ describe("handleOutput / three-layer completion (T3)", () => {
     // First message (no marker): accumulated, run NOT ended, nothing delivered.
     await h.scheduler.handleOutput({
       type: "assistant.message",
-      clientSessionId: "schedule:report:1",
+      clientSessionId: h.runId("report", 1),
       text: "step one",
     });
     expect(h.delivered).toEqual([]);
@@ -706,7 +724,7 @@ describe("handleOutput / three-layer completion (T3)", () => {
     // Second message: still no delivery.
     await h.scheduler.handleOutput({
       type: "assistant.message",
-      clientSessionId: "schedule:report:1",
+      clientSessionId: h.runId("report", 1),
       text: "step two",
     });
     expect(h.delivered).toEqual([]);
@@ -715,14 +733,14 @@ describe("handleOutput / three-layer completion (T3)", () => {
     // (the earlier steps live in the kept accumulation file).
     await h.scheduler.handleOutput({
       type: "assistant.message",
-      clientSessionId: "schedule:report:1",
+      clientSessionId: h.runId("report", 1),
       text: `step three\n${DONE_MARKER}`,
     });
     expect(h.delivered).toEqual([
       {
         type: "assistant.message",
         clientSessionId: TARGET,
-        text: `step three\n\n${completedSuffix(h, "report", "schedule:report:1")}`,
+        text: `step three\n\n${completedSuffix(h, "report", h.runId("report", 1))}`,
       },
     ]);
     expect(h.delivered[0]!.text).not.toContain(DONE_MARKER);
@@ -731,7 +749,7 @@ describe("handleOutput / three-layer completion (T3)", () => {
     // The run ended: a second completion is an orphan.
     await h.scheduler.handleOutput({
       type: "assistant.message",
-      clientSessionId: "schedule:report:1",
+      clientSessionId: h.runId("report", 1),
       text: `again\n${DONE_MARKER}`,
     });
     expect(h.delivered).toHaveLength(1);
@@ -746,13 +764,13 @@ describe("handleOutput / three-layer completion (T3)", () => {
     const a2: OutboundAttachment[] = [{ kind: "file", filePath: "/tmp/b.txt", fileName: "b.txt" }];
     await h.scheduler.handleOutput({
       type: "assistant.message",
-      clientSessionId: "schedule:report:1",
+      clientSessionId: h.runId("report", 1),
       text: "first",
       attachments: a1,
     });
     await h.scheduler.handleOutput({
       type: "assistant.message",
-      clientSessionId: "schedule:report:1",
+      clientSessionId: h.runId("report", 1),
       text: `second\n${DONE_MARKER}`,
       attachments: a2,
     });
@@ -761,7 +779,7 @@ describe("handleOutput / three-layer completion (T3)", () => {
     expect(h.delivered[0]).toEqual({
       type: "assistant.message",
       clientSessionId: TARGET,
-      text: `second\n\n${completedSuffix(h, "report", "schedule:report:1")}`,
+      text: `second\n\n${completedSuffix(h, "report", h.runId("report", 1))}`,
       attachments: [...a1, ...a2],
     });
   });
@@ -774,18 +792,18 @@ describe("handleOutput / three-layer completion (T3)", () => {
     // Only the marker: the curated content is empty, so no-output is delivered.
     await h.scheduler.handleOutput({
       type: "assistant.message",
-      clientSessionId: "schedule:quiet:1",
+      clientSessionId: h.runId("quiet", 1),
       text: DONE_MARKER,
     });
     expect(h.delivered).toEqual([
       {
         type: "assistant.message",
         clientSessionId: TARGET,
-        text: noOutputSuffix(h, "quiet", "schedule:quiet:1"),
+        text: noOutputSuffix(h, "quiet", h.runId("quiet", 1)),
       },
     ]);
     // Even a no-output delivery keeps the (empty/whitespace) accumulation file.
-    await expect(stat(runOutputPath(h.outputsDir, "schedule:quiet:1"))).resolves.toBeDefined();
+    await expect(stat(runOutputPath(h.outputsDir, h.runId("quiet", 1)))).resolves.toBeDefined();
   });
 
   it("carries attachments from earlier messages on a no-output (empty last message) delivery", async () => {
@@ -797,7 +815,7 @@ describe("handleOutput / three-layer completion (T3)", () => {
     const a1: OutboundAttachment[] = [{ kind: "file", filePath: "/tmp/a.txt", fileName: "a.txt" }];
     await h.scheduler.handleOutput({
       type: "assistant.message",
-      clientSessionId: "schedule:report:1",
+      clientSessionId: h.runId("report", 1),
       text: "first",
       attachments: a1,
     });
@@ -807,19 +825,19 @@ describe("handleOutput / three-layer completion (T3)", () => {
     // the attachment collected earlier still travels with the delivery.
     await h.scheduler.handleOutput({
       type: "assistant.message",
-      clientSessionId: "schedule:report:1",
+      clientSessionId: h.runId("report", 1),
       text: DONE_MARKER,
     });
     expect(h.delivered).toEqual([
       {
         type: "assistant.message",
         clientSessionId: TARGET,
-        text: noOutputSuffix(h, "report", "schedule:report:1"),
+        text: noOutputSuffix(h, "report", h.runId("report", 1)),
         attachments: a1,
       },
     ]);
     // The kept accumulation file exists even with an empty last message.
-    await expect(stat(runOutputPath(h.outputsDir, "schedule:report:1"))).resolves.toBeDefined();
+    await expect(stat(runOutputPath(h.outputsDir, h.runId("report", 1)))).resolves.toBeDefined();
   });
 
   it("a bare message without DONE does not end the run", async () => {
@@ -830,14 +848,14 @@ describe("handleOutput / three-layer completion (T3)", () => {
     // Whitespace-only, no marker: accumulated but the run stays alive.
     await h.scheduler.handleOutput({
       type: "assistant.message",
-      clientSessionId: "schedule:report:1",
+      clientSessionId: h.runId("report", 1),
       text: "   ",
     });
     expect(h.delivered).toEqual([]);
     // Still alive: a DONE-only message delivers (empty) accumulated content.
     await h.scheduler.handleOutput({
       type: "assistant.message",
-      clientSessionId: "schedule:report:1",
+      clientSessionId: h.runId("report", 1),
       text: DONE_MARKER,
     });
     expect(h.delivered).toHaveLength(1);
@@ -850,12 +868,12 @@ describe("handleOutput / three-layer completion (T3)", () => {
 
     await h.scheduler.handleOutput({
       type: "assistant.message",
-      clientSessionId: "schedule:report:1",
+      clientSessionId: h.runId("report", 1),
       text: "partial work",
     });
     await h.scheduler.handleOutput({
       type: "error",
-      clientSessionId: "schedule:report:1",
+      clientSessionId: h.runId("report", 1),
       kind: "agent.run.failed",
       detail: "boom",
     });
@@ -863,14 +881,14 @@ describe("handleOutput / three-layer completion (T3)", () => {
       {
         type: "assistant.message",
         clientSessionId: TARGET,
-        text: `boom\n\n${failedSuffix(h, "report", "schedule:report:1")}`,
+        text: `boom\n\n${failedSuffix(h, "report", h.runId("report", 1))}`,
       },
     ]);
     // The partial transcript is NOT inlined.
     expect(h.delivered[0]!.text).not.toContain("partial work");
 
     // The run ended: a second error is an orphan.
-    await h.scheduler.handleOutput({ type: "error", clientSessionId: "schedule:report:1", kind: "agent.run.failed" });
+    await h.scheduler.handleOutput({ type: "error", clientSessionId: h.runId("report", 1), kind: "agent.run.failed" });
     expect(h.delivered).toHaveLength(1);
   });
 
@@ -881,7 +899,7 @@ describe("handleOutput / three-layer completion (T3)", () => {
 
     await h.scheduler.handleOutput({
       type: "error",
-      clientSessionId: "schedule:report:1",
+      clientSessionId: h.runId("report", 1),
       kind: "agent.run.failed",
       detail: "boom",
     });
@@ -889,7 +907,7 @@ describe("handleOutput / three-layer completion (T3)", () => {
       {
         type: "assistant.message",
         clientSessionId: TARGET,
-        text: `boom\n\n${failedSuffix(h, "report", "schedule:report:1")}`,
+        text: `boom\n\n${failedSuffix(h, "report", h.runId("report", 1))}`,
       },
     ]);
   });
@@ -900,10 +918,10 @@ describe("handleOutput / three-layer completion (T3)", () => {
     await h.scheduler.runNow("report");
 
     await h.scheduler.handleOutput({ type: "assistant.message", clientSessionId: TARGET, text: "user's chat reply" });
-    await h.scheduler.handleOutput({ type: "assistant.thinking", clientSessionId: "schedule:report:1", text: "thinking..." });
+    await h.scheduler.handleOutput({ type: "assistant.thinking", clientSessionId: h.runId("report", 1), text: "thinking..." });
     await h.scheduler.handleOutput({
       type: "agent.status.info",
-      clientSessionId: "schedule:report:1",
+      clientSessionId: h.runId("report", 1),
       status: { sessionId: "s1" },
     });
     expect(h.delivered).toEqual([]);
@@ -911,7 +929,7 @@ describe("handleOutput / three-layer completion (T3)", () => {
     // The run is still alive after the intermediate events.
     await h.scheduler.handleOutput({
       type: "assistant.message",
-      clientSessionId: "schedule:report:1",
+      clientSessionId: h.runId("report", 1),
       text: `final\n${DONE_MARKER}`,
     });
     expect(h.delivered).toHaveLength(1);
@@ -919,7 +937,11 @@ describe("handleOutput / three-layer completion (T3)", () => {
 
   it("drops orphan events for schedule sessions with no active run", async () => {
     const h = createHarness();
-    await h.scheduler.handleOutput({ type: "assistant.message", clientSessionId: "schedule:ghost:1", text: "x" });
+    await h.scheduler.handleOutput({
+      type: "assistant.message",
+      clientSessionId: syntheticSessionId("ghost", 1, h.clock.now()),
+      text: "x",
+    });
     expect(h.delivered).toEqual([]);
     expect(h.logger.info).toHaveBeenCalledWith(expect.stringContaining("orphan"));
   });
@@ -934,45 +956,47 @@ describe("concurrent runs of the same task (D5)", () => {
     expect(await h.scheduler.fire("report")).toEqual({ ok: true });
     expect(await h.scheduler.fire("report")).toEqual({ ok: true });
 
-    // Each run got its own run-unique synthetic session id.
+    // Each run got its own run-unique synthetic session id (same-second
+    // fires: both timestamps are the fake clock's current time, only the
+    // seq suffix differs — run-history spec D4).
     expect(h.dispatched.map((e) => e.clientSessionId)).toEqual([
-      "schedule:report:1",
-      "schedule:report:1",
-      "schedule:report:2",
-      "schedule:report:2",
+      h.runId("report", 1),
+      h.runId("report", 1),
+      h.runId("report", 2),
+      h.runId("report", 2),
     ]);
 
     // Run 1 completes: its result is delivered and run 2 is untouched.
     await h.scheduler.handleOutput({
       type: "assistant.message",
-      clientSessionId: "schedule:report:1",
+      clientSessionId: h.runId("report", 1),
       text: `first\n${DONE_MARKER}`,
     });
     expect(h.delivered).toEqual([
       {
         type: "assistant.message",
         clientSessionId: TARGET,
-        text: `first\n\n${completedSuffix(h, "report", "schedule:report:1")}`,
+        text: `first\n\n${completedSuffix(h, "report", h.runId("report", 1))}`,
       },
     ]);
 
     // A late event from the ended run 1 is an orphan — it can never be
     // mistaken for run 2's result.
-    await h.scheduler.handleOutput({ type: "assistant.message", clientSessionId: "schedule:report:1", text: "stale" });
+    await h.scheduler.handleOutput({ type: "assistant.message", clientSessionId: h.runId("report", 1), text: "stale" });
     expect(h.delivered).toHaveLength(1);
     expect(h.logger.info).toHaveBeenCalledWith(expect.stringContaining("orphan"));
 
     // Run 2 still completes normally with its own result.
     await h.scheduler.handleOutput({
       type: "assistant.message",
-      clientSessionId: "schedule:report:2",
+      clientSessionId: h.runId("report", 2),
       text: `second\n${DONE_MARKER}`,
     });
     expect(h.delivered).toHaveLength(2);
     expect(h.delivered[1]).toEqual({
       type: "assistant.message",
       clientSessionId: TARGET,
-      text: `second\n\n${completedSuffix(h, "report", "schedule:report:2")}`,
+      text: `second\n\n${completedSuffix(h, "report", h.runId("report", 2))}`,
     });
   });
 
@@ -987,7 +1011,7 @@ describe("concurrent runs of the same task (D5)", () => {
     // Run 1 completes normally, clearing only its own timer...
     await h.scheduler.handleOutput({
       type: "assistant.message",
-      clientSessionId: "schedule:report:1",
+      clientSessionId: h.runId("report", 1),
       text: `ok\n${DONE_MARKER}`,
     });
     expect(h.delivered).toHaveLength(1);
@@ -996,16 +1020,359 @@ describe("concurrent runs of the same task (D5)", () => {
     // session and delivers the timeout notice for run 2.
     await waitFor(() => expect(h.delivered).toHaveLength(2));
     expect(
-      h.dispatched.some((e) => e.type === "command.session.stop" && e.clientSessionId === "schedule:report:2"),
+      h.dispatched.some((e) => e.type === "command.session.stop" && e.clientSessionId === h.runId("report", 2)),
     ).toBe(true);
     expect(
-      h.dispatched.some((e) => e.type === "command.session.stop" && e.clientSessionId === "schedule:report:1"),
+      h.dispatched.some((e) => e.type === "command.session.stop" && e.clientSessionId === h.runId("report", 1)),
     ).toBe(false);
     expect(h.delivered[1]).toEqual({
       type: "assistant.message",
       clientSessionId: TARGET,
-      text: timedOutSuffix(h, "report", "schedule:report:2"),
+      text: timedOutSuffix(h, "report", h.runId("report", 2)),
     });
+  });
+});
+
+describe("run history (run-history spec D2/D3/D5/D6)", () => {
+  /** Reads the harness's history JSONL, one record per finished run. */
+  async function history(h: Harness): Promise<RunHistoryRecord[]> {
+    return readRunHistory("schedule", h.historyRoot);
+  }
+
+  it("writes one completed line at DONE with runId/ts/ms/channel/agent/file", async () => {
+    const h = createHarness({ tasks: [makeLoaded(makeTask({ name: "report", target: TARGET, prompt: "summarize" }))] });
+    await h.scheduler.start();
+    const runId = h.runId("report", 1);
+
+    h.dispatchClientEvent.mockImplementation(async (event: ClientOutputEvent) => {
+      h.dispatched.push(event);
+      if (event.type === "command.session.new") {
+        return { ok: true, agentSessionId: "pi-coding-agent:a8b7c75f-0000-0000-0000-1" };
+      }
+      return { ok: true } as const;
+    });
+    await h.scheduler.runNow("report");
+
+    h.clock.advance(252_000);
+    await h.scheduler.handleOutput({
+      type: "assistant.message",
+      clientSessionId: runId,
+      text: `done\n${DONE_MARKER}`,
+    });
+
+    const startedAt = 1_700_000_000_000; // fake clock's epoch
+    expect(await history(h)).toEqual([
+      {
+        runId,
+        ts: new Date(startedAt).toISOString(),
+        ms: 252_000,
+        outcome: "completed",
+        channel: "test",
+        agent: "pi-coding-agent:a8b7c75f-0000-0000-0000-1",
+        file: runOutputPath(h.outputsDir, runId),
+      },
+    ]);
+  });
+
+  it("writes a failed line with the error detail as reason (fallback text when absent)", async () => {
+    const h = createHarness({ tasks: [makeLoaded(makeTask({ name: "report", target: TARGET }))] });
+    await h.scheduler.start();
+    await h.scheduler.runNow("report");
+    await h.scheduler.handleOutput({
+      type: "error",
+      clientSessionId: h.runId("report", 1),
+      kind: "agent.run.failed",
+      detail: "boom",
+    });
+    const [record] = await history(h);
+    expect(record).toMatchObject({
+      runId: h.runId("report", 1),
+      outcome: "failed",
+      reason: "boom",
+      channel: "test",
+    });
+    expect("agent" in record!).toBe(false); // fake dispatch returns no agentSessionId
+
+    // No detail on the event: a fallback reason is still recorded.
+    const h2 = createHarness({ tasks: [makeLoaded(makeTask({ name: "quiet", target: TARGET }))] });
+    await h2.scheduler.start();
+    await h2.scheduler.runNow("quiet");
+    await h2.scheduler.handleOutput({
+      type: "error",
+      clientSessionId: h2.runId("quiet", 1),
+      kind: "agent.run.failed",
+    });
+    const [record2] = await history(h2);
+    expect(record2).toMatchObject({ outcome: "failed", reason: "agent run failed" });
+  });
+
+  it("writes a timeout line with a `timed out after Xms` reason", async () => {
+    const h = createHarness({
+      tasks: [makeLoaded(makeTask({ name: "slow", target: TARGET, timeoutMs: 100 }))],
+    });
+    await h.scheduler.start();
+    await h.scheduler.runNow("slow");
+    await waitFor(async () => expect(await history(h)).toHaveLength(1));
+    const [record] = await history(h);
+    expect(record).toMatchObject({
+      runId: h.runId("slow", 1),
+      outcome: "timeout",
+      reason: "timed out after 100ms",
+      channel: "test",
+    });
+    expect(typeof record!.ms).toBe("number");
+    expect(record!.file).toBe(runOutputPath(h.outputsDir, h.runId("slow", 1)));
+  });
+
+  it("writes a fire-failed line with the dispatch failure reason", async () => {
+    const h = createHarness({ tasks: [makeLoaded(makeTask({ name: "report", target: TARGET }))] });
+    await h.scheduler.start();
+    h.dispatchClientEvent.mockImplementation(async (event: ClientOutputEvent) => {
+      h.dispatched.push(event);
+      if (event.type === "command.session.new") {
+        return { ok: false, reason: "boom: model not available" };
+      }
+      return { ok: true } as const;
+    });
+    await h.scheduler.fire("report");
+
+    expect(await history(h)).toHaveLength(1);
+    const [record] = await history(h);
+    expect(record).toMatchObject({
+      runId: h.runId("report", 1),
+      outcome: "fire-failed",
+      reason: "boom: model not available",
+      channel: "test",
+    });
+    expect("agent" in record!).toBe(false); // session.new failed: no agentSessionId
+  });
+
+  it("keeps the agent field on a fire-failed line when session.new succeeded but user.message failed", async () => {
+    const h = createHarness({ tasks: [makeLoaded(makeTask({ name: "report", target: TARGET }))] });
+    await h.scheduler.start();
+    h.dispatchClientEvent.mockImplementation(async (event: ClientOutputEvent) => {
+      h.dispatched.push(event);
+      if (event.type === "user.message") {
+        return { ok: false, reason: "boom: prompt rejected" };
+      }
+      return { ok: true, agentSessionId: "pi-coding-agent:1111-2222" };
+    });
+    await h.scheduler.fire("report");
+    const [record] = await history(h);
+    expect(record).toMatchObject({
+      outcome: "fire-failed",
+      reason: "boom: prompt rejected",
+      agent: "pi-coding-agent:1111-2222",
+    });
+  });
+
+  it("a back-to-back DONE arriving during the error path's history write is an orphan: exactly one line, one delivery", async () => {
+    // B1 regression: #handleError used to await #writeHistory BEFORE
+    // #endRun, so while that await window was open the run was still in the
+    // registry and a back-to-back DONE message walked the full completion
+    // path — a second history line, a double delivery. The interleaving is
+    // reproduced deterministically: the error handling blocks inside the
+    // history append (gated), the DONE message arrives then, the gate opens.
+    const h = createHarness({ tasks: [makeLoaded(makeTask({ name: "report", target: TARGET }))] });
+    await h.scheduler.start();
+    await h.scheduler.runNow("report");
+    const runId = h.runId("report", 1);
+
+    // Gate the run-history append so the error path pauses mid-write: the
+    // spy signals that it entered and waits for an explicit release, so the
+    // DONE message below is guaranteed to arrive while write is pending.
+    let releaseHistory!: () => void;
+    const historyGate = new Promise<void>((resolve) => {
+      releaseHistory = resolve;
+    });
+    let historyEnteredResolve!: () => void;
+    const historyEntered = new Promise<void>((resolve) => {
+      historyEnteredResolve = resolve;
+    });
+    const originalAppend = historyModule.appendRunHistory;
+    const historySpy = vi
+      .spyOn(historyModule, "appendRunHistory")
+      .mockImplementation(async (...args: Parameters<typeof originalAppend>) => {
+        historyEnteredResolve();
+        await historyGate;
+        return originalAppend(...args);
+      });
+
+    // 1. The error event starts its run-end path and blocks in the history write.
+    const errorPromise = h.scheduler.handleOutput({
+      type: "error",
+      clientSessionId: runId,
+      kind: "agent.run.failed",
+      detail: "boom",
+    });
+    await historyEntered;
+
+    // 2. While that write is still pending, a back-to-back DONE message for
+    //    the same run arrives: the run must already be gone from the registry,
+    //    so this is an orphan — handled synchronously, no completion path, no
+    //    second history append. (With the old ordering the DONE walked the
+    //    full completion path and started a second append.)
+    const donePromise = h.scheduler.handleOutput({
+      type: "assistant.message",
+      clientSessionId: runId,
+      text: `late done\n${DONE_MARKER}`,
+    });
+    await sleep(50); // let the orphan path (or, if buggy, the completion path) run
+    expect(historySpy).toHaveBeenCalledTimes(1);
+    expect(h.logger.info).toHaveBeenCalledWith(expect.stringContaining("orphan"));
+
+    // 3. Release the paused write and let both paths settle.
+    releaseHistory();
+    await errorPromise;
+    await donePromise;
+    historySpy.mockRestore();
+
+    expect(await history(h)).toHaveLength(1);
+    expect((await history(h))[0]).toMatchObject({ runId, outcome: "failed", reason: "boom" });
+    // Exactly one delivery: the failure notice. The orphan DONE delivered nothing.
+    await vi.waitFor(() => expect(h.delivered).toHaveLength(1));
+    expect(h.delivered[0]).toMatchObject({
+      type: "assistant.message",
+      clientSessionId: TARGET,
+      text: expect.stringContaining("boom"),
+    });
+    expect(h.delivered.filter((e) => (e as { text?: string }).text?.includes("late done"))).toEqual([]);
+  });
+
+  it("writes no line for pre-fire validation refusals and none for stop()-cleared runs", async () => {
+    const h = createHarness({
+      tasks: [
+        makeLoaded(makeTask({ name: "disabled", target: TARGET, enabled: false })),
+        makeLoaded(makeTask({ name: "empty", target: TARGET, prompt: "   " })),
+        makeLoaded(makeTask({ name: "no-target" })),
+        makeLoaded(makeTask({ name: "theirs", channel: "other", target: TARGET })),
+        makeLoaded(
+          makeTask({ name: "baddir", directory: `/definitely/not/real-${Date.now()}`, target: TARGET }),
+        ),
+      ],
+    });
+    await h.scheduler.start();
+    await h.scheduler.fire("disabled");
+    await h.scheduler.fire("empty");
+    await h.scheduler.fire("no-target");
+    await h.scheduler.fire("theirs");
+    await h.scheduler.fire("baddir");
+    await h.scheduler.fire("missing");
+    expect(await history(h)).toEqual([]);
+
+    // A stop()-cleared in-flight run writes nothing either (spec Non-Goals).
+    const h2 = createHarness({ tasks: [makeLoaded(makeTask({ name: "live", target: TARGET }))] });
+    await h2.scheduler.start();
+    await h2.scheduler.runNow("live");
+    await h2.scheduler.stop();
+    expect(await history(h2)).toEqual([]);
+  });
+
+  it("writes exactly one line per run, not per message", async () => {
+    const h = createHarness({ tasks: [makeLoaded(makeTask({ name: "report", target: TARGET }))] });
+    await h.scheduler.start();
+    await h.scheduler.runNow("report");
+    await h.scheduler.handleOutput({ type: "assistant.message", clientSessionId: h.runId("report", 1), text: "one" });
+    await h.scheduler.handleOutput({ type: "assistant.message", clientSessionId: h.runId("report", 1), text: "two" });
+    await h.scheduler.handleOutput({
+      type: "assistant.message",
+      clientSessionId: h.runId("report", 1),
+      text: `three\n${DONE_MARKER}`,
+    });
+    const records = await history(h);
+    expect(records).toHaveLength(1);
+    expect(records[0]).toMatchObject({ outcome: "completed", runId: h.runId("report", 1) });
+  });
+
+  it("records the trigger in the header: tick fires vs /schedule-run fires", async () => {
+    const task = makeLoaded(
+      makeTask({ name: "trig", target: TARGET, scheduleRaw: "every 30m", prompt: "the full task body\nsecond line" }),
+    );
+    const h = createHarness({ tasks: [task] });
+    await h.scheduler.start();
+    h.clock.advance(30 * 60_000); // due: the tick fires
+    const tickRunId = h.runId("trig", 1); // id derived from the (advanced) clock
+    await waitFor(() => expect(h.dispatched).toHaveLength(2));
+    await h.scheduler.handleOutput({
+      type: "assistant.message",
+      clientSessionId: tickRunId,
+      text: DONE_MARKER,
+    });
+
+    await h.scheduler.runNow("trig"); // manual: run-now
+    const runNowId = h.runId("trig", 2);
+    await h.scheduler.handleOutput({
+      type: "assistant.message",
+      clientSessionId: runNowId,
+      text: DONE_MARKER,
+    });
+
+    const tickHeader = await readFile(runOutputPath(h.outputsDir, tickRunId), "utf8");
+    expect(tickHeader).toContain("trigger: tick\n");
+    const runNowHeader = await readFile(runOutputPath(h.outputsDir, runNowId), "utf8");
+    expect(runNowHeader).toContain("trigger: run-now\n");
+  });
+
+  it("writes the header with front matter and the prompt's full text before any message", async () => {
+    const h = createHarness({
+      tasks: [
+        makeLoaded(
+          makeTask({
+            name: "report",
+            target: TARGET,
+            scheduleRaw: "daily 09:00",
+            directory: os.tmpdir(),
+            prompt: "first line of the task body\n\nsecond paragraph",
+          }),
+        ),
+      ],
+    });
+    await h.scheduler.start();
+    const runId = h.runId("report", 1);
+    await h.scheduler.runNow("report");
+    await h.scheduler.handleOutput({
+      type: "assistant.message",
+      clientSessionId: runId,
+      text: "assistant output",
+    });
+
+    const content = await readFile(runOutputPath(h.outputsDir, runId), "utf8");
+    const expectedHeader = [
+      "---",
+      `runId: ${runId}`,
+      "channel: test",
+      `target: ${TARGET}`,
+      "trigger: run-now",
+      "schedule: daily 09:00",
+      `directory: ${os.tmpdir()}`,
+      `startedAt: ${new Date(1_700_000_000_000).toISOString()}`,
+      "---",
+      "# Prompt",
+      "",
+      "first line of the task body",
+      "",
+      "second paragraph",
+      "",
+      "---",
+      "",
+    ].join("\n");
+    expect(content.startsWith(expectedHeader)).toBe(true);
+    expect(content.endsWith("assistant output\n\n")).toBe(true);
+  });
+
+  it("omits optional header lines (agent/schedule/directory) when unknown or unset", async () => {
+    const h = createHarness({
+      tasks: [makeLoaded(makeTask({ name: "minimal", target: TARGET, scheduleRaw: undefined }))],
+    });
+    await h.scheduler.start();
+    await h.scheduler.runNow("minimal");
+    const content = await readFile(runOutputPath(h.outputsDir, h.runId("minimal", 1)), "utf8");
+    expect(content).not.toContain("agent:"); // unknown until session.new, header written once
+    // Check the front-matter lines specifically (runId itself contains "schedule:").
+    const frontMatter = content.split("---")[1]!;
+    expect(frontMatter).not.toMatch(/^schedule: /m);
+    expect(frontMatter).not.toMatch(/^directory: /m);
+    expect(frontMatter).not.toMatch(/^agent: /m);
   });
 });
 
@@ -1034,7 +1401,7 @@ describe("stop() races (SF-2)", () => {
     expect(h.delivered).toEqual([]);
 
     // Nothing was registered after stop: any event is an orphan.
-    h.scheduler.handleOutput({ type: "assistant.message", clientSessionId: "schedule:report:1", text: "x" });
+    h.scheduler.handleOutput({ type: "assistant.message", clientSessionId: h.runId("report", 1), text: "x" });
     expect(h.delivered).toEqual([]);
     expect(h.logger.info).toHaveBeenCalledWith(expect.stringContaining("orphan"));
   });
@@ -1114,12 +1481,19 @@ describe("stop() races (SF-2)", () => {
     expect(await firePromise).toEqual({ ok: false, reason: "gateway is not running" });
     expect(h.delivered).toEqual([]);
 
+    // S1 (asserting the existing behavior to pin module parity): no
+    // fire-failed history line either — post-stop dispatch failures are not
+    // task failures. The scheduler's #failFire re-gets the record, finds it
+    // gone (stop cleared the registry) and skips the write; the queue
+    // controller's #failFire mirrors this.
+    expect(await readRunHistory("schedule", h.historyRoot)).toEqual([]);
+
     // The run was ended: its 50 ms timer never fires (no stop dispatch, no
     // timeout notice) and any late output is treated as an orphan.
     await sleep(200);
     expect(h.dispatched.filter((e) => e.type === "command.session.stop")).toEqual([]);
     expect(h.delivered).toEqual([]);
-    h.scheduler.handleOutput({ type: "assistant.message", clientSessionId: "schedule:report:1", text: "x" });
+    h.scheduler.handleOutput({ type: "assistant.message", clientSessionId: h.runId("report", 1), text: "x" });
     expect(h.delivered).toEqual([]);
     expect(h.logger.info).toHaveBeenCalledWith(expect.stringContaining("orphan"));
   });
@@ -1169,16 +1543,21 @@ summarize the logs
       t: getTranslator("en-US"),
       schedulesRoot: tempRoot,
       outputsDir: path.join(tempRoot, "run-outputs"),
+      // Same isolation as the harness above (run-history spec D2): keep the
+      // JSONL index under the temp root so the test never appends to the
+      // real ~/.config/agent-bridge/run-history/schedule.jsonl.
+      historyRoot: path.join(tempRoot, "run-history"),
       logger,
     });
     schedulers.push(scheduler);
 
     await scheduler.start();
     clock.advance(30 * 60_000);
+    const runId = syntheticSessionId("report", 1, clock.now());
     await waitFor(() => expect(dispatched).toHaveLength(2));
     expect(dispatched[0]).toMatchObject({
       type: "command.session.new",
-      clientSessionId: "schedule:report:1",
+      clientSessionId: runId,
       workingDirectory: await realpath(tempRoot),
       workingDirectorySource: "default",
     });
@@ -1189,10 +1568,10 @@ summarize the logs
 
     await scheduler.handleOutput({
       type: "assistant.message",
-      clientSessionId: "schedule:report:1",
+      clientSessionId: runId,
       text: `done!\n${DONE_MARKER}`,
     });
-    const reportOut = runOutputPath(path.join(tempRoot, "run-outputs"), "schedule:report:1");
+    const reportOut = runOutputPath(path.join(tempRoot, "run-outputs"), runId);
     expect(delivered).toEqual([
       {
         type: "assistant.message",
@@ -1223,6 +1602,11 @@ summarize the logs
       deliver,
       t: getTranslator("en-US"),
       schedulesRoot: tempRoot,
+      outputsDir: path.join(tempRoot, "run-outputs"),
+      // Same isolation as the harness above (run-history spec D2): keep the
+      // JSONL index under the temp root so the test never appends to the
+      // real ~/.config/agent-bridge/run-history/schedule.jsonl.
+      historyRoot: path.join(tempRoot, "run-history"),
       logger,
     });
     schedulers.push(scheduler);
@@ -1274,6 +1658,8 @@ summarize the logs
       deliver,
       t: getTranslator("en-US"),
       schedulesRoot: tempRoot,
+      outputsDir: path.join(tempRoot, "run-outputs"),
+      historyRoot: path.join(tempRoot, "run-history"),
       logger,
     });
     schedulers.push(scheduler);
@@ -1308,6 +1694,8 @@ summarize the logs
       deliver,
       t: getTranslator("en-US"),
       schedulesRoot: tempRoot,
+      outputsDir: path.join(tempRoot, "run-outputs"),
+      historyRoot: path.join(tempRoot, "run-history"),
       logger,
     });
     schedulers.push(scheduler);
@@ -1334,6 +1722,8 @@ summarize the logs
       deliver,
       t: getTranslator("en-US"),
       schedulesRoot: tempRoot,
+      outputsDir: path.join(tempRoot, "run-outputs"),
+      historyRoot: path.join(tempRoot, "run-history"),
       logger,
     });
     schedulers.push(scheduler);
@@ -1350,5 +1740,73 @@ summarize the logs
     expect(await scheduler.claimTarget("late", TARGET)).toEqual({ ok: true });
     const content = await readFile(path.join(tempRoot, "late.md"), "utf8");
     expect(content).toContain(`target: ${TARGET}`);
+  });
+});
+
+describe("synthetic session ids (run-history spec D4)", () => {
+  it("builds schedule:<task>:<yyyymmdd-hhmmss>-<seq> from the clock's LOCAL time", () => {
+    // Local-time components, so the test is timezone-independent by
+    // construction: build the date from local fields and assert those.
+    const now = new Date(2026, 7, 9, 7, 5, 3); // Aug 9 2026 07:05:03 LOCAL
+    expect(syntheticSessionId("daily-report", 3, now)).toBe(
+      "schedule:daily-report:20260809-070503-3",
+    );
+  });
+
+  it("pads every field, so single-digit components still form 8+6 digits", () => {
+    const now = new Date(2027, 0, 1, 0, 0, 0); // Jan 1 2027 00:00:00 LOCAL
+    expect(syntheticSessionId("t", 12, now)).toBe("schedule:t:20270101-000000-12");
+  });
+
+  it("parses a well-formed id back into task name and seq", () => {
+    expect(parseSyntheticSessionId("schedule:daily-report:20260809-070503-3")).toEqual({
+      taskName: "daily-report",
+      runSeq: 3,
+    });
+    // A task name containing a colon still parses: the LAST colon bounds
+    // the timestamped segment.
+    expect(parseSyntheticSessionId("schedule:weird:name:20260809-070503-42")).toEqual({
+      taskName: "weird:name",
+      runSeq: 42,
+    });
+  });
+
+  it("round-trips every id the scheduler can produce", () => {
+    const now = new Date(2026, 11, 31, 23, 59, 59);
+    for (const task of ["report", "a:b", "daily-report"]) {
+      for (const seq of [1, 2, 999]) {
+        const id = syntheticSessionId(task, seq, now);
+        expect(parseSyntheticSessionId(id)).toEqual({ taskName: task, runSeq: seq });
+      }
+    }
+  });
+
+  it("rejects legacy and malformed ids", () => {
+    // The legacy bare-seq format (pre run-history D4) is no longer valid.
+    expect(parseSyntheticSessionId("schedule:report:1")).toBeNull();
+    expect(parseSyntheticSessionId("schedule:report:20260809-0705-3")).toBeNull(); // 4-digit time
+    expect(parseSyntheticSessionId("schedule:report:202689-070503-3")).toBeNull(); // 6-digit date
+    expect(parseSyntheticSessionId("schedule:report:20260809-070503-0")).toBeNull(); // seq 0
+    expect(parseSyntheticSessionId("schedule:report:20260809-070503-x")).toBeNull(); // non-numeric seq
+    expect(parseSyntheticSessionId("schedule:20260809-070503-3")).toBeNull(); // no task name
+    expect(parseSyntheticSessionId("queue:build:20260809-070503-3")).toBeNull(); // wrong prefix
+    expect(parseSyntheticSessionId("report:20260809-070503-3")).toBeNull(); // no prefix
+  });
+
+  it("derives fire ids from the injected now(): ids differ across clock advances", async () => {
+    const h = createHarness({ tasks: [makeLoaded(makeTask({ name: "report", target: TARGET }))] });
+    await h.scheduler.start();
+    const before = h.runId("report", 1);
+    h.clock.advance(61_000); // next local-time second
+    const clockAtFire = h.clock.now();
+    expect(await h.scheduler.fire("report")).toEqual({ ok: true });
+    const after = syntheticSessionId("report", 1, clockAtFire);
+    expect(after).not.toBe(before);
+    // The fired run (this scheduler's first) carried the clock-derived id.
+    expect(h.dispatched.map((e) => e.clientSessionId)).toEqual([after, after]);
+    // Both ids parse back to the task with their own seq.
+    expect(parseSyntheticSessionId(before)?.runSeq).toBe(1);
+    expect(parseSyntheticSessionId(after)?.runSeq).toBe(1);
+    expect(parseSyntheticSessionId(after)?.taskName).toBe("report");
   });
 });

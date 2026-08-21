@@ -170,3 +170,83 @@
 4. WAITING（等异步回调）期间占 worker 槽位（v1）。
 5. N 默认 10 分钟，可在任务/队列定义里配置。
 6. 根治长期路径：pi 上游扩展注册 pending-work 句柄 + RPC 暴露（本版不做）。
+
+---
+
+## 2026-08-20 Schedule/Queue 运行历史（run-history）
+
+背景：Schedule Task 和 Queue Task 执行完后没有留痕（run 记录只在内存、queue 任务文件完成后即删、run-outputs 文件名跨重启会撞），无法回看历史执行。
+
+问题：history 存一个文件还是两个模块分开存？
+
+用户回答：分开存（run-history/schedule.jsonl、run-history/queue.jsonl）。减少耦合——一个模块以后加字段不影响另一个；且查询入口（history 子命令）本来就分挂在 schedule/queue 下，没有合并查询场景。
+
+---
+
+问题：history JSONL 每行存哪些字段？
+
+用户回答：字段尽可能少。定稿：runId / ts / ms / outcome / reason? / channel / agent? / file。runId 本身已编码任务名/队列名/taskId（parseSyntheticSessionId 可解析），不重复存；target、scheduleRaw、prompt 等上下文不进 JSONL。
+
+---
+
+问题：history 记录里要不要带 Client Adapter ID 和 Agent Adapter ID？
+
+用户回答：要。client 侧身份即 clientSessionId（run 场景下就是 runId，免费）；agent 侧记 agentSessionId（`<moduleType>:<uuid>`，core 在 #createRuntimeForClient 生成）。有了这个 ID，即使 bridge 不记录 adapter 的会话文件路径，AI 查日志时也能顺着它去对应 agent app（pi-sessions/ 或 opencode 存储）定位会话文件。实现：IngressResult ok 分支加可选 agentSessionId，由 #handleSessionNew 填充，控制器 fire 时捕获（权威值；事后反查 session-bindings 有绑定漂移问题，否决）。
+
+---
+
+问题：Output File 要不要改成 JSONL 全量事件日志（记录 tool call / SubAgent / thinking）？
+
+用户回答：不改，Output File 保持原样（Markdown、只累积 assistant 消息）。理由：把它做得再完美也只是还原了一个一模一样的 Agent Session File——忠实记录一切本来就是 agent adapter 的职责且已做好（pi session file 含 tool calls/thinking/subagent），bridge 重复造是纯浪费。想看具体日志就顺 agent ID 去对应 agent app 找 session file。（注：此结论经历了"保持 Markdown → 改 JSONL → 回到保持原样"两轮反复，最终拍板保持原样，连 prompt 头部也不加。）
+
+---
+
+问题：schedule 的 runId 跨重启唯一性？
+
+用户回答：（讨论中提出并确认）现在 runId 用 #runSeq（重启归零），跨重启会撞 id，history 里必须唯一——runId 加时间戳（形如 schedule:<task>:<yyyymmdd-hhmmss>-<seq>），顺带让 run-outputs 文件名按时间可排序。queue 用 taskId 天然唯一，不动。
+
+---
+
+问题：history 的记录范围——fire 前被校验拒绝（未绑定/disabled/目录无效等，没有 runId 的 B 类）要不要记？进行中的状态要不要记？
+
+用户回答：B 类要记——"只要是触发了都要记"，用 outcome（state）字段标记，如 outcome: "skipped" + reason（典型场景：配置了任务但没绑定 chat/channel 导致没执行）。进行中的状态不记——JSONL 只记终态。延伸判断（助手推导、用户可纠正）：bridge 重启时在途中的 run 也不记（没活到终态；queue 会 at-least-once 重跑产生新记录）。实现后果：tick 需重构为先算 due 再决定 fire/记 skip，且记 skip 必须同时推进 nextRun（否则每 tick  flood）；多 channel 进程并发时未绑定任务的 skip 行会每进程各记一行，接受并在 spec 注明。skipped 行无 runId/file/agent，带 name 字段（异形行，JSONL schemaless 可接受）。
+
+---
+
+问题：（纠正上一轮记录）"Output File 保持原样"指的是什么？
+
+用户回答：保持**第一版设计**——Markdown 文件，开头是 front matter 头部（runId/channel/target/agent/startedAt 等元数据）+ `# Prompt` 全文，下面逐条追加 assistant 消息。不是"一行代码都不动"。否决的只是在文件里记录 tool call/SubAgent/thinking（那是 adapter session file 的职责）以及改 JSONL 格式。因此 target/prompt 有头部承载，history JSONL 维持 7 字段（runId/ts/ms/outcome/reason?/channel/agent?/file），不加 target。
+
+---
+
+问题：skip 记录为什么必须同时推进 nextRun？
+
+用户回答：（事实澄清，非决策）tick 每 30s 判断 now >= nextRun，记 skip 后若不推进 nextRun，下一 tick 会重复记同样的 skip 行（每天 2880 行 flood）。推进后每个到点 occurrence 只记一行。
+
+---
+
+问题：history CLI 的形态（--limit/--all/show 子命令）？
+
+用户回答：只加一个 name 参数，其他参数一律不加，也不加 show 子命令。`agent-bridge schedule history [task-name]` / `agent-bridge queue history <queue-name>`，全量输出、时间倒序。表格列定为 Time/Name/Outcome/Duration/Reason/File——查看详情拿 File 路径自己 cat，更深用 agent ID 去 adapter 会话存储找。
+
+---
+
+补充（头部方案恢复后的红利，无需决策）：output file 头部在 run 注册时写入，因此 fire-failed（dispatch 失败）的 run 也有带 prompt 头部的 output file——之前担心的"queue 任务 fire-failed 后 prompt 随任务文件删除而丢失"问题自动消失。唯一没有 output file 的是 skipped 行（run 未注册），而 schedule 的 prompt 本就在任务文件里，queue 侧基本没有 skip 场景。
+
+---
+
+问题：（回退之前的决策）被 skip 的 task run 还要不要记？
+
+用户回答：不记了。最终定稿：只记注册过 run 的终态（completed/failed/timeout/fire-failed），fire 前被校验拒绝的和未绑定未触发的一律不进 history，维持进程 warn 日志。连带效果：tick 无需重构、无 nextRun flood 问题、无异形行、无多进程重复记问题；所有 history 行结构统一（runId/ts/ms/outcome/reason?/channel/agent?/file）。
+
+---
+
+问题：history.jsonl 和 run-outputs/*.md 的保留策略（自动清理/prune 命令）？
+
+用户回答：不清理。不做任何自动清理，也不加 prune 命令；文件多到碍事时手动/AI 清理（符合"单人项目不做兼容性设施""低频管理操作交给 AI"原则）。pi-sessions 现状同样是无限制增长。
+
+---
+
+问题：run-history 的 ticket 拆分（T1–T7）是不是太细了？
+
+用户回答：是。收敛为按层划分的 3 个 ticket：T1 记录基础设施（history 读写器 + IngressResult.agentSessionId + runId 唯一化，纯管道无行为变化）、T2 控制器接入（Output File 头部 + 四终点写 history + capture agent，两模块同构一起改）、T3 查询面（CLI history + RUN_HISTORY_DIR + 文档同步）。理由：feature 体量小，T2/T3/T5 各自只有几行，且严格串行依赖，拆细不能并行只增交接成本。

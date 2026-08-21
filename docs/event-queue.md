@@ -115,6 +115,7 @@ The task prompt.
 | `agent-bridge queue insert <queue-name> --prompt "..."` | Validates the queue exists and appends a task file (`queues/<queue-name>.tasks/<id>.md`). Prints `Inserted task <id> into queue "<name>".` If the queue has no `target`, prints a warning that tasks wait until `/queue-here` binds a chat. Insert always succeeds regardless of binding or whether the channel is running — the task is durable the moment the file lands. |
 | `agent-bridge queue list` | Table of every queue: Name, Channel, Workers, Model, Bound (`yes`/`no`), Pending count, Running count. |
 | `agent-bridge queue remove <queue-name>` | Delete the queue definition file **and** its `<queue-name>.tasks/` directory recursively — pending tasks die with the queue, no prompts. Errors on an unknown queue or an invalid name. |
+| `agent-bridge queue history <queue-name>` | Newest-first table of the queue's finished runs (Time, Name, Outcome, Duration, Reason, File) from the run-history index. |
 
 ## `/queue-here <queue-name>`
 

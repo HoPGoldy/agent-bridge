@@ -22,9 +22,11 @@
  *   {@link Scheduler.handleOutput} or when the timer fires (spec D5);
  * - firing: a synthetic `command.session.new` (canonical working directory,
  *   `workingDirectorySource: "default"`) followed by a `user.message`, both
- *   carrying a run-unique synthetic `schedule:<task-name>:<run-seq>`
- *   clientSessionId (spec D1), plus fire-time validation of the target and
- *   working directory (spec D6/D7).
+ *   carrying a run-unique synthetic `schedule:<task-name>:<yyyymmdd-hhmmss>-<seq>`
+ *   clientSessionId (spec D1 / run-history spec D4 — the local-time timestamp
+ *   keeps ids unique across restarts, the seq disambiguates same-second
+ *   fires), plus fire-time validation of the target and working directory
+ *   (spec D6/D7).
  *
  * All external interaction goes through the injected callbacks:
  * `dispatchClientEvent` (synthetic client-output events — the runner wires
@@ -43,6 +45,7 @@ import type {
 } from "../../types";
 import type { Translator } from "../../i18n";
 import { createLogger, type Logger } from "../../core/logger";
+import { appendRunHistory, type RunHistoryOutcome } from "../run-completion/history";
 import { validateWorkingDirectory } from "../client/utils/working-directory";
 import { nextRun } from "./grammar";
 import {
@@ -104,6 +107,11 @@ export interface SchedulerOptions {
   schedulesRoot?: string;
   /** Overridable run-outputs root for the per-run accumulator (tests). */
   outputsDir?: string;
+  /**
+   * Overridable run-history root (tests): each finished run appends one
+   * line to `run-history/schedule.jsonl` under it (run-history spec D1/D3).
+   */
+  historyRoot?: string;
 }
 
 interface TaskRow {
@@ -112,16 +120,23 @@ interface TaskRow {
   nextRun: Date | null;
 }
 
+/** What started a fire (run-history spec D6): the timed tick or `/schedule-run`. */
+export type FireTrigger = "tick" | "run-now";
+
 interface RunRecord {
-  /** The run-unique synthetic clientSessionId (`schedule:<task>:<seq>`). */
+  /** The run-unique synthetic clientSessionId (`schedule:<task>:<yyyymmdd-hhmmss>-<seq>`). */
   sessionId: string;
   task: ScheduleTask;
   startedAt: number;
+  /** What started this run (run-history spec D6). */
+  trigger: FireTrigger;
   timer: NodeJS.Timeout;
   /** Per-run output accumulator (T3): every assistant message is appended here. */
   accumulator: RunAccumulator;
   /** Per-run silence probe (T3): fires a probing user.message after inactivity. */
   probe: SilenceProbe;
+  /** Captured from the fire's session.new result (run-history spec D5). */
+  agentSessionId?: string;
 }
 
 export class Scheduler {
@@ -136,6 +151,7 @@ export class Scheduler {
   readonly #loadTasks: (schedulesRoot?: string) => Promise<LoadedTask[]>;
   readonly #schedulesRoot?: string;
   readonly #outputsDir?: string;
+  readonly #historyRoot?: string;
 
   /** In-memory task table, re-synced from disk on every tick (spec D8). */
   readonly #tasks = new Map<string, TaskRow>();
@@ -166,6 +182,7 @@ export class Scheduler {
     this.#loadTasks = options.loadTasks ?? ((schedulesRoot) => loadAllTasks(schedulesRoot));
     this.#schedulesRoot = options.schedulesRoot;
     this.#outputsDir = options.outputsDir;
+    this.#historyRoot = options.historyRoot;
   }
 
   /**
@@ -268,6 +285,7 @@ export class Scheduler {
    * whole run still go with the delivery.
    */
   async #deliverDone(record: RunRecord): Promise<void> {
+    await this.#writeHistory(record, "completed");
     const { task } = record;
     const target = task.target;
     if (target === undefined) {
@@ -313,9 +331,17 @@ export class Scheduler {
     record: RunRecord,
     event: Extract<ClientInputEvent, { type: "error" }>,
   ): Promise<void> {
+    // End the run BEFORE the history write, like every other run endpoint:
+    // while #writeHistory's await window is open the run must already be
+    // gone from the registry, so a back-to-back DONE message is dropped as
+    // an orphan instead of walking the full completion path a second time
+    // (double history line + double delivery, SF-2).
+    this.#endRun(record.sessionId);
+    await this.#writeHistory(record, "failed", {
+      reason: (event.detail ?? "").trim() !== "" ? (event.detail ?? "").trim() : "agent run failed",
+    });
     const { task } = record;
     const target = task.target;
-    this.#endRun(record.sessionId);
     if (target === undefined) {
       this.#logger.warn(`[schedule] task "${task.name}" has no target to deliver its failure to`);
       return;
@@ -338,12 +364,12 @@ export class Scheduler {
    * The localized error reply for the triggering chat is the caller's job.
    */
   async runNow(taskName: string): Promise<FireResult> {
-    return this.#fire(taskName);
+    return this.#fire(taskName, "run-now");
   }
 
   /** The shared fire path; `runNow` is an alias (spec D7a). */
   async fire(taskName: string): Promise<FireResult> {
-    return this.#fire(taskName);
+    return this.#fire(taskName, "run-now");
   }
 
   /**
@@ -393,7 +419,7 @@ export class Scheduler {
     );
   }
 
-  async #fire(taskName: string): Promise<FireResult> {
+  async #fire(taskName: string, trigger: FireTrigger): Promise<FireResult> {
     // SF-2: never start work (and never register a run/timer) once stopped.
     if (!this.#started) {
       this.#logger.warn(`[schedule] scheduler is not running; skipping fire of "${taskName}"`);
@@ -461,8 +487,13 @@ export class Scheduler {
     // surfaces during the dispatch window is still attributed to this run.
     // SF-2: if stop() landed while we were awaiting validation, no run and
     // no timer may be created.
-    const sessionId = this.#registerRun(task);
+    const sessionId = await this.#registerRun(task, trigger);
     if (sessionId === null) {
+      if (this.#started) {
+        // Defensive: #registerRun ended the run after the run header's
+        // write failed (the error is logged there); nothing was dispatched.
+        return { ok: false, reason: "failed to write run output header" };
+      }
       this.#logger.warn(`[schedule] scheduler stopped during fire of "${taskName}"; run not registered`);
       return { ok: false, reason: "scheduler is not running" };
     }
@@ -487,6 +518,13 @@ export class Scheduler {
       });
       if (!sessionResult.ok) {
         return await this.#failFire(task, sessionId, sessionResult.reason);
+      }
+      // Run-history spec D5: capture the agentSessionId from the fire's
+      // session.new result — this is the authoritative value (a later
+      // session-bindings lookup could miss a subsequent /new).
+      const record = this.#runs.get(sessionId);
+      if (record !== undefined && sessionResult.agentSessionId !== undefined) {
+        record.agentSessionId = sessionResult.agentSessionId;
       }
 
       const messageResult = await this.#dispatchClientEvent({
@@ -521,9 +559,15 @@ export class Scheduler {
    * invokers see the real cause (`scheduleRunFailed` prints `{{reason}}`).
    */
   async #failFire(task: ScheduleTask, sessionId: string, reason: string): Promise<FireResult> {
+    // Capture the run record before it is cleared (history needs its
+    // start time, agentSessionId and accumulator path).
+    const record = this.#runs.get(sessionId);
     // Capture the accumulation-file path before the run record is cleared.
-    const filePath = this.#runs.get(sessionId)?.accumulator.filePath;
+    const filePath = record?.accumulator.filePath;
     this.#endRun(sessionId);
+    if (record !== undefined) {
+      await this.#writeHistory(record, "fire-failed", { reason });
+    }
     this.#logger.warn(`[schedule] fire of "${task.name}" failed: ${reason}`);
     // Stop-race (SF-2): a dispatch that was in flight across a stop resolves
     // `{ ok: false, reason: "gateway is not running" }` — the core ingress
@@ -573,7 +617,7 @@ export class Scheduler {
       if (task.channel !== this.#channelName) continue;
       if (!task.enabled || task.schedule === null || row.nextRun === null) continue;
       if (now.getTime() >= row.nextRun.getTime()) {
-        const result = await this.#fire(taskName);
+        const result = await this.#fire(taskName, "tick");
         if (!result.ok) {
           this.#logger.warn(`[schedule] fire of "${taskName}" failed: ${result.reason}`);
         }
@@ -635,12 +679,13 @@ export class Scheduler {
     return loaded.find((entry) => entry.task.name === taskName)?.task;
   }
 
-  #registerRun(task: ScheduleTask): string | null {
+  async #registerRun(task: ScheduleTask, trigger: FireTrigger): Promise<string | null> {
     // SF-2: never register a run (and therefore never create a timer) once
     // stopped — a stop() landing mid-fire must not leave a timer that
     // nobody will clear.
     if (!this.#started) return null;
-    const sessionId = syntheticSessionId(task.name, ++this.#runSeq);
+    const sessionId = syntheticSessionId(task.name, ++this.#runSeq, this.#now());
+    const startedAt = this.#now().getTime();
     // T3: per-run output accumulator and silence probe, alongside the
     // existing wall-clock timeout (the layer-3 backstop). The probe is armed
     // (poked) at run start so its silence window opens as soon as the run
@@ -652,22 +697,64 @@ export class Scheduler {
       },
     });
     probe.poke();
+    const accumulator = createRunAccumulator({
+      sessionId,
+      ...(this.#outputsDir !== undefined ? { outputsDir: this.#outputsDir } : {}),
+    });
     const record: RunRecord = {
       sessionId,
       task,
-      startedAt: this.#now().getTime(),
-      accumulator: createRunAccumulator({
-        sessionId,
-        ...(this.#outputsDir !== undefined ? { outputsDir: this.#outputsDir } : {}),
-      }),
+      startedAt,
+      trigger,
+      accumulator,
       probe,
       timer: setTimeout(() => {
         void this.#handleTimeout(sessionId);
       }, task.timeoutMs),
+      // agentSessionId lands here right after session.new succeeds (D5).
     };
     record.timer.unref?.();
     this.#runs.set(sessionId, record);
+    // Run-history spec D6: write the header (front matter + the prompt's
+    // full text) so the Output File is self-contained; a registered run
+    // always has a file. The agentSessionId is unknown until session.new
+    // succeeds and the header can only be written once, so the `agent` line
+    // is omitted on purpose. The await completes before any dispatch, so the
+    // header always precedes the first appended assistant message.
+    try {
+      await this.#writeRunHeader(record);
+    } catch (error: unknown) {
+      // Defensive: an fs failure here must not leave a half-registered run —
+      // end it and let #fire report the failed fire (nothing was dispatched,
+      // so no history line either, mirroring the dispatch catch there).
+      this.#endRun(sessionId);
+      this.#logger.error(`[schedule] failed to write run header for "${sessionId}":`, error);
+      return null;
+    }
     return sessionId;
+  }
+
+  /** Builds and writes a run's Output File header (run-history spec D6). */
+  async #writeRunHeader(record: RunRecord): Promise<void> {
+    const { task } = record;
+    const lines = [
+      "---",
+      `runId: ${record.sessionId}`,
+      `channel: ${this.#channelName}`,
+      ...(task.target !== undefined ? [`target: ${task.target}`] : []),
+      `trigger: ${record.trigger}`,
+      ...(task.scheduleRaw !== undefined ? [`schedule: ${task.scheduleRaw}`] : []),
+      ...(task.directory !== undefined ? [`directory: ${task.directory}`] : []),
+      `startedAt: ${new Date(record.startedAt).toISOString()}`,
+      "---",
+      "# Prompt",
+      "",
+      task.prompt,
+      "",
+      "---",
+      "",
+    ];
+    await record.accumulator.writeHeader(`${lines.join("\n")}\n`);
   }
 
   /**
@@ -698,6 +785,9 @@ export class Scheduler {
     record.probe.stop();
     const { task } = record;
     this.#logger.warn(`[schedule] task "${task.name}" timed out after ${task.timeoutMs}ms`);
+    await this.#writeHistory(record, "timeout", {
+      reason: `timed out after ${task.timeoutMs}ms`,
+    });
 
     const target = task.target;
     if (target === undefined) {
@@ -730,6 +820,34 @@ export class Scheduler {
     this.#runs.delete(sessionId);
   }
 
+  /**
+   * Writes the run's single history line (run-history spec D2/D3) at a run
+   * endpoint. One line per finished run; `stop()`-cleared in-flight runs
+   * write nothing, and neither do pre-fire validation refusals (no
+   * RunRecord exists for those). The writer never throws, so this can be
+   * awaited anywhere in a endpoint without risk.
+   */
+  async #writeHistory(
+    record: RunRecord,
+    outcome: RunHistoryOutcome,
+    extra: { reason?: string } = {},
+  ): Promise<void> {
+    await appendRunHistory(
+      "schedule",
+      {
+        runId: record.sessionId,
+        ts: new Date(record.startedAt).toISOString(),
+        ms: this.#now().getTime() - record.startedAt,
+        outcome,
+        ...(extra.reason !== undefined ? { reason: extra.reason } : {}),
+        channel: this.#channelName,
+        ...(record.agentSessionId !== undefined ? { agent: record.agentSessionId } : {}),
+        file: record.accumulator.filePath,
+      },
+      this.#historyRoot,
+    );
+  }
+
   async #dispatchSafe(event: ClientOutputEvent): Promise<void> {
     try {
       await this.#dispatchClientEvent(event);
@@ -759,16 +877,25 @@ export interface ParsedSyntheticId {
 
 /**
  * Returns the run-unique synthetic clientSessionId for a task run
- * (`schedule:<task-name>:<run-seq>`, spec D1). The run sequence guarantees
- * that concurrent runs of the same task have distinct ids.
+ * (`schedule:<task-name>:<yyyymmdd-hhmmss>-<seq>`, spec D1 / run-history spec
+ * D4). The local-time timestamp makes ids unique across bridge restarts
+ * (the sequence counter resets every process); the seq suffix still
+ * disambiguates multiple fires within the same second.
  */
-export function syntheticSessionId(taskName: string, runSeq: number): string {
-  return `${SYNTHETIC_SESSION_PREFIX}${taskName}:${runSeq}`;
+export function syntheticSessionId(taskName: string, runSeq: number, now: Date): string {
+  const yyyy = String(now.getFullYear()).padStart(4, "0");
+  const mm = String(now.getMonth() + 1).padStart(2, "0");
+  const dd = String(now.getDate()).padStart(2, "0");
+  const hh = String(now.getHours()).padStart(2, "0");
+  const mi = String(now.getMinutes()).padStart(2, "0");
+  const ss = String(now.getSeconds()).padStart(2, "0");
+  return `${SYNTHETIC_SESSION_PREFIX}${taskName}:${yyyy}${mm}${dd}-${hh}${mi}${ss}-${runSeq}`;
 }
 
 /**
- * Parses a `schedule:<task-name>:<run-seq>` clientSessionId; `null` when it
- * is not a well-formed synthetic schedule session id.
+ * Parses a `schedule:<task-name>:<yyyymmdd-hhmmss>-<seq>` clientSessionId
+ * (run-history spec D4); `null` when it is not a well-formed synthetic
+ * schedule session id. `runSeq` is the trailing integer of the last segment.
  */
 export function parseSyntheticSessionId(clientSessionId: string): ParsedSyntheticId | null {
   if (!clientSessionId.startsWith(SYNTHETIC_SESSION_PREFIX)) return null;
@@ -776,7 +903,9 @@ export function parseSyntheticSessionId(clientSessionId: string): ParsedSyntheti
   const colon = rest.lastIndexOf(":");
   if (colon <= 0 || colon === rest.length - 1) return null;
   const taskName = rest.slice(0, colon);
-  const runSeq = Number(rest.slice(colon + 1));
+  const lastSegment = rest.slice(colon + 1);
+  if (!/^\d{8}-\d{6}-\d+$/.test(lastSegment)) return null;
+  const runSeq = Number(lastSegment.slice(lastSegment.lastIndexOf("-") + 1));
   if (!Number.isInteger(runSeq) || runSeq < 1) return null;
   return { taskName, runSeq };
 }

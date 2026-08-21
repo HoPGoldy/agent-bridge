@@ -146,3 +146,66 @@ describe("createRunAccumulator", () => {
     expect(await accumulator.readAll()).not.toContain("/tmp/a.png");
   });
 });
+
+describe("writeHeader (run-history spec D6)", () => {
+  it("creates the directory and file with the header content, followed by appends", async () => {
+    const root = await mkdtemp(path.join(os.tmpdir(), "agent-bridge-run-outputs-root-"));
+    tmpDirs.push(root);
+    const dir = path.join(root, "run-outputs"); // does not exist yet
+    const accumulator = createRunAccumulator({ sessionId: "schedule:t:1", outputsDir: dir });
+
+    const header = [
+      "---",
+      "runId: schedule:t:1",
+      "channel: feishu-dev",
+      "---",
+      "# Prompt",
+      "",
+      "do the thing",
+      "",
+      "---",
+      "",
+    ].join("\n");
+    await accumulator.writeHeader(`${header}\n`);
+    await accumulator.append("first assistant message");
+
+    const content = await readFile(accumulator.filePath, "utf8");
+    // The header sits at the very start and the message follows it.
+    expect(content.startsWith(header)).toBe(true);
+    expect(content).toBe(`${header}\nfirst assistant message\n\n`);
+  });
+
+  it("normalizes the header tail to exactly one blank line before the first append", async () => {
+    const dir = await makeOutputsDir();
+    const a = createRunAccumulator({ sessionId: "schedule:t:2", outputsDir: dir });
+    await a.writeHeader("---\nrunId: schedule:t:2\n---\n# Prompt\n\ndo it\n\n---\n\n");
+    await a.append("msg");
+    expect(await a.readAll()).toBe(
+      "---\nrunId: schedule:t:2\n---\n# Prompt\n\ndo it\n\n---\n\nmsg\n\n",
+    );
+
+    // No trailing newline at all: one is added so the header stays separated.
+    const b = createRunAccumulator({ sessionId: "schedule:t:3", outputsDir: dir });
+    await b.writeHeader("---\nrunId: schedule:t:3\n---");
+    await b.append("msg");
+    expect(await b.readAll()).toBe("---\nrunId: schedule:t:3\n---\n\nmsg\n\n");
+  });
+
+  it("throws on a second writeHeader and on a writeHeader after an append", async () => {
+    const dir = await makeOutputsDir();
+    const accumulator = createRunAccumulator({ sessionId: "schedule:t:4", outputsDir: dir });
+
+    await accumulator.writeHeader("---\nrunId: schedule:t:4\n---\n");
+    await expect(accumulator.writeHeader("---\nagain\n---\n")).rejects.toThrow(
+      /already written/,
+    );
+
+    const second = createRunAccumulator({ sessionId: "schedule:t:5", outputsDir: dir });
+    await second.append("message first");
+    await expect(second.writeHeader("---\nrunId: schedule:t:5\n---\n")).rejects.toThrow(
+      /before any append/,
+    );
+    // The failed header did not reach the file: only the message is there.
+    expect(await second.readAll()).toBe("message first\n\n");
+  });
+});

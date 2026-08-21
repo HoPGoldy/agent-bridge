@@ -219,8 +219,13 @@ export interface ChannelCommonContext extends ChannelCommonConfig {
  * completion resolves `{ ok: true }`, any handler failure resolves
  * `{ ok: false, reason }` with the underlying error message. The ingress
  * never rejects — adapters and the scheduler rely on that contract (T6).
+ *
+ * `agentSessionId` is filled only by a successful `command.session.new`
+ * (the freshly created session's core-owned id) so the scheduler / queue
+ * controller can capture it for the run-history index (run-history spec
+ * D5); every other ok result omits it.
  */
-export type IngressResult = { ok: true } | { ok: false; reason: string };
+export type IngressResult = { ok: true; agentSessionId?: string } | { ok: false; reason: string };
 
 /** Outcome of a manual task trigger (`/schedule-run`, spec D7a). */
 export type ScheduleRunResult = { ok: true } | { ok: false; reason: string };

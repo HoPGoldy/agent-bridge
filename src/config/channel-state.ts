@@ -31,6 +31,12 @@ export const QUEUES_DIR = path.join(os.homedir(), ".config", "agent-bridge", "qu
 /** Root directory of per-run output accumulation files (`run-outputs/<sanitizedSessionId>.md`). */
 export const RUN_OUTPUTS_DIR = path.join(os.homedir(), ".config", "agent-bridge", "run-outputs");
 
+/**
+ * Root directory of the per-module run-history JSONL indexes
+ * (`run-history/schedule.jsonl` / `run-history/queue.jsonl`, run-history spec D1).
+ */
+export const RUN_HISTORY_DIR = path.join(os.homedir(), ".config", "agent-bridge", "run-history");
+
 /** Bridge agent session id prefixes for the built-in agent modules. */
 const KNOWN_AGENT_TYPE_PREFIXES: ReadonlyArray<readonly [prefix: string, agentType: string]> = [
   ["pi-coding-agent:", "pi-coding-agent"],

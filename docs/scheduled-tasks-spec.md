@@ -48,7 +48,7 @@ Failure delivery:
 - Timeout kill (D5) → a localized "task timed out" notice is delivered the same way.
 - Fire-time validation failure (D6) → no session is created; a localized error is delivered to the target chat the same way and logged.
 
-There is deliberately **no persisted run history or CLI-side observability**: every outcome already lands in the target chat as a message (result, failure, or timeout notice), which is the user's notification surface.
+Every run is also recorded as one line in an append-only JSONL index at `~/.config/agent-bridge/run-history/schedule.jsonl` (outcome, duration, pointers to the output file and agent session), queryable with `agent-bridge schedule history` — see `docs/run-history-spec.md`. The target-chat messages above remain the user's notification surface; the index is the persistent, CLI-readable record.
 
 If the task has no valid `target`, nothing can be delivered; the fire is skipped, logged, and shown as "no target" in `schedule list`.
 

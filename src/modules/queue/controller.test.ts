@@ -1,4 +1,4 @@
-import { mkdtemp, rm, stat, writeFile } from "node:fs/promises";
+import { mkdtemp, readFile, rm, stat, writeFile } from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
@@ -12,6 +12,7 @@ import {
   setQueueTaskState,
 } from "./queue-file";
 import { buildProbeMessage, buildTaskPrompt, DONE_MARKER, sanitizeSessionId } from "../run-completion";
+import { readRunHistory, type RunHistoryRecord } from "../run-completion/history";
 import { QueueController } from "./controller";
 
 const TARGET = "feishu:dm:oc_6f9d408e630098e6dd06bb071d6b60fc";
@@ -48,11 +49,18 @@ interface Harness {
   logger: MockLogger;
   root: string;
   controller: QueueController;
+  /** Isolated run-history root for this harness's JSONL index (cleaned up with root). */
+  historyRoot: string;
 }
 
 /** Absolute path a queue run's accumulation file lands at. */
 function runOutputPath(h: Harness, sessionId: string): string {
   return path.join(h.root, "run-outputs", `${sanitizeSessionId(sessionId)}.md`);
+}
+
+/** Reads the harness's history JSONL, one record per finished run. */
+function history(h: Harness): Promise<RunHistoryRecord[]> {
+  return readRunHistory("queue", h.historyRoot);
 }
 function completedSuffix(h: Harness, queue: string, sessionId: string): string {
   return `*Queue "${queue}" task completed · full output: ${runOutputPath(h, sessionId)}*`;
@@ -85,6 +93,7 @@ async function createHarness(
     delivered.push(event);
   });
   const logger: MockLogger = { debug: vi.fn(), info: vi.fn(), warn: vi.fn(), error: vi.fn() };
+  const historyRoot = path.join(root, "run-history");
   const controller = new QueueController({
     channelName: "test",
     tickMs: options.tickMs ?? 20,
@@ -95,10 +104,11 @@ async function createHarness(
     t: getTranslator("en-US"),
     // Isolated run-outputs dir under the temp root (cleaned up with it).
     outputsDir: path.join(root, "run-outputs"),
+    historyRoot,
     logger,
   });
   controllers.push(controller);
-  return { dispatched, delivered, dispatchClientEvent, deliver, logger, root, controller };
+  return { dispatched, delivered, dispatchClientEvent, deliver, logger, root, controller, historyRoot };
 }
 
 /**
@@ -579,6 +589,11 @@ describe("stop() races (SF-2)", () => {
     // spurious task-failed notice in the target chat).
     expect(h.delivered).toEqual([]);
 
+    // S1 regression: no run-history line either — the task file stays
+    // `running` for the at-least-once re-run at the next start, which writes
+    // its own line. Consistent with the scheduler's same-scenario behavior.
+    expect(await history(h)).toEqual([]);
+
     // The task file stays `running` (not deleted — the gateway-down race is
     // not a failure): the next start re-enqueues it (at-least-once).
     const tasks = await listQueueTasks("q", h.root);
@@ -590,6 +605,65 @@ describe("stop() races (SF-2)", () => {
     await sleep(200);
     expect(h.dispatched.filter((e) => e.type === "command.session.stop")).toEqual([]);
     expect(h.delivered).toEqual([]);
+  });
+
+  it("writes no fire-failed history line when stop lands during #registerRun's header write and the dispatch fails", async () => {
+    // S1 regression, second entry: stop() can also land while #registerRun
+    // is awaiting its header write. #fire then holds a LOCAL record that is
+    // no longer in the run registry (stop cleared it) and still dispatches;
+    // the post-stop dispatch resolves { ok: false, reason: "gateway is not
+    // running" }. #failFire must skip the history line for that run too.
+    const h = await createHarness({ runTimeoutMs: 50 });
+    const [id] = await seedQueue(h.root, "q", { target: TARGET }, ["a"]);
+
+    // Gate the accumulator's header write so #registerRun blocks mid-await.
+    let releaseHeader!: () => void;
+    const headerGate = new Promise<void>((resolve) => {
+      releaseHeader = resolve;
+    });
+    let headerEnteredResolve!: () => void;
+    const headerEntered = new Promise<void>((resolve) => {
+      headerEnteredResolve = resolve;
+    });
+    const { createRunAccumulator } = await import("../run-completion");
+    const accumulatorSpy = vi
+      .spyOn(await import("../run-completion"), "createRunAccumulator")
+      .mockImplementation((...args: Parameters<typeof createRunAccumulator>) => {
+        const accumulator = createRunAccumulator(...args);
+        const originalWriteHeader = accumulator.writeHeader.bind(accumulator);
+        return Object.create(accumulator, {
+          writeHeader: {
+            value: async (...headerArgs: Parameters<typeof accumulator.writeHeader>) => {
+              headerEnteredResolve();
+              await headerGate;
+              return originalWriteHeader(...headerArgs);
+            },
+          },
+        });
+      });
+
+    // The (post-stop) dispatch resolves the gateway-down reason.
+    h.dispatchClientEvent.mockImplementation(async (event: ClientOutputEvent) => {
+      h.dispatched.push(event);
+      return { ok: false, reason: "gateway is not running" } as const;
+    });
+
+    const startPromise = h.controller.start(); // the initial tick blocks in the header write
+    await headerEntered; // run registered, header write in flight
+    await h.controller.stop(); // clears the registry while the write is pending
+    releaseHeader();
+    await startPromise;
+    accumulatorSpy.mockRestore();
+
+    // The dispatch was attempted (with the stale local record) and failed —
+    // but that post-stop failure writes no history line, deletes nothing
+    // and delivers nothing: the task file stays `running` for the next start.
+    expect(h.dispatched).toHaveLength(1);
+    expect(h.delivered).toEqual([]);
+    expect(await history(h)).toEqual([]);
+    const tasks = await listQueueTasks("q", h.root);
+    expect(tasks).toHaveLength(1);
+    expect(tasks[0]!.state).toBe("running");
   });
 });
 
@@ -628,6 +702,104 @@ describe("handleOutput routing (D3)", () => {
     expect(h.logger.info).toHaveBeenCalledWith(expect.stringContaining("orphan"));
   });
 });
+
+describe("stale-fire guard (stop → start fast re-run of the same taskId)", () => {
+  it("a stale fire's #failFire writes no history and never ends the NEW run registered under the same id", async () => {
+    // Queue run ids are `queue:<queue>:<taskId>` and restart-stable, so a
+    // stop() → start() of the SAME controller can re-fire the SAME taskId
+    // and register a NEW record under the SAME id (a fresh record object).
+    // When the STALE fire's dispatch then resolves a failure, #failFire's
+    // identity check must reject it: no history line, no #endRun of the new
+    // run, no task delete, no delivery. With the old `registered !==
+    // undefined` guard the id-keyed #endRun would take the NEW run down and
+    // the stale fire would write a phantom fire-failed line (the controller
+    // is started again by then, so the #started guard does not save it).
+    const h = await createHarness();
+    const [id] = await seedQueue(h.root, "q", { target: TARGET }, ["a"]);
+    const sessionId = `queue:q:${id}`;
+
+    // Gate each session.new so the fires can be ordered precisely: the
+    // stale (first) fire stays in flight across stop()/start(), and the new
+    // fire stays in flight until the stale failure has been handled.
+    let releaseStaleFire!: () => void;
+    const staleFireGate = new Promise<void>((resolve) => {
+      releaseStaleFire = resolve;
+    });
+    let staleFireEntered!: () => void;
+    const staleFireEnteredPromise = new Promise<void>((resolve) => {
+      staleFireEntered = resolve;
+    });
+    let releaseNewFire!: () => void;
+    const newFireGate = new Promise<void>((resolve) => {
+      releaseNewFire = resolve;
+    });
+    let newFireEntered!: () => void;
+    const newFireEnteredPromise = new Promise<void>((resolve) => {
+      newFireEntered = resolve;
+    });
+    let stale = true;
+    h.dispatchClientEvent.mockImplementation(async (event: ClientOutputEvent) => {
+      h.dispatched.push(event);
+      if (event.type === "command.session.new") {
+        if (stale) {
+          stale = false;
+          staleFireEntered();
+          await staleFireGate;
+          return { ok: false, reason: "boom: stale fire" } as const;
+        }
+        newFireEntered();
+        await newFireGate;
+      }
+      return { ok: true } as const;
+    });
+
+    const startPromise1 = h.controller.start(); // the initial tick blocks in session.new
+    await staleFireEnteredPromise; // run 1 registered, its dispatch in flight
+    await h.controller.stop(); // clears the registry (run 1 forgotten, #started=false)
+
+    // Start the SAME controller again: the `running` task is reset to
+    // pending and re-fired — a NEW record lands under the SAME sessionId.
+    const startPromise2 = h.controller.start();
+    await newFireEnteredPromise; // NEW run registered under the same id
+
+    // Release the STALE fire's dispatch: its failure resolution reaches
+    // #failFire while the NEW run is registered under the same id.
+    releaseStaleFire();
+    await startPromise1;
+
+    // The identity check rejected the stale fire: no history line...
+    expect(await history(h)).toEqual([]);
+    // ...nothing delivered to the target chat...
+    expect(h.delivered).toEqual([]);
+    // ...and the task file was NOT deleted by the stale fire's fail-and-drop.
+    const tasks = await listQueueTasks("q", h.root);
+    expect(tasks).toHaveLength(1);
+
+    // The NEW run survived the stale failure: let its session.new resolve,
+    // wait for its user.message dispatch, then DONE the run — the normal
+    // completion path must deliver and write exactly one `completed` line
+    // (with the old guard the run would be an orphan: no delivery).
+    releaseNewFire();
+    await startPromise2;
+    await waitFor(() =>
+      expect(h.dispatched.filter((e) => e.type === "user.message")).toHaveLength(1),
+    );
+    await h.controller.handleOutput({
+      type: "assistant.message",
+      clientSessionId: sessionId,
+      text: `fresh result\n${DONE_MARKER}`,
+    });
+    await waitFor(() => expect(h.delivered).toHaveLength(1));
+    expect(h.delivered[0]).toEqual({
+      type: "assistant.message",
+      clientSessionId: TARGET,
+      text: `fresh result\n\n${completedSuffix(h, "q", sessionId)}`,
+    });
+    expect(await history(h)).toHaveLength(1);
+    expect((await history(h))[0]).toMatchObject({ runId: sessionId, outcome: "completed" });
+  });
+});
+
 
 describe("three-layer completion (T4)", () => {
   it("accumulates assistant messages and delivers them once only on DONE, marker stripped", async () => {
@@ -919,6 +1091,180 @@ describe("silence probe (T4, layer 2)", () => {
       clientSessionId: TARGET,
       text: `done now\n\n${completedSuffix(h, "q", `queue:q:${ids[0]}`)}`,
     });
+  });
+});
+
+describe("run history (run-history spec D2/D3/D5/D6)", () => {
+  it("writes one completed line at DONE with runId/ts/ms/channel/agent/file", async () => {
+    const h = await createHarness();
+    const [id] = await seedQueue(h.root, "q", { target: TARGET }, ["a"]);
+    h.dispatchClientEvent.mockImplementation(async (event: ClientOutputEvent) => {
+      h.dispatched.push(event);
+      if (event.type === "command.session.new") {
+        return { ok: true, agentSessionId: "pi-coding-agent:3333-4444" };
+      }
+      return { ok: true } as const;
+    });
+    await h.controller.start();
+    await waitFor(() => expect(h.dispatched).toHaveLength(2));
+
+    h.controller.handleOutput({
+      type: "assistant.message",
+      clientSessionId: `queue:q:${id}`,
+      text: `done\n${DONE_MARKER}`,
+    });
+    await waitFor(async () => expect(await history(h)).toHaveLength(1));
+
+    const [record] = await history(h);
+    expect(record!.runId).toBe(`queue:q:${id}`);
+    expect(record!.outcome).toBe("completed");
+    expect("reason" in record!).toBe(false);
+    expect(record!.channel).toBe("test");
+    expect(record!.agent).toBe("pi-coding-agent:3333-4444");
+    expect(record!.file).toBe(runOutputPath(h, `queue:q:${id}`));
+    expect(typeof record!.ts).toBe("string");
+    expect(typeof record!.ms).toBe("number");
+  });
+
+  it("writes a failed line with the error detail as reason", async () => {
+    const h = await createHarness();
+    const [id] = await seedQueue(h.root, "q", { target: TARGET }, ["a"]);
+    await h.controller.start();
+    await waitFor(() => expect(h.dispatched).toHaveLength(2));
+
+    h.controller.handleOutput({
+      type: "error",
+      clientSessionId: `queue:q:${id}`,
+      kind: "agent.run.failed",
+      detail: "boom",
+    });
+    await waitFor(async () => expect(await history(h)).toHaveLength(1));
+    expect((await history(h))[0]).toMatchObject({
+      runId: `queue:q:${id}`,
+      outcome: "failed",
+      reason: "boom",
+      channel: "test",
+    });
+  });
+
+  it("writes a timeout line with a `timed out after Xms` reason", async () => {
+    const h = await createHarness({ runTimeoutMs: 50 });
+    const [id] = await seedQueue(h.root, "q", { target: TARGET }, ["a"]);
+    await h.controller.start();
+    await waitFor(() => expect(h.dispatched).toHaveLength(2));
+
+    await waitFor(async () => expect(await history(h)).toHaveLength(1));
+    expect((await history(h))[0]).toMatchObject({
+      runId: `queue:q:${id}`,
+      outcome: "timeout",
+      reason: "timed out after 50ms",
+      channel: "test",
+    });
+  });
+
+  it("writes a fire-failed line with the dispatch failure reason; agent present when session.new succeeded", async () => {
+    const h = await createHarness();
+    const [id] = await seedQueue(h.root, "q", { target: TARGET }, ["a"]);
+    // session.new succeeds (returning an agentSessionId), user.message fails.
+    h.dispatchClientEvent.mockImplementation(async (event: ClientOutputEvent) => {
+      h.dispatched.push(event);
+      if (event.type === "user.message") {
+        return { ok: false, reason: "boom: prompt rejected" };
+      }
+      return { ok: true, agentSessionId: "pi-coding-agent:5555-6666" };
+    });
+    await h.controller.start();
+
+    await waitFor(async () => expect(await history(h)).toHaveLength(1));
+    expect((await history(h))[0]).toMatchObject({
+      runId: `queue:q:${id}`,
+      outcome: "fire-failed",
+      reason: "boom: prompt rejected",
+      agent: "pi-coding-agent:5555-6666",
+    });
+
+    // session.new itself fails: no agent field on the line.
+    const h2 = await createHarness();
+    const [id2] = await seedQueue(h2.root, "q", { target: TARGET }, ["a"]);
+    h2.dispatchClientEvent.mockImplementation(async (event: ClientOutputEvent) => {
+      h2.dispatched.push(event);
+      if (event.type === "command.session.new") {
+        return { ok: false, reason: "boom: model not available" };
+      }
+      return { ok: true } as const;
+    });
+    await h2.controller.start();
+    await waitFor(async () => expect(await history(h2)).toHaveLength(1));
+    const [record2] = await history(h2);
+    expect(record2).toMatchObject({
+      runId: `queue:q:${id2}`,
+      outcome: "fire-failed",
+      reason: "boom: model not available",
+    });
+    expect("agent" in record2!).toBe(false);
+  });
+
+  it("writes nothing for skipped queues (unbound/foreign) and stop()-cleared runs", async () => {
+    const h = await createHarness();
+    // Unbound (no target) and foreign (other channel) queues are never fired.
+    await seedQueue(h.root, "unbound", {}, ["a"]);
+    await seedQueue(h.root, "foreign", { channel: "other", target: TARGET }, ["a"]);
+    await h.controller.start();
+    await sleep(80);
+    expect(await history(h)).toEqual([]);
+
+    // A stop()-cleared in-flight run writes nothing either (spec Non-Goals).
+    const h2 = await createHarness();
+    const [id] = await seedQueue(h2.root, "q", { target: TARGET }, ["a"]);
+    await h2.controller.start();
+    await waitFor(() => expect(h2.dispatched).toHaveLength(2));
+    await h2.controller.stop();
+    expect(await history(h2)).toEqual([]);
+    expect(id).toBeDefined();
+  });
+
+  it("writes the header with the RAW prompt (queue body + task prompt) and no protocol block", async () => {
+    const h = await createHarness();
+    const [id] = await seedQueue(
+      h.root,
+      "q",
+      { target: TARGET, body: "Shared context.\nSecond line." },
+      ["task prompt body"],
+    );
+    await h.controller.start();
+    await waitFor(() => expect(h.dispatched).toHaveLength(2));
+    await h.controller.handleOutput({
+      type: "assistant.message",
+      clientSessionId: `queue:q:${id}`,
+      text: "assistant output",
+    });
+
+    const content = await readFile(runOutputPath(h, `queue:q:${id}`), "utf8");
+    const lines = content.split("\n");
+    // Front matter: runId/channel/target/queue/taskId/startedAt, then the prompt.
+    expect(lines.slice(0, 7)).toEqual([
+      "---",
+      `runId: queue:q:${id}`,
+      "channel: test",
+      `target: ${TARGET}`,
+      "queue: q",
+      `taskId: ${id}`,
+      `startedAt: ${new Date(lines[6]!.slice(11)).toISOString()}`,
+    ]);
+    // The RAW prompt (body + task prompt), NOT buildTaskPrompt's wrapping.
+    expect(content).toContain("# Prompt\n\nShared context.\nSecond line.\n\ntask prompt body\n\n---\n");
+    expect(content).not.toContain(DONE_MARKER);
+    expect(content).not.toContain("Task completion protocol");
+    expect(content.endsWith("assistant output\n\n")).toBe(true);
+  });
+
+  it("header with an empty queue body holds the bare task prompt", async () => {
+    const h = await createHarness();
+    const [id] = await seedQueue(h.root, "q", { target: TARGET }, ["just the task"]);
+    await h.controller.start();
+    await waitFor(() => expect(h.dispatched).toHaveLength(2));
+    const content = await readFile(runOutputPath(h, `queue:q:${id}`), "utf8");
+    expect(content).toContain("# Prompt\n\njust the task\n\n---\n\n");
   });
 });
 

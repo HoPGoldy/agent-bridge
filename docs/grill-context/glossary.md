@@ -33,3 +33,15 @@
 ### 调度语法（Schedule Grammar）
 
 定义：任务文件 `schedule` 字段的四档简化语法：`every <n>m|h|d`、`daily HH:MM`、`weekly <day> HH:MM`、`monthly <day> HH:MM`。本地时区、分钟粒度。明确不支持完整 cron 表达式。
+
+### 运行历史（Run History）
+
+定义：`~/.config/agent-bridge/run-history/` 下的 append-only JSONL 索引文件（schedule.jsonl / queue.jsonl 分开存），每次 run 结束（completed/failed/timeout/fire-failed）写一行：runId、ts、ms、outcome、reason?、channel、agent?（agentSessionId）、file（Output File 路径）。只作索引，不存详情。
+
+易混淆点：它不是日志全文——assistant 输出全文在 Output File，工具调用/SubAgent 细节在 agent adapter 的 session file（靠 agent 字段定位）。
+
+### 运行输出文件（Output File）
+
+定义：`~/.config/agent-bridge/run-outputs/<run-id>.md`，run 注册时写入 front matter 头部（runId/channel/target/startedAt）+ `# Prompt` 全文，run 期间由 accumulator 逐条追加 assistant 消息，run 结束后保留，投递消息的斜体后缀引用它。刻意保持简单：不记 tool call / thinking。
+
+易混淆点：它不是完整会话记录；完整记录在 agent adapter 的 session file（如 pi-sessions/*.jsonl）。

@@ -228,6 +228,7 @@ Bind this chat as a task's delivery target in one step — send it **in the chat
 | `agent-bridge schedule add` | Interactive wizard: name the task (globally unique — no channel selection), enter the schedule (validated, with examples), optionally set the working directory, timeout and a per-task model, then write the task file with an example prompt and print the targeting instruction. |
 | `agent-bridge schedule list` | Table of every task across all channels: Task, Schedule, Enabled (`yes`/`no`), Target (`yes`/`no`), Next run (computed from the grammar at the current clock) and Status (`ERROR:`/`WARN:` notes such as missing schedule, invalid timeout, empty body, unknown keys). |
 | `agent-bridge schedule remove <task-name>` | Delete the task file directly. Task names are globally unique, so no disambiguation or `--channel` option is needed. |
+| `agent-bridge schedule history [task-name]` | Newest-first table of finished runs (Time, Name, Outcome, Duration, Reason, File) from the run-history index; without a name it lists every task's runs. |
 
 Task files are plain Markdown: diffable, git-trackable, and hot-reloaded — there is no runtime binding state and no channel-state schema change.
 

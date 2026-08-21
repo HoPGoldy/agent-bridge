@@ -49,6 +49,8 @@ The CLI currently provides these commands:
 - `agent-bridge queue add`
 - `agent-bridge queue insert <queue-name> --prompt "..."`
 - `agent-bridge queue list`
+- `agent-bridge schedule history [task-name]`
+- `agent-bridge queue history <queue-name>`
 
 Create a channel interactively:
 

@@ -2778,6 +2778,9 @@ describe("GatewayCore", () => {
     running.push(core);
     await core.start();
 
+    // Run-history spec D5: a successful session.new carries the freshly
+    // created session's core-owned id; the follow-up user.message result
+    // stays a bare { ok: true }.
     await expect(
       core.input({
         type: "command.session.new",
@@ -2785,7 +2788,17 @@ describe("GatewayCore", () => {
         workingDirectory: "/tmp/project-a",
         workingDirectorySource: "default",
       }),
-    ).resolves.toEqual({ ok: true });
+    ).resolves.toEqual({ ok: true, agentSessionId: expect.any(String) });
+    const sessionResult = await core.input({
+      type: "command.session.new",
+      clientSessionId: "schedule:report:2",
+      workingDirectory: "/tmp/project-a",
+      workingDirectorySource: "default",
+    });
+    expect(sessionResult.ok).toBe(true);
+    if (sessionResult.ok) {
+      expect(createdAdapters.map((a) => a.agentSessionId)).toContain(sessionResult.agentSessionId);
+    }
     await expect(
       core.input({
         type: "user.message",
@@ -2793,7 +2806,7 @@ describe("GatewayCore", () => {
         text: "produce the report",
       }),
     ).resolves.toEqual({ ok: true });
-    await waitFor(() => expect(createdAdapters).toHaveLength(1));
+    await waitFor(() => expect(createdAdapters).toHaveLength(2));
   });
 
   it("surfaces a failed schedule session.new as { ok: false } without delivering to the IM adapter", async () => {

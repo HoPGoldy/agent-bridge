@@ -666,7 +666,11 @@ export class GatewayCore {
       });
     }
 
-    return { ok: true };
+    // Run-history spec D5: carry the freshly created session's id on the ok
+    // result so the scheduler / queue controller can capture it at fire time
+    // (the authoritative value — a later binding lookup could already point
+    // at a newer session). Purely additive: existing callers ignore it.
+    return { ok: true, agentSessionId: newRuntime.agentSessionId };
   }
 
   async #deliverClientInput(event: ClientInputEvent): Promise<void> {
@@ -1065,8 +1069,9 @@ export class GatewayCore {
   }
 
   /**
-   * Spec D1/D3: synthetic task-run sessions use `schedule:<task>:<run-seq>`
-   * and `queue:<queue>:<taskId>` ids.
+   * Spec D1/D3: synthetic task-run sessions use
+   * `schedule:<task>:<yyyymmdd-hhmmss>-<seq>` and `queue:<queue>:<taskId>` ids
+   * (run-history spec D4).
    */
   #isSyntheticClientSession(clientSessionId: string): boolean {
     return (

@@ -963,3 +963,227 @@ describe("runCli queue remove", () => {
     expect(unlink).not.toHaveBeenCalled();
   });
 });
+
+// ---------------------------------------------------------------------------
+// history subcommands (run-history spec D7). The readRunHistory reader runs
+// against the mocked node:fs/promises, so each test seeds `readFile` with a
+// JSONL payload keyed by the history file path (RUN_HISTORY_DIR-based, same
+// layout the reader builds) — no real fs is touched.
+// ---------------------------------------------------------------------------
+
+describe("history helpers", () => {
+  it("formatDuration renders human-readable durations", async () => {
+    const { formatDuration } = await import("./cli");
+    expect(formatDuration(0)).toBe("0ms");
+    expect(formatDuration(45_123)).toBe("45s");
+    expect(formatDuration(252_000)).toBe("4m12s");
+    expect(formatDuration(3_723_000)).toBe("1h2m3s");
+  });
+
+  it("parseQueueRunId splits at the FIRST colon after the queue: prefix", async () => {
+    const { parseQueueRunId } = await import("./cli");
+    // taskId may contain `-`; the queue name never contains `:`.
+    expect(parseQueueRunId("queue:build:1787134243550-6727")).toBe("build");
+    expect(parseQueueRunId("queue:my-queue:1787134243550-6727")).toBe("my-queue");
+    expect(parseQueueRunId("schedule:task:20260820-090000-1")).toBeNull();
+    expect(parseQueueRunId("queue:noname")).toBeNull();
+    expect(parseQueueRunId("queue::1234-abcd")).toBeNull();
+  });
+});
+
+/** History-row fixture (spec D2 fields). */
+function makeHistoryLine(overrides: Record<string, unknown> = {}): string {
+  return `${JSON.stringify({
+    runId: "schedule:daily-report:20260820-090000-1",
+    ts: "2026-08-20T01:00:00.000Z",
+    ms: 252_000,
+    outcome: "completed",
+    channel: "demo",
+    file: "/tmp/run-outputs/daily-report.md",
+    ...overrides,
+  })}\n`;
+}
+
+/** Seeds the mocked fs with JSONL content per history file path. */
+function seedHistory(files: Record<string, string>): void {
+  readFile.mockImplementation(async (p: unknown) => {
+    const key = String(p);
+    if (key in files) return files[key]!;
+    throw Object.assign(new Error("ENOENT"), { code: "ENOENT" });
+  });
+}
+
+describe("runCli schedule history", () => {
+  beforeEach(() => {
+    resetPromptMocks();
+    readFile.mockReset();
+    readFile.mockImplementation(async () => {
+      throw Object.assign(new Error("ENOENT"), { code: "ENOENT" });
+    });
+  });
+
+  it("prints a friendly hint when there is no history (missing file)", async () => {
+    const { runCli } = await import("./cli");
+    const logs = captureLogs();
+    try {
+      await runCli(["node", "agent-bridge", "schedule", "history"]);
+    } finally {
+      logs.restore();
+    }
+    expect(logs.lines.join("\n")).toContain("No run history found");
+  });
+
+  it("prints the full table with all columns, newest first", async () => {
+    const { RUN_HISTORY_DIR } = await import("./config/channel-state");
+    seedHistory({
+      [`${RUN_HISTORY_DIR}/schedule.jsonl`]: [
+        makeHistoryLine(), // 01:00 completed, daily-report
+        makeHistoryLine({
+          runId: "schedule:backup:20260820-093000-2",
+          ts: "2026-08-20T01:30:00.000Z",
+          outcome: "failed",
+          reason: "boom",
+          ms: 45_000,
+        }),
+      ].join(""),
+    });
+
+    const { runCli } = await import("./cli");
+    const logs = captureLogs();
+    try {
+      await runCli(["node", "agent-bridge", "schedule", "history"]);
+    } finally {
+      logs.restore();
+    }
+
+    const out = logs.lines.join("\n");
+    for (const header of ["Time", "Name", "Outcome", "Duration", "Reason", "File"]) {
+      expect(out).toContain(header);
+    }
+    expect(out).toContain("daily-report");
+    expect(out).toContain("backup");
+    expect(out).toContain("4m12s");
+    expect(out).toContain("45s");
+    expect(out).toContain("boom");
+    expect(out).toContain("-"); // Reason placeholder on the completed row
+    // Newest first: the 01:30 row precedes the 01:00 row.
+    expect(out.indexOf("backup")).toBeLessThan(out.indexOf("daily-report"));
+  });
+
+  it("filters by task name", async () => {
+    const { RUN_HISTORY_DIR } = await import("./config/channel-state");
+    seedHistory({
+      [`${RUN_HISTORY_DIR}/schedule.jsonl`]: [
+        makeHistoryLine(),
+        makeHistoryLine({ runId: "schedule:backup:20260820-093000-2", ts: "2026-08-20T01:30:00.000Z" }),
+      ].join(""),
+    });
+
+    const { runCli } = await import("./cli");
+    const logs = captureLogs();
+    try {
+      await runCli(["node", "agent-bridge", "schedule", "history", "daily-report"]);
+    } finally {
+      logs.restore();
+    }
+
+    const out = logs.lines.join("\n");
+    expect(out).toContain("daily-report");
+    expect(out).not.toContain("backup");
+  });
+
+  it("prints a task-specific hint when the filtered name has no history", async () => {
+    const { RUN_HISTORY_DIR } = await import("./config/channel-state");
+    seedHistory({ [`${RUN_HISTORY_DIR}/schedule.jsonl`]: makeHistoryLine() });
+    const { runCli } = await import("./cli");
+    const logs = captureLogs();
+    try {
+      await runCli(["node", "agent-bridge", "schedule", "history", "no-such-task"]);
+    } finally {
+      logs.restore();
+    }
+    expect(logs.lines.join("\n")).toContain('No run history found for scheduled task "no-such-task".');
+  });
+
+  it("skips malformed lines and rows whose runId does not parse as a schedule id", async () => {
+    const { RUN_HISTORY_DIR } = await import("./config/channel-state");
+    seedHistory({
+      [`${RUN_HISTORY_DIR}/schedule.jsonl`]: [
+        "{not json\n", // malformed JSON: skipped by the reader
+        makeHistoryLine({ runId: "queue:build:1787134243550-6727" }), // wrong kind
+        makeHistoryLine({ runId: "schedule:daily-report:20260821-090000-1", ts: "2026-08-21T01:00:00.000Z" }),
+      ].join(""),
+    });
+    const { runCli } = await import("./cli");
+    const logs = captureLogs();
+    try {
+      await runCli(["node", "agent-bridge", "schedule", "history"]);
+    } finally {
+      logs.restore();
+    }
+
+    const out = logs.lines.join("\n");
+    expect(out).toContain("daily-report");
+    expect(out).not.toContain("build"); // wrong-kind runId row skipped
+    // Table rows only: header + one data row.
+    expect(logs.lines).toHaveLength(2);
+  });
+});
+
+describe("runCli queue history", () => {
+  beforeEach(() => {
+    resetPromptMocks();
+    readFile.mockReset();
+    readFile.mockImplementation(async () => {
+      throw Object.assign(new Error("ENOENT"), { code: "ENOENT" });
+    });
+  });
+
+  it("prints a friendly hint when the queue has no history", async () => {
+    const { runCli } = await import("./cli");
+    const logs = captureLogs();
+    try {
+      await runCli(["node", "agent-bridge", "queue", "history", "build"]);
+    } finally {
+      logs.restore();
+    }
+    expect(logs.lines.join("\n")).toContain('No run history found for queue "build".');
+  });
+
+  it("prints only the named queue's rows, newest first", async () => {
+    const { RUN_HISTORY_DIR } = await import("./config/channel-state");
+    seedHistory({
+      [`${RUN_HISTORY_DIR}/queue.jsonl`]: [
+        makeHistoryLine({ runId: "queue:build:1787134243550-6727", ms: 90_000 }),
+        makeHistoryLine({
+          runId: "queue:build:1787134243999-aaaa",
+          ts: "2026-08-20T02:00:00.000Z",
+          outcome: "fire-failed",
+          reason: "boom: model not available",
+          ms: 1_500,
+        }),
+        makeHistoryLine({ runId: "queue:other:1787134243551-bbbb", ts: "2026-08-20T03:00:00.000Z" }),
+      ].join(""),
+    });
+
+    const { runCli } = await import("./cli");
+    const logs = captureLogs();
+    try {
+      await runCli(["node", "agent-bridge", "queue", "history", "build"]);
+    } finally {
+      logs.restore();
+    }
+
+    const out = logs.lines.join("\n");
+    expect(out).toContain("build");
+    expect(out).not.toContain("other");
+    // Duration formatting: 90s and 1.5s; fire-failed reason is shown.
+    expect(out).toContain("1m30s");
+    expect(out).toContain("1s");
+    expect(out).toContain("boom: model not available");
+    // Newest first: the 02:00 row precedes the 01:00 row.
+    expect(out.indexOf("1s")).toBeLessThan(out.indexOf("1m30s"));
+    // Table rows only: header + two data rows.
+    expect(logs.lines).toHaveLength(3);
+  });
+});

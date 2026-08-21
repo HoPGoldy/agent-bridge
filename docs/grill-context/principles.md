@@ -29,3 +29,15 @@
 内容：本项目仅作者本人使用，破坏性变更直接做：不为旧数据格式/旧目录布局写迁移逻辑、兼容扫描或 deprecation warn。升级后失效的东西由作者手动处理或让 AI 排查。
 
 适用场景：数据迁移、旧格式兼容、breaking change 提示等决策。例外：如果项目未来有其他用户，此原则需重新评估。
+
+### bridge 不复制 adapter 的会话记录职责
+
+内容：忠实记录完整会话（tool call、thinking、SubAgent）是 agent adapter 的职责且它已做好（如 pi session file）。bridge 侧的功能性文件（如 Output File）只记 bridge 自己产生的增量信息（对用户说了什么），需要细节时用 agentSessionId 桥接到 adapter 的存储，绝不重复造一份。
+
+适用场景：bridge 内任何"留痕/日志/转录"类设计。
+
+### 持久化按模块分文件，不合并
+
+内容：不同功能模块的持久化数据各自成文件（如 schedule.jsonl / queue.jsonl），即使结构当前相同也不合并成一个。模块演进自由、查询入口本来也按模块分。
+
+适用场景：多模块同构数据的存储设计。

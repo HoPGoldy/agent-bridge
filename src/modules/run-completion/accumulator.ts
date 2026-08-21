@@ -21,7 +21,7 @@
  * guarantee for a log-structured file.
  */
 
-import { appendFile, mkdir, readFile } from "node:fs/promises";
+import { appendFile, mkdir, readFile, writeFile } from "node:fs/promises";
 import path from "node:path";
 import type { OutboundAttachment } from "../../types";
 import { RUN_OUTPUTS_DIR } from "../../config/channel-state";
@@ -33,7 +33,7 @@ export interface CollectedAttachment {
 }
 
 /**
- * Sanitizes a synthetic run session id (`schedule:<task>:<n>`,
+ * Sanitizes a synthetic run session id (`schedule:<task>:<yyyymmdd-hhmmss>-<seq>`,
  * `queue:<queue>:<taskId>`) into a safe file-name stem: every character
  * outside `[A-Za-z0-9._-]` collapses to `_`, and the stem is truncated to a
  * bounded length.
@@ -47,6 +47,18 @@ export function sanitizeSessionId(sessionId: string): string {
 export interface RunAccumulator {
   /** Absolute path of the accumulation file. */
   readonly filePath: string;
+  /**
+   * Writes the run's header (Markdown front matter + the full prompt,
+   * run-history spec D6) at the very START of the accumulation file,
+   * creating the directory and the file (registration-time creation — a
+   * registered run always has an Output File). Contract: call at most ONCE
+   * and BEFORE any {@link append} — a header cannot be prepended in front
+   * of existing messages, so a second call (or one after an append) throws.
+   * The caller owns the format; this method only ensures the block ends
+   * with a blank line so the first appended message stays clearly
+   * separated from the header.
+   */
+  writeHeader(markdown: string): Promise<void>;
   /** Appends one assistant message's text and collects its attachments. */
   append(text: string, attachments?: readonly OutboundAttachment[]): Promise<void>;
   /** Attachments collected from every appended message, in arrival order. */
@@ -75,8 +87,30 @@ export function createRunAccumulator(options: RunAccumulatorOptions): RunAccumul
   // while the file keeps the whole run.
   const collected: CollectedAttachment[] = [];
   let last = "";
+  let headerWritten = false;
+  let appended = false;
+
+  async function writeHeader(markdown: string): Promise<void> {
+    if (headerWritten) {
+      throw new Error("run accumulator header already written");
+    }
+    if (appended) {
+      throw new Error("run accumulator header must be written before any append");
+    }
+    headerWritten = true;
+    await mkdir(dir, { recursive: true });
+    // Normalize the tail to a blank line so the header and the first
+    // appended message never glue together.
+    const block = markdown.endsWith("\n\n")
+      ? markdown
+      : markdown.endsWith("\n")
+        ? `${markdown}\n`
+        : `${markdown}\n\n`;
+    await writeFile(filePath, block, "utf8");
+  }
 
   async function append(text: string, messageAttachments?: readonly OutboundAttachment[]): Promise<void> {
+    appended = true;
     for (const attachment of messageAttachments ?? []) {
       collected.push({ filePath: attachment.filePath, ...(attachment.fileName !== undefined ? { fileName: attachment.fileName } : {}) });
     }
@@ -88,6 +122,7 @@ export function createRunAccumulator(options: RunAccumulatorOptions): RunAccumul
 
   return {
     filePath,
+    writeHeader,
     append,
     get collectedAttachments(): readonly CollectedAttachment[] {
       return collected;

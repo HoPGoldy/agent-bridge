@@ -21,7 +21,9 @@ import { runChannel } from "./core/channel-runner";
 import { DEFAULT_LOCALE, getTranslatorForCommon } from "./i18n";
 import { getAgentModule, listAgentModules } from "./modules/agent";
 import { getClientModule, listClientModules } from "./modules/client";
+import { readRunHistory, type RunHistoryRecord } from "./modules/run-completion/history";
 import { nextRun, parseSchedule, parseTimeout } from "./modules/schedule/grammar";
+import { parseSyntheticSessionId } from "./modules/schedule/scheduler";
 import {
   getSchedulesDir,
   isValidTaskName,
@@ -36,6 +38,7 @@ import {
   listQueueDefinitions,
   listQueueTasks,
   loadQueueDefinition,
+  QUEUE_SESSION_PREFIX,
   writeQueueDefinition,
   type QueueDefinition,
 } from "./modules/queue/queue-file";
@@ -583,6 +586,113 @@ async function removeQueue(queueName: string): Promise<void> {
   console.log(`Deleted ${filePath}`);
 }
 
+// ---------------------------------------------------------------------------
+// history subcommands (run-history spec D7)
+//
+// `schedule history [task-name]` / `queue history <queue-name>` read the
+// per-module JSONL index written at every run endpoint (T2) and print the
+// WHOLE list (no paging — the file is small), newest first. Pure read-only:
+// the CLI process never touches a running bridge. Name filtering parses the
+// name out of the runId (schedule ids embed the task name via
+// parseSyntheticSessionId; queue ids are `queue:<name>:<taskId>` and the
+// queue name cannot contain `:`, so the SECOND colon delimits it — taskId
+// itself may contain `-`, so no further splitting is attempted).
+// ---------------------------------------------------------------------------
+
+/** Human-readable run duration: `4m12s`, `45s`, `1h2m3s`, `0ms`. */
+export function formatDuration(ms: number): string {
+  if (ms < 1000) return `${Math.max(0, Math.trunc(ms))}ms`;
+  const totalSeconds = Math.floor(ms / 1000);
+  const hours = Math.floor(totalSeconds / 3600);
+  const minutes = Math.floor((totalSeconds % 3600) / 60);
+  const seconds = totalSeconds % 60;
+  if (hours > 0) return `${hours}h${minutes}m${seconds}s`;
+  if (minutes > 0) return `${minutes}m${seconds}s`;
+  return `${seconds}s`;
+}
+
+/** Extracts the queue name out of a `queue:<name>:<taskId>` runId. */
+export function parseQueueRunId(runId: string): string | null {
+  if (!runId.startsWith(QUEUE_SESSION_PREFIX)) return null;
+  const rest = runId.slice(QUEUE_SESSION_PREFIX.length);
+  const colon = rest.indexOf(":");
+  // The queue name never contains `:`; the taskId after the second colon is
+  // opaque (it contains `-`), so it is never split further.
+  if (colon <= 0 || colon === rest.length - 1) return null;
+  return rest.slice(0, colon);
+}
+
+interface HistoryRow {
+  record: RunHistoryRecord;
+  name: string;
+}
+
+/** Prints the shared history table (spec D7), newest first. */
+function printHistoryTable(rows: HistoryRow[]): void {
+  const columns: Array<{ header: string; get: (row: HistoryRow) => string }> = [
+    // Local timezone, same formatting as `schedule list`'s Next run column.
+    { header: "Time", get: (row) => new Date(row.record.ts).toLocaleString() },
+    { header: "Name", get: (row) => row.name },
+    { header: "Outcome", get: (row) => row.record.outcome },
+    { header: "Duration", get: (row) => formatDuration(row.record.ms) },
+    { header: "Reason", get: (row) => row.record.reason ?? "-" },
+    { header: "File", get: (row) => row.record.file },
+  ];
+  const widths = columns.map((column) =>
+    Math.max(column.header.length, ...rows.map((row) => column.get(row).length)),
+  );
+
+  console.log(columns.map((column, i) => column.header.padEnd(widths[i])).join("  ").trimEnd());
+  for (const row of rows) {
+    console.log(columns.map((column, i) => column.get(row).padEnd(widths[i])).join("  ").trimEnd());
+  }
+}
+
+/** Shared plumbing: read, filter, sort newest-first, print or hint. */
+async function listHistory(
+  kind: "schedule" | "queue",
+  name: string | undefined,
+  nameOf: (runId: string) => string | null,
+  emptyHint: string,
+): Promise<void> {
+  const records = await readRunHistory(kind);
+  const rows: HistoryRow[] = [];
+  for (const record of records) {
+    const parsedName = nameOf(record.runId);
+    if (parsedName === null) continue; // not a well-formed runId: skip silently
+    if (name !== undefined && parsedName !== name) continue;
+    rows.push({ record, name: parsedName });
+  }
+  if (rows.length === 0) {
+    console.log(emptyHint);
+    return;
+  }
+  rows.sort((a, b) => (a.record.ts < b.record.ts ? 1 : a.record.ts > b.record.ts ? -1 : 0));
+  printHistoryTable(rows);
+}
+
+/** `agent-bridge schedule history [task-name]`: newest-first run table (all tasks when no name). */
+async function scheduleHistory(taskName?: string): Promise<void> {
+  await listHistory(
+    "schedule",
+    taskName,
+    (runId) => parseSyntheticSessionId(runId)?.taskName ?? null,
+    taskName === undefined
+      ? "No run history found."
+      : `No run history found for scheduled task "${taskName}".`,
+  );
+}
+
+/** `agent-bridge queue history <queue-name>`: newest-first run table. */
+async function queueHistory(queueName: string): Promise<void> {
+  await listHistory(
+    "queue",
+    queueName,
+    parseQueueRunId,
+    `No run history found for queue "${queueName}".`,
+  );
+}
+
 export async function runCli(argv = process.argv): Promise<void> {
   const program = new Command();
 
@@ -645,6 +755,14 @@ export async function runCli(argv = process.argv): Promise<void> {
       await removeScheduleTask(taskName);
     });
 
+  schedule
+    .command("history")
+    .description("Show run history of scheduled tasks (newest first)")
+    .argument("[task-name]")
+    .action(async (taskName?: string) => {
+      await scheduleHistory(taskName);
+    });
+
   const queue = program
     .command("queue")
     .description("Manage event queues (Markdown files under ~/.config/agent-bridge/queues)");
@@ -678,6 +796,14 @@ export async function runCli(argv = process.argv): Promise<void> {
     .argument("<queue-name>")
     .action(async (queueName: string) => {
       await removeQueue(queueName);
+    });
+
+  queue
+    .command("history")
+    .description("Show run history of a queue's tasks (newest first)")
+    .argument("<queue-name>")
+    .action(async (queueName: string) => {
+      await queueHistory(queueName);
     });
 
   await program.parseAsync(argv);
