@@ -1218,4 +1218,31 @@ describe("WeixinIMAdapter", () => {
       warnSpy.mockRestore();
     }
   });
+
+  it("replies with the local resume usage hint on a bare /resume without emitting an event", async () => {
+    const adapter = new WeixinIMAdapter(
+      {
+        accountId: "bot-account",
+        token: "bot-token",
+      },
+      createLogger("test"),
+    );
+    const onOutput = vi.fn(async (_event: ClientOutputEvent) => {});
+
+    await adapter.start(onOutput);
+    await fakeClientState.onMessage?.({
+      chatId: "wxid_user_1",
+      chatType: "dm",
+      messageId: "msg-resume-usage",
+      text: "/resume",
+      mentionedBot: false,
+    });
+
+    expect(onOutput).not.toHaveBeenCalled();
+    expect(fakeClientState.sendText).toHaveBeenCalledWith(
+      "wxid_user_1",
+      expect.stringContaining("Usage: `/resume <provider-session-id>`"),
+    );
+    expect(fakeClientState.stopTyping).toHaveBeenCalledWith("wxid_user_1");
+  });
 });

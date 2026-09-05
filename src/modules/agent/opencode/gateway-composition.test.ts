@@ -192,4 +192,45 @@ describe("Gateway + OpenCode module composition", () => {
       await rm(dir, { recursive: true, force: true });
     }
   });
+
+  it("adopts a provider session through /resume end to end", async () => {
+    const store = createInMemoryChannelStateStore();
+    const imAdapter = new FakeIMAdapter();
+    const { core, getApi } = makeCore(imAdapter, store);
+
+    storeProbe = store;
+    try {
+      await core.start();
+      await imAdapter.emit({
+        type: "command.session.resume",
+        clientSessionId: "client-1",
+        providerSessionId: "opencode:ses_external",
+      });
+
+      await vi.waitFor(() => {
+        expect(getApi()).not.toBeNull();
+        // Adopt verifies the provider session and never creates one.
+        expect(getApi()!.getSession).toHaveBeenCalledWith("ses_external");
+        expect(getApi()!.createSession).not.toHaveBeenCalled();
+      });
+
+      const document = await store.load();
+      const agentSessionId = document.bindings["client-1"];
+      expect(agentSessionId).toMatch(/^opencode:/);
+      expect(document.agentSessions[agentSessionId!]!.state).toMatchObject({
+        version: 1,
+        openCodeSessionId: "ses_external",
+        workingDirectorySource: "bridge-default",
+      });
+      // The confirmation reply names the session and its working directory.
+      const confirmation = imAdapter.outputs.find(
+        (event) => event.type === "assistant.message",
+      ) as Extract<ClientOutputEvent, { type: "assistant.message" }> | undefined;
+      expect(confirmation?.text).toContain("ses_external");
+      expect(confirmation?.text).toContain(process.cwd());
+    } finally {
+      storeProbe = null;
+      await core.stop();
+    }
+  });
 });

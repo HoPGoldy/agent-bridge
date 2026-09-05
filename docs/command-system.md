@@ -22,6 +22,8 @@ All client adapters use the same command parser, so the command behavior is cons
 | `/s` | Alias of `/stop` | `command.session.stop` |
 | `/status` | Query the current agent session runtime status | `command.session.status` |
 | `/st` | Alias of `/status` | `command.session.status` |
+| `/resume <provider-session-id>` | Adopt (take over) an existing provider session into the current chat; later messages continue that session | `command.session.resume` |
+| `/r <provider-session-id>` | Alias of `/resume <provider-session-id>` | `command.session.resume` |
 | `/model` | List available models for the current active agent session | `command.session.model.list` |
 | `/m` | Alias of `/model` | `command.session.model.list` or `command.session.model.set` |
 | `/model provider/modelId` | Switch the current active agent session model | `command.session.model.set` |
@@ -36,7 +38,8 @@ The parser is deliberately strict and predictable:
 2. Zero-argument commands must match a supported command exactly.
 3. `/new` and `/n` additionally support an optional argument tail, interpreted as the working directory for the new session.
 4. `/model` and `/m` additionally support a single argument tail, interpreted as the target model string.
-5. Matching is case-insensitive for the command name. The working directory tail is trimmed of leading/trailing whitespace but otherwise preserved exactly as typed (including case, internal spaces, and Unicode).
+5. `/resume` and `/r` require a single argument tail, the provider session id. It is trimmed and passed through verbatim — the parser deliberately does not validate its format, because only the agent backend can decide whether it names an existing session. A bare `/resume` is still recognized as a command and produces a localized usage reply instead of an event.
+6. Matching is case-insensitive for the command name. The working directory tail is trimmed of leading/trailing whitespace but otherwise preserved exactly as typed (including case, internal spaces, and Unicode).
 
 That means these are valid:
 
@@ -59,6 +62,10 @@ That means these are valid:
 - `/m`
 - `/model anthropic/claude-sonnet-4-5`
 - `/m openai/gpt-5`
+- `/resume 6e8af726-3fdc-4a6e-a2b4-3a5c2b91f3a4`
+- `/r ses_01HTXYZ3M8Q4V7D2KPB5AW9QWE`
+- `/R abc`
+- `/Resume some-provider-session-id`
 - `/New /Users/Wesley/MyProject`
 - `/Compact`
 - `/C`
@@ -82,6 +89,8 @@ And these are **not** treated as commands:
 - `-n`
 - `-c`
 
+> Note: a bare `/resume` (without an id) is still **recognized as a command**. The parser matches the command name and produces a localized usage reply (`Usage: /resume <provider-session-id> ...`); it is not treated as a normal chat message, and nothing reaches the core.
+
 > Note: `/new please` is a **valid** command. The parser treats everything after `/new` as the working directory argument, so `please` is interpreted as a relative directory. It is only rejected later if the path cannot be resolved (for example, a missing directory). Keep this in mind if you ever type `/new` followed by words that are not a path.
 
 ## Why exact-match only (except argument tails)
@@ -93,7 +102,7 @@ This avoids accidental command execution when users are just talking naturally, 
 - a command message, or
 - a normal user message
 
-Only `/new`/`/n` and `/model`/`/m` accept an argument tail. All other commands must match exactly.
+Only `/new`/`/n`, `/model`/`/m` and `/resume`/`/r` accept an argument tail. All other commands must match exactly.
 
 ## Runtime behavior
 
@@ -185,6 +194,32 @@ A user-supplied working directory can point anywhere the agent-bridge process ca
 
 See [`docs/pi-coding-agent.md`](./pi-coding-agent.md) and [`docs/opencode.md`](./opencode.md) for backend-specific details.
 
+### `/resume`
+
+`/resume <provider-session-id>` and `/r <provider-session-id>` **adopt** an existing provider session (for example one created earlier in the pi or OpenCode TUI) into the current chat: the agent context and the working directory are fully restored from the adopted session, and later messages in this chat continue that same provider session.
+
+- **Where to get the id**: from `/status`, which shows the current session's provider session id. In pi it is a uuid (sessions created by the bridge use a `pi-coding-agent.<uuid>` id); in OpenCode it is a `ses_*` id.
+- **Zero-validation pass-through**: neither the parser nor `GatewayCore` validates the id. The trimmed string is forwarded verbatim to the agent adapter, which resolves it through the agent backend. An invalid or unknown id is therefore reported by the agent backend as a normal failure reply, and nothing changes.
+- **Transactional like `/new`**: the adopting session is created and started **before** the previous session is stopped. If the resume fails — the id does not exist, the session's working directory is gone, or it is outside the configured allowlist — the previous session, its binding, and its running agent stay untouched.
+- **`/new` memory is unaffected**: resuming a session does not touch the chat's remembered `/new` working directory. A later bare `/new` still targets the directory the user last chose with `/new <path>`.
+
+On success the user receives a confirmation reply that names the restored working directory:
+
+```text
+Resumed session `<provider-session-id>` (working directory: /Users/wesley/project-a).
+```
+
+#### Allowlist
+
+The adopted session's working directory is treated as **user-sourced**: when `defaults.allowedWorkingDirectoryRoots` is configured, the restored directory is checked against it exactly like an explicit `/new <path>`. With no roots configured, the resume is permitted. The check happens before the adopted session starts, so an out-of-allowlist session fails the whole transaction instead of half-starting.
+
+#### Backend adoption mechanics
+
+- **PI Coding Agent**: the adapter locates the session's `jsonl` file by the original id string (exact or prefix match, ambiguity is rejected), reads the file header to recover the real `cwd` and session id, then spawns pi with `--session <absolute file path>` and deliberately never passes `--session-id` (pi would silently create an empty same-id session when it cannot find the id). Subsequent writes continue on the original session file, so the TUI and the bridge can operate on the same session one after the other.
+- **OpenCode**: the adapter verifies that the id (with the optional `opencode:` prefix stripped, so it can be copied from `/status` verbatim) names an existing session via the server's `session.get`, then adopts that session id directly. OpenCode keeps its own session directory on the server side; the bridge-side directory only affects the runtime/cache key.
+
+A provider session cannot be driven by two live adapters at once: an already-active session of the same backend is rejected for adoption instead of being taken over.
+
 ### `/compact`
 
 `/compact` and `/c` send a compact request to the current active agent session.
@@ -253,6 +288,7 @@ This help text currently lists:
 - `/stop` (`/s`)
 - `/status` (`/st`)
 - `/model` (`/m`)
+- `/resume <id>` (`/r <id>`)
 - `/help` (`/h`)
 
 Because this is local client-side help, it does **not** create an agent session, does **not** send anything to `GatewayCore`, and does **not** invoke the agent.

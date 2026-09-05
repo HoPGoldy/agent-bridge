@@ -1,6 +1,6 @@
 import path from "node:path";
 import { fileURLToPath } from "node:url";
-import type { Event, FilePart, Message, Part, ToolPart } from "@opencode-ai/sdk/v2/types";
+import type { Event, FilePart, Message, Part, Session, ToolPart } from "@opencode-ai/sdk/v2/types";
 import { createLogger, type Logger } from "../../../../core/logger";
 import { extractMediaMarkers, MEDIA_CONVENTION_PROMPT } from "../../media-convention";
 import type {
@@ -107,6 +107,14 @@ export interface OpenCodeAgentAdapterOptions {
   sessionState:
     | NewAgentSessionStateApi<OpenCodeAgentSessionStateV1>
     | AgentSessionStateApi<OpenCodeAgentSessionStateV1>;
+  /**
+   * Raw provider session id to adopt (`/resume <id>`, create mode only):
+   * verified on the OpenCode Server with `session.get` and adopted as-is —
+   * no new provider session is created. An optional `opencode:` prefix is
+   * stripped so a bridge agentSessionId copied verbatim from `/status` also
+   * resolves. The raw string is never otherwise re-validated here.
+   */
+  providerSessionId?: string;
   /** Channel-level OpenCode configuration. Never mutated. */
   config: OpenCodeAgentConfig;
   /**
@@ -149,10 +157,18 @@ export interface OpenCodeAgentAdapterOptions {
    * so sessions on the same server + directory share one SSE subscription.
    */
   getRuntime: (channelName: string, config: OpenCodeAgentConfig) => OpenCodeRuntime;
+  /**
+   * Fails when the exact target provider session is already adopted by a live
+   * adapter of this process, across every same-Server runtime (adopt spec
+   * decision 7). Checked with the normalized id, right before registration.
+   */
+  assertSessionAvailable?: (channelName: string, config: OpenCodeAgentConfig, sessionId: string) => void;
   logger?: Logger;
 }
 
 export class OpenCodeAgentAdapter implements AgentAdapter, OpenCodeRuntimeAdapter {
+  /** Public bridge session id; surfaced for the runtime registry's conflict messages. */
+  readonly agentSessionId: string;
   readonly #agentSessionId: string;
   readonly #handle:
     | { mode: "create"; sessionState: NewAgentSessionStateApi<OpenCodeAgentSessionStateV1> }
@@ -163,7 +179,13 @@ export class OpenCodeAgentAdapter implements AgentAdapter, OpenCodeRuntimeAdapte
   readonly #workingDirectory?: string;
   readonly #workingDirectorySource?: "user" | "default";
   readonly #allowedWorkingDirectoryRoots?: string[];
+  readonly #providerSessionId?: string;
   readonly #getRuntime: (channelName: string, config: OpenCodeAgentConfig) => OpenCodeRuntime;
+  readonly #assertSessionAvailable?: (
+    channelName: string,
+    config: OpenCodeAgentConfig,
+    sessionId: string,
+  ) => void;
   readonly #logger: Logger;
   /** Directory-scoped runtime selected during start(); set before any API call. */
   #runtime: OpenCodeRuntime | null = null;
@@ -179,6 +201,8 @@ export class OpenCodeAgentAdapter implements AgentAdapter, OpenCodeRuntimeAdapte
     resolve(value: boolean): void;
   };
   #model?: SelectedModel;
+  /** Effective working directory resolved by start(); surfaced via getWorkingDirectory(). */
+  #resolvedWorkingDirectory: string | undefined;
   #assistantMessageIds = new Set<string>();
   #ignoredMessageIds = new Set<string>();
   #messages = new Map<string, MessageBuffer>();
@@ -189,6 +213,7 @@ export class OpenCodeAgentAdapter implements AgentAdapter, OpenCodeRuntimeAdapte
 
   constructor(options: OpenCodeAgentAdapterOptions) {
     this.#agentSessionId = options.agentSessionId;
+    this.agentSessionId = options.agentSessionId;
     // The module guarantees the pairing: a reserved handle in create mode, an
     // opened handle in resume mode. The branch narrows the union for the rest
     // of the class while keeping the handle truly scoped.
@@ -208,7 +233,22 @@ export class OpenCodeAgentAdapter implements AgentAdapter, OpenCodeRuntimeAdapte
     this.#workingDirectory = options.workingDirectory;
     this.#workingDirectorySource = options.workingDirectorySource;
     this.#allowedWorkingDirectoryRoots = options.allowedWorkingDirectoryRoots;
+    this.#providerSessionId = options.providerSessionId;
+    // Defensive (adopt spec): the pairing mirrors the pi adapter — adopting is
+    // a create-lifecycle concern, and a provider id fully replaces any
+    // requested working directory.
+    if (options.mode === "resume" && options.providerSessionId !== undefined) {
+      throw new Error("providerSessionId is only valid in create mode");
+    }
+    if (
+      options.mode === "create" &&
+      options.providerSessionId !== undefined &&
+      options.workingDirectory !== undefined
+    ) {
+      throw new Error("providerSessionId and workingDirectory are mutually exclusive");
+    }
     this.#getRuntime = options.getRuntime;
+    this.#assertSessionAvailable = options.assertSessionAvailable;
     this.#logger = options.logger ?? createLogger("opencode-agent");
   }
 
@@ -257,13 +297,13 @@ export class OpenCodeAgentAdapter implements AgentAdapter, OpenCodeRuntimeAdapte
 
   /**
    * Create lifecycle: resolve the working-directory policy, select the
-   * directory-scoped runtime, create the OpenCode provider session, initialize
-   * the persisted state record, then set the provider session/model and
-   * register the runtime. Any failure before `register` leaves the runtime
-   * unregistered and the reserved record uninitialized (the gateway deletes
-   * it); a provider session created before a later failure cannot be deleted
-   * through the OpenCode API (there is none) and is a documented residual
-   * orphan on the server.
+   * directory-scoped runtime, create the OpenCode provider session (or adopt
+   * an existing one via `providerSessionId`), initialize the persisted state
+   * record, then set the provider session/model and register the runtime. Any
+   * failure before `register` leaves the runtime unregistered and the reserved
+   * record uninitialized (the gateway deletes it); a provider session created
+   * before a later failure cannot be deleted through the OpenCode API (there
+   * is none) and is a documented residual orphan on the server.
    */
   async #startCreate(): Promise<void> {
     if (this.#handle.mode !== "create") {
@@ -271,6 +311,7 @@ export class OpenCodeAgentAdapter implements AgentAdapter, OpenCodeRuntimeAdapte
     }
     const { sessionState } = this.#handle;
     const { directory, source } = this.#resolveCreateDirectory();
+    this.#resolvedWorkingDirectory = directory;
     // The effective model is the per-task override when present, else the
     // channel config model — createSession, state init and
     // currentModelFromSessionData all observe the same effective value.
@@ -281,6 +322,10 @@ export class OpenCodeAgentAdapter implements AgentAdapter, OpenCodeRuntimeAdapte
     };
     const runtime = this.#getRuntime(this.#channelName, effective);
     this.#runtime = runtime;
+    if (this.#providerSessionId !== undefined) {
+      await this.#startCreateAdopt(sessionState, runtime, effective, directory, source);
+      return;
+    }
     const session = await runtime.api.createSession({
       title: `agent-bridge:${this.#channelName}`,
       agent: effective.agent,
@@ -296,6 +341,54 @@ export class OpenCodeAgentAdapter implements AgentAdapter, OpenCodeRuntimeAdapte
       workingDirectorySource: source,
     });
     this.#openCodeSessionId = session.id;
+    this.#model = currentModelFromSessionData(session, [], effective.model);
+    await runtime.register(this);
+  }
+
+  /**
+   * Adopt branch of the create lifecycle (`/resume <id>`, resume-command
+   * decision 4): the raw provider id is only resolved/verified by the server
+   * itself — `session.get` must name an existing session, otherwise the
+   * create fails with the original input in the message (the gateway renders
+   * the standard failure reply). A new provider session is never created and
+   * the state initializes with the adopted id directly. The working directory
+   * is the channel-configured one (or the bridge cwd): the session's real
+   * directory lives on the server, the bridge-side value only keys the
+   * runtime/SSE cache, so no session state directory is written beyond it.
+   */
+  async #startCreateAdopt(
+    sessionState: NewAgentSessionStateApi<OpenCodeAgentSessionStateV1>,
+    runtime: OpenCodeRuntime,
+    effective: OpenCodeAgentConfig,
+    directory: string,
+    source: OpenCodeWorkingDirectorySource,
+  ): Promise<void> {
+    const raw = this.#providerSessionId!;
+    // Users copy the bridge agentSessionId verbatim from `/status`; strip the
+    // optional prefix so both forms address the same provider session.
+    const sessionId = raw.startsWith("opencode:") ? raw.slice("opencode:".length) : raw;
+    if (sessionId.length === 0) {
+      throw new Error(`provider session "${raw}" does not name an existing OpenCode session`);
+    }
+    let session: Session;
+    try {
+      session = await runtime.api.getSession(sessionId);
+    } catch (error) {
+      const detail = error instanceof Error ? error.message : String(error);
+      throw new Error(
+        `provider session "${raw}" does not name an existing OpenCode session: ${detail}`,
+      );
+    }
+    // Precise occupancy check (decision 7): only the exact target session is
+    // protected — unrelated live sessions on sibling directories coexist.
+    this.#assertSessionAvailable?.(this.#channelName, effective, sessionId);
+    await sessionState.initialize({
+      version: 1,
+      openCodeSessionId: sessionId,
+      workingDirectory: directory,
+      workingDirectorySource: source,
+    });
+    this.#openCodeSessionId = sessionId;
     this.#model = currentModelFromSessionData(session, [], effective.model);
     await runtime.register(this);
   }
@@ -327,6 +420,7 @@ export class OpenCodeAgentAdapter implements AgentAdapter, OpenCodeRuntimeAdapte
       runtime.api.getMessages(state.openCodeSessionId, 50),
     ]);
     this.#openCodeSessionId = state.openCodeSessionId;
+    this.#resolvedWorkingDirectory = state.workingDirectory;
     this.#model = currentModelFromSessionData(session, messages, effective.model);
     if (state.migratedFromBinding) {
       // First successful resume rewrites a legacy binding-migrated record into
@@ -400,6 +494,17 @@ export class OpenCodeAgentAdapter implements AgentAdapter, OpenCodeRuntimeAdapte
       workingDirectory,
       workingDirectorySource,
     };
+  }
+
+  /**
+   * Best-effort effective working directory of this session (AgentAdapter
+   * contract): the value resolved during start() — the requested or
+   * channel-configured directory on create/adopt, the persisted directory on
+   * resume. Never re-read from the server; unknown only before a completed
+   * start(), which the gateway treats as a directory-less confirmation.
+   */
+  async getWorkingDirectory(): Promise<string | undefined> {
+    return this.#resolvedWorkingDirectory;
   }
 
   async stop(): Promise<void> {

@@ -28,6 +28,15 @@ export interface PiCodingAgentSessionStateV1 {
    */
   workingDirectorySource: "default" | "user";
   /**
+   * Canonical absolute path of the adopted provider session jsonl file
+   * (`/resume` only). Present → every spawn continues that exact file with
+   * `--session <path>` (never `--session-id`, which would silently create a
+   * same-id empty session when the id is unknown). Absent on regular
+   * sessions; decode stays fully compatible with records written before the
+   * field existed (codec currentVersion stays 1).
+   */
+  sessionFile?: string;
+  /**
    * Decode-only marker set while the persisted record is still the legacy
    * binding-migrated form (`{ migratedFromBinding: true }`). The adapter
    * rewrites the record to the canonical V1 shape on the first resume; encode
@@ -44,6 +53,23 @@ function workingDirectoryOf(raw: Record<string, unknown>): string | undefined {
   return typeof raw.workingDirectory === "string" && raw.workingDirectory.length > 0
     ? raw.workingDirectory
     : undefined;
+}
+
+/**
+ * Optional field: absent stays absent (old records decode byte-identically),
+ * present must be a non-empty string. No path normalization here — the
+ * adapter canonicalizes and the field is only ever written from an already
+ * canonicalized locator result.
+ */
+const invalidSessionFile = Symbol("invalid-session-file");
+function sessionFileOf(raw: Record<string, unknown>): string | undefined | typeof invalidSessionFile {
+  if (!("sessionFile" in raw) || raw.sessionFile === undefined) {
+    return undefined;
+  }
+  if (typeof raw.sessionFile === "string" && raw.sessionFile.length > 0) {
+    return raw.sessionFile;
+  }
+  return invalidSessionFile;
 }
 
 /**
@@ -71,10 +97,15 @@ export const piCodingAgentSessionStateCodec: AgentSessionStateCodec<PiCodingAgen
         throw new Error(`unsupported Pi agent session state version ${stateVersion}`);
       }
       const workingDirectory = workingDirectoryOf(raw);
+      const sessionFile = sessionFileOf(raw);
+      if (sessionFile === invalidSessionFile) {
+        throw new Error('invalid Pi agent session state: sessionFile must be a non-empty string');
+      }
       return {
         version: 1,
         workingDirectory: workingDirectory ?? process.cwd(),
         workingDirectorySource: workingDirectory !== undefined ? "user" : "default",
+        ...(sessionFile !== undefined ? { sessionFile } : {}),
         migratedFromBinding: true,
       };
     }
@@ -95,7 +126,16 @@ export const piCodingAgentSessionStateCodec: AgentSessionStateCodec<PiCodingAgen
         'invalid Pi agent session state: workingDirectorySource must be "default" or "user"',
       );
     }
-    return { version: 1, workingDirectory, workingDirectorySource: source };
+    const sessionFile = sessionFileOf(raw);
+    if (sessionFile === invalidSessionFile) {
+      throw new Error('invalid Pi agent session state: sessionFile must be a non-empty string');
+    }
+    return {
+      version: 1,
+      workingDirectory,
+      workingDirectorySource: source,
+      ...(sessionFile !== undefined ? { sessionFile } : {}),
+    };
   },
 
   encode(state) {
@@ -114,10 +154,16 @@ export const piCodingAgentSessionStateCodec: AgentSessionStateCodec<PiCodingAgen
         'invalid Pi agent session state: workingDirectorySource must be "default" or "user"',
       );
     }
+    if (state.sessionFile !== undefined && (typeof state.sessionFile !== "string" || state.sessionFile.length === 0)) {
+      throw new Error('invalid Pi agent session state: sessionFile must be a non-empty string');
+    }
     return {
       version: 1,
       workingDirectory: state.workingDirectory,
       workingDirectorySource: state.workingDirectorySource,
+      // Optional field: never persist an explicit undefined, so records stay
+      // byte-comparable across old and new writers.
+      ...(state.sessionFile !== undefined ? { sessionFile: state.sessionFile } : {}),
     };
   },
 };
@@ -144,6 +190,8 @@ function buildAdapterOptions(
      * resolved with precedence override > channel config > env/adapter default.
      */
     model?: string;
+    /** Existing provider session jsonl file to adopt (`/resume` only). */
+    providerSessionId?: string;
   },
 ): PiCodingAgentAdapterOptions {
   return {
@@ -156,6 +204,9 @@ function buildAdapterOptions(
       : {}),
     ...(options.allowedWorkingDirectoryRoots !== undefined
       ? { allowedWorkingDirectoryRoots: options.allowedWorkingDirectoryRoots }
+      : {}),
+    ...(options.providerSessionId !== undefined
+      ? { providerSessionId: options.providerSessionId }
       : {}),
     sessionDir:
       config.sessionDir ??
@@ -203,7 +254,10 @@ export const piCodingAgentModule: AgentModule<PiCodingAgentConfig, PiCodingAgent
   sessionStateCodec: piCodingAgentSessionStateCodec,
   createConfigCollector: createPiCodingAgentConfigCollector,
 
-  async createAgentSession({ config, common, agentSessionId, sessionState, workingDirectory, workingDirectorySource, allowedWorkingDirectoryRoots, model }) {
+  async createAgentSession({ config, common, agentSessionId, sessionState, workingDirectory, workingDirectorySource, allowedWorkingDirectoryRoots, model, providerSessionId }) {
+    if (providerSessionId !== undefined) {
+      logger.info(`adopting provider session "${providerSessionId}" as ${agentSessionId} for channel ${common.channelName}`);
+    }
     logger.info(`creating agent session ${agentSessionId} for channel ${common.channelName}`);
     return new PiCodingAgentAdapter(
       buildAdapterOptions(config, agentSessionId, sessionState, {
@@ -212,6 +266,7 @@ export const piCodingAgentModule: AgentModule<PiCodingAgentConfig, PiCodingAgent
         workingDirectorySource,
         allowedWorkingDirectoryRoots,
         model,
+        providerSessionId,
       }),
     );
   },

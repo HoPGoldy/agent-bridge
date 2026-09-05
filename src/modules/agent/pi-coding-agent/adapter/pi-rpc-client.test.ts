@@ -91,4 +91,42 @@ describe("PiRpcClient", () => {
       expect.objectContaining({ cwd }),
     );
   });
+
+  it("spawns with --session-id by default", async () => {
+    const client = new PiRpcClient({
+      agentSessionId: "agent-1",
+      piSessionId: "pi-agent-1",
+      cwd: "/tmp/x",
+      sessionDir,
+    });
+
+    vi.mocked(spawn).mockReturnValue(createFakeChild() as never);
+    await client.start();
+
+    const args = vi.mocked(spawn).mock.calls[0]?.[1] ?? [];
+    expect(args).toContain("--session-id");
+    expect(args[args.indexOf("--session-id") + 1]).toBe("pi-agent-1");
+    expect(args).not.toContain("--session");
+  });
+
+  it("spawns with --session <file> and never --session-id when a session file is given", async () => {
+    const sessionFile = path.join(sessionDir, "2026-01-01T00-00-00-000Z_ext-abc.jsonl");
+    const client = new PiRpcClient({
+      agentSessionId: "agent-1",
+      piSessionId: "pi-agent-1",
+      cwd: "/tmp/x",
+      sessionDir,
+      sessionFile,
+    });
+
+    vi.mocked(spawn).mockReturnValue(createFakeChild() as never);
+    await client.start();
+
+    const args = vi.mocked(spawn).mock.calls[0]?.[1] ?? [];
+    expect(args).toContain("--session");
+    // The file form must win exclusively: pi creates a same-id empty session
+    // when --session-id is combined or names an unknown session (context §3.3).
+    expect(args[args.indexOf("--session") + 1]).toBe(sessionFile);
+    expect(args).not.toContain("--session-id");
+  });
 });

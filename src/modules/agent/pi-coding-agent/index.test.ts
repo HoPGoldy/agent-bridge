@@ -410,6 +410,68 @@ describe("Pi coding agent session state codec", () => {
     });
   });
 
+  it("encodes an adopted state with an optional sessionFile and round-trips it", () => {
+    const state: PiCodingAgentSessionStateV1 = {
+      version: 1,
+      workingDirectory: "/workspace/project",
+      workingDirectorySource: "user",
+      sessionFile: "/home/test/.config/agent-bridge/pi-sessions/2026-01-01T00-00-00-000Z_abc.jsonl",
+    };
+    const encoded = codec.encode(state);
+    expect(encoded).toEqual(state);
+    expect(codec.decode(encoded, 1, { agentSessionId: "pi-coding-agent:x" })).toEqual(state);
+  });
+
+  it("decode of an old record without sessionFile stays byte-identical and omits the field", () => {
+    const decoded = codec.decode(
+      { version: 1, workingDirectory: "/a", workingDirectorySource: "user" },
+      1,
+      { agentSessionId: "pi-coding-agent:x" },
+    );
+    expect(decoded).toEqual({
+      version: 1,
+      workingDirectory: "/a",
+      workingDirectorySource: "user",
+    });
+    expect("sessionFile" in decoded).toBe(false);
+    expect(codec.encode(decoded)).toEqual({
+      version: 1,
+      workingDirectory: "/a",
+      workingDirectorySource: "user",
+    });
+  });
+
+  it("rejects a malformed sessionFile field on decode and on encode", () => {
+    expect(() =>
+      codec.decode({ version: 1, workingDirectory: "/a", workingDirectorySource: "user", sessionFile: "" }, 1, {
+        agentSessionId: "pi-coding-agent:x",
+      }),
+    ).toThrow(/sessionFile must be a non-empty string/);
+    expect(() =>
+      codec.decode({ version: 1, workingDirectory: "/a", workingDirectorySource: "user", sessionFile: 5 }, 1, {
+        agentSessionId: "pi-coding-agent:x",
+      }),
+    ).toThrow(/sessionFile must be a non-empty string/);
+    expect(() =>
+      codec.encode({ version: 1, workingDirectory: "/a", workingDirectorySource: "user", sessionFile: "" } as never),
+    ).toThrow(/sessionFile must be a non-empty string/);
+  });
+
+  it("keeps sessionFile when decoding a legacy migrated record that carries it", () => {
+    const decoded = codec.decode(
+      { migratedFromBinding: true, workingDirectory: "/workspace/legacy", sessionFile: "/sf.jsonl" },
+      1,
+      { agentSessionId: "pi-coding-agent:x" },
+    );
+    expect(decoded).toEqual({
+      version: 1,
+      workingDirectory: "/workspace/legacy",
+      workingDirectorySource: "user",
+      sessionFile: "/sf.jsonl",
+      migratedFromBinding: true,
+    });
+  });
+
   it("encode never persists the decode-only migration marker", () => {
     const encoded = codec.encode({
       version: 1,

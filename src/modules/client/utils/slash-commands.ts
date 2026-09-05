@@ -150,6 +150,43 @@ function parseScheduleHereCommand(
 }
 
 /**
+ * Adapter-local usage error for `/resume` without a provider session id:
+ * the adapter replies with a localized usage hint; nothing reaches the core.
+ */
+export interface SessionResumeUsageCommand {
+  type: "command.session.resume.usage";
+  clientSessionId: string;
+}
+
+/**
+ * `/resume <provider-session-id>` (`/r <id>`, case-insensitive): adopts an
+ * existing provider session into this chat. The id is passed through
+ * verbatim after trimming — the parser deliberately does not validate its
+ * format (decision 4 of the `/resume` spec); only the agent backend can
+ * decide whether it names an existing session.
+ */
+function parseResumeCommand(
+  text: string,
+  clientSessionId: string,
+): Extract<ParsedSlashCommand, { type: "command.session.resume" }> | SessionResumeUsageCommand | null {
+  const match = text.match(/^\/(resume|r)(?:\s+(.*))?$/i);
+  if (!match) {
+    return null;
+  }
+
+  const providerSessionId = match[2]?.trim();
+  if (!providerSessionId) {
+    return { type: "command.session.resume.usage", clientSessionId };
+  }
+
+  return {
+    type: "command.session.resume",
+    clientSessionId,
+    providerSessionId,
+  };
+}
+
+/**
  * Result of syntactic slash-command parsing. Identical to
  * {@link ClientOutputEvent} except that a parsed `command.session.new` still
  * has an optional, unresolved `workingDirectory` (exactly what the user
@@ -162,14 +199,20 @@ export type ParsedSlashCommand =
       clientSessionId: string;
       workingDirectory?: string;
     }
-  | Exclude<ClientOutputEvent, { type: "command.session.new" }>;
+  | Exclude<ClientOutputEvent, { type: "command.session.new" | "command.session.resume" }>
+  | {
+      type: "command.session.resume";
+      clientSessionId: string;
+      providerSessionId: string;
+    };
 
 /**
  * Parses a trimmed inbound text as one of the standard agent-bridge slash
- * commands (`/new [path]`, `/n [path]`, `/compact`, `/c`, `/stop`, `/s`, `/status`, `/st`, `/model`, `/m`, `/schedule-run <name>`, `/schedule-here <name>`) and returns the
+ * commands (`/new [path]`, `/n [path]`, `/resume <id>`, `/r <id>`, `/compact`, `/c`, `/stop`, `/s`, `/status`, `/st`, `/model`, `/m`, `/schedule-run <name>`, `/schedule-here <name>`) and returns the
  * corresponding {@link ParsedSlashCommand} (or an adapter-local
  * {@link ScheduleRunCommand}/{@link ScheduleRunUsageCommand}/
- * {@link ScheduleHereCommand}/{@link ScheduleHereUsageCommand}), or `null` if
+ * {@link ScheduleHereCommand}/{@link ScheduleHereUsageCommand}/
+ * {@link SessionResumeUsageCommand}), or `null` if
  * `text` is not a recognized command and should be treated as a regular user
  * message.
  */
@@ -182,6 +225,7 @@ export function parseSlashCommand(
   | ScheduleRunUsageCommand
   | ScheduleHereCommand
   | ScheduleHereUsageCommand
+  | SessionResumeUsageCommand
   | null {
   // `/schedule-run` and `/schedule-here` are handled entirely by the adapter
   // (spec D7a/D7): they never go through `resolveSlashCommandEvent` nor reach
@@ -199,6 +243,11 @@ export function parseSlashCommand(
   const newCommand = parseNewCommand(text, clientSessionId);
   if (newCommand) {
     return newCommand;
+  }
+
+  const resumeCommand = parseResumeCommand(text, clientSessionId);
+  if (resumeCommand) {
+    return resumeCommand;
   }
 
   const modelCommand = parseModelCommand(text, clientSessionId);
@@ -388,7 +437,12 @@ export function formatScheduleHereReply(
  * working directory (explicit argument, remembered chat default, or the
  * process cwd fallback) and its trust classification; an invalid directory
  * yields an {@link InvalidWorkingDirectoryReply} instead of an event. Every
- * other command passes through unchanged.
+ * other command passes through unchanged — including
+ * `command.session.resume`, whose provider session id needs no client-side
+ * resolution. The adapter-local `command.session.resume.usage` variant is
+ * deliberately not part of this contract: client adapters must intercept it
+ * BEFORE calling this function (reply with `client.resumeUsage` locally;
+ * nothing reaches the core).
  */
 export async function resolveSlashCommandEvent(
   parsed: ParsedSlashCommand,

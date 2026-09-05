@@ -4,6 +4,12 @@ import type { OpenCodeApi } from "./opencode-api";
 
 export interface OpenCodeRuntimeAdapter {
   readonly openCodeSessionId: string;
+  /**
+   * Bridge agent session id of the adapter, used purely for error messages
+   * (which live bridge session already holds a provider session). Optional for
+   * backwards compatibility with bare runtime test fakes.
+   */
+  readonly agentSessionId?: string;
   handleOpenCodeEvent(event: Event): Promise<void>;
 }
 
@@ -59,10 +65,27 @@ export class OpenCodeRuntime {
     return this.#api;
   }
 
+  /**
+   * Precise occupancy query (adopt spec decision 7): fails only when the
+   * exact provider session is already registered by a live adapter of this
+   * runtime — unrelated live sessions never block an adoption. `register`
+   * remains the final authoritative check.
+   */
+  assertSessionAvailable(sessionID: string): void {
+    const existing = this.#adapters.get(sessionID);
+    if (existing) {
+      throw new Error(
+        `provider session "${sessionID}" is already adopted by live agent session ${existing.agentSessionId ?? "(unknown)"}`,
+      );
+    }
+  }
+
   async register(adapter: OpenCodeRuntimeAdapter): Promise<void> {
     const existing = this.#adapters.get(adapter.openCodeSessionId);
     if (existing && existing !== adapter) {
-      throw new Error(`OpenCode session is already registered: ${adapter.openCodeSessionId}`);
+      throw new Error(
+        `provider session "${adapter.openCodeSessionId}" is already adopted by live agent session ${existing.agentSessionId ?? "(unknown)"}`,
+      );
     }
     this.#adapters.set(adapter.openCodeSessionId, adapter);
 

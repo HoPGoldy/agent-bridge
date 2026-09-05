@@ -90,6 +90,8 @@ Architecture overview: [`docs/architecture-design.md`](./docs/architecture-desig
 
 Command usage across IM adapters: [`docs/command-system.md`](./docs/command-system.md)
 
+You can also **adopt an existing provider session** (for example one from the pi or OpenCode TUI) into a chat with `/resume <provider-session-id>` (`/r`): the agent context and working directory are fully restored and later messages continue that session. See [`docs/command-system.md`](./docs/command-system.md).
+
 Scheduled tasks (cron-style agent sessions with file-based prompts): [`docs/scheduled-tasks.md`](./docs/scheduled-tasks.md)
 
 Event queues (FIFO agent task queues with file-based prompts, worker concurrency and chat-bound result delivery): [`docs/event-queue.md`](./docs/event-queue.md)

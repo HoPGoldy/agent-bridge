@@ -1208,4 +1208,33 @@ describe("FeishuIMAdapter", () => {
       warnSpy.mockRestore();
     }
   });
+
+  it("replies with the local resume usage hint on a bare /resume without emitting an event", async () => {
+    const adapter = new FeishuIMAdapter(
+      {
+        appId: "cli_xxx",
+        appSecret: "secret",
+        requireMentionInGroup: true,
+      },
+      createLogger("test"),
+    );
+    const onOutput = vi.fn(async (_event: ClientOutputEvent) => {});
+
+    await adapter.start(onOutput);
+    await fakeClientState.onMessage?.({
+      chatId: "oc_dm",
+      chatType: "p2p",
+      messageId: "msg-resume-usage",
+      text: "/resume",
+      mentionedBot: false,
+    });
+
+    expect(onOutput).not.toHaveBeenCalled();
+    expect(fakeClientState.sendText).toHaveBeenCalledWith(
+      "oc_dm",
+      expect.stringContaining("Usage: `/resume <provider-session-id>`"),
+      "msg-resume-usage",
+    );
+    expect(fakeClientState.stopTyping).toHaveBeenCalledWith("oc_dm");
+  });
 });

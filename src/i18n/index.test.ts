@@ -13,16 +13,44 @@ describe("i18n", () => {
     expect(en("client.helpMessage")).toContain("/new [path]");
     expect(en("client.helpMessage")).toContain("/n [path]");
     expect(en("client.helpMessage")).toContain("/new /path/to/project");
+    expect(en("client.helpMessage")).toContain("/resume <id>");
+    expect(en("client.helpMessage")).toContain("/r <id>");
     expect(zh("client.helpMessage")).toContain("查看这条帮助信息");
     expect(zh("client.helpMessage")).toContain("切换模型");
     expect(zh("client.helpMessage")).toContain("/new [path]");
     expect(zh("client.helpMessage")).toContain("/n [path]");
     expect(zh("client.helpMessage")).toContain("/new /path/to/project");
+    expect(zh("client.helpMessage")).toContain("/resume <id>");
+    expect(zh("client.helpMessage")).toContain("/r <id>");
     expect(en("gateway.failedToResumeSession", { detail: "boom" })).toBe(
       "Failed to resume the agent session: boom\nStart a new session with `/new`.",
     );
     expect(zh("gateway.failedToResumeSession", { detail: "boom" })).toBe(
       "恢复智能体会话失败：boom\n请使用 `/new` 开始新会话。",
+    );
+    expect(en("client.resumeUsage")).toBe(
+      "Usage: `/resume <provider-session-id>` — adopt an existing provider session (get the id from `/status`).",
+    );
+    expect(zh("client.resumeUsage")).toBe(
+      "用法：`/resume <provider 会话 ID>` —— 接管一个已有的 provider 会话（ID 可通过 `/status` 查看）。",
+    );
+    expect(
+      en("gateway.resumedSession", { sessionId: "ses_1", workingDirectory: "/w" }),
+    ).toBe('Resumed session `ses_1` (working directory: /w).');
+    expect(
+      zh("gateway.resumedSession", { sessionId: "ses_1", workingDirectory: "/w" }),
+    ).toBe("已接管会话 `ses_1`（工作目录：/w）。",);
+    expect(en("gateway.resumedSessionWithoutDirectory", { sessionId: "ses_1" })).toBe(
+      "Resumed session `ses_1`.",
+    );
+    expect(zh("gateway.resumedSessionWithoutDirectory", { sessionId: "ses_1" })).toBe(
+      "已接管会话 `ses_1`。",
+    );
+    expect(en("gateway.failedToResumeNewSession", { detail: "boom" })).toBe(
+      "Failed to adopt the provider session: boom",
+    );
+    expect(zh("gateway.failedToResumeNewSession", { detail: "boom" })).toBe(
+      "接管 provider 会话失败：boom",
     );
     expect(en("queue.taskCompletedSuffix", { queue: "q", path: "/p/q.md" })).toBe(
       '*Queue "q" task completed · full output: /p/q.md*',

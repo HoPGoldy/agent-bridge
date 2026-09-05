@@ -32,6 +32,18 @@ export type ClientOutputEvent =
       model?: string;
     }
   | {
+      type: "command.session.resume";
+      clientSessionId: string;
+      /**
+       * Provider-native session id to adopt, passed through verbatim (trimmed
+       * by the parser, never validated): only the agent backend can decide
+       * whether it names an existing session. Coming from the `/resume` chat
+       * command only — `/new`, implicit creation, schedule and queue runs
+       * never set it.
+       */
+      providerSessionId: string;
+    }
+  | {
       type: "command.session.compact";
       clientSessionId: string;
     }
@@ -189,6 +201,13 @@ export interface AgentAdapter {
   getStatus?(): Promise<AgentSessionStatus>;
   getAvailableModels?(): Promise<AgentAvailableModel[]>;
   setModel?(target: string): Promise<{ provider: string; modelId: string }>;
+  /**
+   * Best-effort working directory of the session, used by the core to render
+   * the `/resume` confirmation. Optional: when absent, undefined or throwing,
+   * the reply simply omits the directory. Should be a best-effort read of
+   * already-known state, never a blocking operation.
+   */
+  getWorkingDirectory?(): Promise<string | undefined>;
   input(event: AgentInputEvent): Promise<void>;
 }
 
@@ -357,6 +376,15 @@ export interface AgentModule<TConfig = unknown, TState extends object = Record<s
      * never resume.
      */
     model?: string;
+    /**
+     * Provider-native session id to adopt (`/resume <id>` only): the module
+     * creates a fresh bridge session whose state points at the given provider
+     * session. Only the resume command sets it — `/new`, implicitly created
+     * sessions, schedule and queue runs never do. The raw string is passed
+     * through unvalidated; the module/agent backend resolves it and fails the
+     * create when it does not name an existing session.
+     */
+    providerSessionId?: string;
   }): Promise<AgentAdapter>;
   /**
    * Restores an adapter for an existing persisted agent session from its

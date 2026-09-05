@@ -254,6 +254,10 @@ export class GatewayCore {
       );
     }
 
+    if (event.type === "command.session.resume") {
+      return this.#handleSessionResume(event.clientSessionId, event.providerSessionId);
+    }
+
     if (event.type === "command.session.compact") {
       await this.#handleSessionCompact(event.clientSessionId);
       return { ok: true };
@@ -699,6 +703,106 @@ export class GatewayCore {
     return { ok: true, agentSessionId: newRuntime.agentSessionId };
   }
 
+  /**
+   * `/resume <id>` (adopt spec): transactionally binds the chat to a new
+   * bridge session whose state points at the given provider session — same
+   * steps and failure semantics as {@link #handleSessionNew}: create and
+   * start the new runtime first, then commit the binding (dropping the old
+   * record when unreferenced), then stop the previous runtime. Any failure
+   * leaves the previous session, binding and runtime untouched, with a
+   * localized failure reply. The provider id is passed through to the module
+   * unvalidated: the agent backend resolves it and fails the create when it
+   * does not name an existing session.
+   */
+  async #handleSessionResume(
+    clientSessionId: string,
+    providerSessionId: string,
+  ): Promise<IngressResult> {
+    // Defensive (adopt spec): synthetic (`schedule:*` / `queue:*`) sessions
+    // have no reader that could send `/resume` — ignore rather than corrupt a
+    // controller-owned id with a real chat's session.
+    if (this.#isSyntheticClientSession(clientSessionId)) {
+      this.#logger.debug(`ignoring command.session.resume for synthetic session ${clientSessionId}`);
+      return { ok: true };
+    }
+
+    // Transactional switch, mirroring #handleSessionNew: create first so a
+    // failed creation never tears down the previous session. The provider
+    // id is passed explicitly with this create call — no shared state, so
+    // concurrent ingresses (a scheduler fire racing this resume) can never
+    // see or steal it.
+    let newRuntime: AgentRuntime;
+    try {
+      newRuntime = await this.#createRuntimeForClient(clientSessionId, { providerSessionId });
+    } catch (error) {
+      const detail = error instanceof Error ? error.message : String(error);
+      this.#logger.error(`failed to resume provider session for ${clientSessionId}:`, error);
+      await this.#deliverClientInput({
+        type: "assistant.message",
+        clientSessionId,
+        text: this.#t("gateway.failedToResumeNewSession", { detail }),
+      });
+      return { ok: false, reason: detail };
+    }
+
+    const previousAgentSessionId = this.#clientToAgentSession.get(clientSessionId);
+    try {
+      // Same commit semantics as /new: durable binding (plus old-record
+      // drop) before stopping the previous runtime, so the adopted session
+      // is authoritative even if the old stop throws.
+      await this.#switchClientToAgent(clientSessionId, newRuntime.agentSessionId, previousAgentSessionId);
+    } catch (error) {
+      const detail = error instanceof Error ? error.message : String(error);
+      this.#logger.error(`failed to persist the resumed binding for ${clientSessionId}:`, error);
+      await this.#cleanupNewRuntime(newRuntime);
+      await this.#deliverClientInput({
+        type: "assistant.message",
+        clientSessionId,
+        text: this.#t("gateway.failedToResumeNewSession", { detail }),
+      });
+      return { ok: false, reason: detail };
+    }
+
+    if (previousAgentSessionId) {
+      const previousRuntime = this.#agentRuntimes.get(previousAgentSessionId);
+      if (previousRuntime) {
+        // Same tolerance as /new: a throwing stop is logged, never aborts
+        // the completed switch.
+        try {
+          await this.#stopRuntime(previousRuntime);
+        } catch (error) {
+          this.#logger.error(
+            `failed to stop previous agent session ${previousRuntime.agentSessionId}:`,
+            error,
+          );
+        }
+      }
+    }
+
+    // Best-effort directory for the confirmation reply: absent adapter, an
+    // undefined value or a throwing call all render the directory-less
+    // variant instead of failing an otherwise successful adoption.
+    let workingDirectory: string | undefined;
+    try {
+      workingDirectory = await newRuntime.agentAdapter.getWorkingDirectory?.();
+    } catch (error) {
+      this.#logger.error(
+        `failed to read the working directory of ${newRuntime.agentSessionId}:`,
+        error,
+      );
+    }
+    await this.#deliverClientInput({
+      type: "assistant.message",
+      clientSessionId,
+      text:
+        workingDirectory !== undefined
+          ? this.#t("gateway.resumedSession", { sessionId: providerSessionId, workingDirectory })
+          : this.#t("gateway.resumedSessionWithoutDirectory", { sessionId: providerSessionId }),
+    });
+
+    return { ok: true, agentSessionId: newRuntime.agentSessionId };
+  }
+
   async #deliverClientInput(event: ClientInputEvent): Promise<void> {
     try {
       await this.#imAdapter.input(event);
@@ -805,6 +909,13 @@ export class GatewayCore {
       workingDirectory?: string;
       workingDirectorySource?: ClientWorkingDirectorySource;
       model?: string;
+      /**
+       * Provider-native session id to adopt (`/resume` only, `/resume` spec
+       * decision 4): passed through to the module unvalidated — only the
+       * agent backend can resolve it. Never set for `/new`, implicit
+       * creates, schedule or queue runs.
+       */
+      providerSessionId?: string;
     },
   ): Promise<AgentRuntime> {
     const agentSessionId = `${this.#agentModule.type}:${randomUUID()}`;
@@ -822,6 +933,9 @@ export class GatewayCore {
         common: this.#common ?? { channelName: "", language: "en-US" },
         agentSessionId,
         sessionState,
+        ...(options?.providerSessionId !== undefined
+          ? { providerSessionId: options.providerSessionId }
+          : {}),
         ...(options?.workingDirectory !== undefined
           ? { workingDirectory: options.workingDirectory }
           : {}),
@@ -908,10 +1022,12 @@ export class GatewayCore {
       this.#clientToAgentSession.set(clientSessionId, agentSessionId);
       return;
     }
-    const proposed = new Map(this.#clientToAgentSession);
-    proposed.set(clientSessionId, agentSessionId);
+    // Merge just this key into the committed document. A whole-map snapshot
+    // of the in-memory routing table would race concurrent ingresses (a
+    // commit parked while another client binds would drop that binding) and
+    // would leak synthetic in-memory bindings into the durable document.
     await this.#channelStateStore.transaction((draft) => {
-      draft.bindings = { ...Object.fromEntries(proposed) };
+      draft.bindings = { ...draft.bindings, [clientSessionId]: agentSessionId };
     });
     this.#clientToAgentSession.set(clientSessionId, agentSessionId);
   }
@@ -935,13 +1051,16 @@ export class GatewayCore {
       this.#clientToAgentSession.set(clientSessionId, newAgentSessionId);
       return;
     }
-    const proposed = new Map(this.#clientToAgentSession);
-    proposed.set(clientSessionId, newAgentSessionId);
-    const snapshot = Object.fromEntries(proposed);
+    // Merge just this key into the committed document (race-free under
+    // concurrent ingresses — see #bindClientToAgent), and drop the previous
+    // session's record when the merged bindings no longer reference it. The
+    // durable document is committed first; the in-memory binding is only
+    // updated after the commit succeeds, so a failed commit keeps the
+    // previous binding and runtime authoritative.
     await this.#channelStateStore.transaction((draft) => {
-      draft.bindings = { ...snapshot };
+      draft.bindings = { ...draft.bindings, [clientSessionId]: newAgentSessionId };
       if (previousAgentSessionId && previousAgentSessionId !== newAgentSessionId) {
-        const stillReferenced = Object.values(snapshot).includes(previousAgentSessionId);
+        const stillReferenced = Object.values(draft.bindings).includes(previousAgentSessionId);
         if (!stillReferenced) {
           delete draft.agentSessions[previousAgentSessionId];
         }

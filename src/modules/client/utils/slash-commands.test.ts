@@ -349,6 +349,70 @@ describe("parse /schedule-here", () => {
   });
 });
 
+describe("parse /resume", () => {
+  it("parses /resume <id> and /r <id> into a command.session.resume event", () => {
+    expect(parseSlashCommand("/resume ses_abc123", "session-1")).toEqual({
+      type: "command.session.resume",
+      clientSessionId: "session-1",
+      providerSessionId: "ses_abc123",
+    });
+    expect(parseSlashCommand("/r pi-coding-agent.0195c2e5-8b7e-7d90-8f26-f0ea4d8f6f70", "session-1")).toEqual({
+      type: "command.session.resume",
+      clientSessionId: "session-1",
+      providerSessionId: "pi-coding-agent.0195c2e5-8b7e-7d90-8f26-f0ea4d8f6f70",
+    });
+  });
+
+  it("matches /resume case-insensitively while preserving the id", () => {
+    expect(parseSlashCommand("/Resume ses_abc123", "session-1")).toEqual({
+      type: "command.session.resume",
+      clientSessionId: "session-1",
+      providerSessionId: "ses_abc123",
+    });
+    expect(parseSlashCommand("/R ABC-def_123", "session-1")).toEqual({
+      type: "command.session.resume",
+      clientSessionId: "session-1",
+      providerSessionId: "ABC-def_123",
+    });
+  });
+
+  it("returns a usage error for /resume without a provider session id", () => {
+    expect(parseSlashCommand("/resume", "session-1")).toEqual({
+      type: "command.session.resume.usage",
+      clientSessionId: "session-1",
+    });
+    expect(parseSlashCommand("/r", "session-1")).toEqual({
+      type: "command.session.resume.usage",
+      clientSessionId: "session-1",
+    });
+    expect(parseSlashCommand("/resume   ", "session-1")).toEqual({
+      type: "command.session.resume.usage",
+      clientSessionId: "session-1",
+    });
+  });
+
+  it("trims whitespace around the provider session id without validating it", () => {
+    expect(parseSlashCommand("/resume   ses_abc123  ", "session-1")).toEqual({
+      type: "command.session.resume",
+      clientSessionId: "session-1",
+      providerSessionId: "ses_abc123",
+    });
+    // Decision 4: the raw string is passed through even when it does not look
+    // like a session id — only the agent backend can validate it.
+    expect(parseSlashCommand("/resume what is this? x.y", "session-1")).toEqual({
+      type: "command.session.resume",
+      clientSessionId: "session-1",
+      providerSessionId: "what is this? x.y",
+    });
+  });
+
+  it("returns null for resume-like text that is not the command", () => {
+    expect(parseSlashCommand("/resumes ses_1", "session-1")).toBeNull();
+    expect(parseSlashCommand("/resume;x", "session-1")).toBeNull();
+    expect(parseSlashCommand("hello /resume ses_1", "session-1")).toBeNull();
+  });
+});
+
 describe("formatScheduleHereReply", () => {
   it("renders a localized success reply", () => {
     const en = getTranslator("en-US");
@@ -495,6 +559,19 @@ describe("resolveSlashCommandEvent", () => {
         cwd: "/fallback",
       }),
     ).resolves.toEqual({ type: "command.session.compact", clientSessionId: "session-1" });
+
+    // `/resume` needs no client-side resolution either: the provider session
+    // id is forwarded verbatim to the core (T04 adds the adapter-local
+    // interception of the usage variant before this call).
+    await expect(
+      resolveSlashCommandEvent(parseNew("/resume ses_abc123"), {
+        sessionState: store.session("session-1"),
+      }),
+    ).resolves.toEqual({
+      type: "command.session.resume",
+      clientSessionId: "session-1",
+      providerSessionId: "ses_abc123",
+    });
   });
 
   it("uses the explicit /new path, marks it as user-sourced and remembers the canonical path", async () => {

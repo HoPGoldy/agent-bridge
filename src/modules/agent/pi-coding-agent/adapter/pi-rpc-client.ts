@@ -40,6 +40,13 @@ export interface PiRpcClientOptions {
   model?: string;
   extraArgs?: string[];
   logger?: Logger;
+  /**
+   * Existing session jsonl file to continue (`--session <path>`, adopt/resume
+   * of a located session file). Mutually exclusive with `--session-id`: pi
+   * creates a same-id empty session when `--session-id` names a missing
+   * session, while `--session <path>` fails cleanly on a missing file.
+   */
+  sessionFile?: string;
 }
 
 type PendingRequest = {
@@ -95,9 +102,10 @@ function defaultSessionDir(): string {
 }
 
 export class PiRpcClient {
-  readonly #options: Required<Omit<PiRpcClientOptions, "model" | "extraArgs" | "logger">> & {
+  readonly #options: Required<Omit<PiRpcClientOptions, "model" | "extraArgs" | "logger" | "sessionFile">> & {
     model?: string;
     extraArgs: string[];
+    sessionFile?: string;
   };
   readonly #logger: Logger;
   #process: ChildProcessWithoutNullStreams | null = null;
@@ -120,6 +128,7 @@ export class PiRpcClient {
       bin: options.bin ?? "pi",
       model: options.model,
       extraArgs: options.extraArgs ?? [],
+      ...(options.sessionFile !== undefined ? { sessionFile: options.sessionFile } : {}),
     };
     this.#logger = options.logger ?? createLogger("pi-rpc");
   }
@@ -138,11 +147,18 @@ export class PiRpcClient {
 
     await mkdir(this.#options.sessionDir, { recursive: true });
 
+    // `--session <file>` and `--session-id` are mutually exclusive (context
+    // §3.3): the file form continues the exact jsonl on disk, while the id
+    // form silently creates a new empty session when the id is unknown. The
+    // bridge-side derived id is still passed via piSessionId for logging; the
+    // flag only decides the spawn form.
+    const sessionArgs = this.#options.sessionFile
+      ? ["--session", this.#options.sessionFile]
+      : ["--session-id", this.#options.piSessionId];
     const args = [
       "--mode",
       "rpc",
-      "--session-id",
-      this.#options.piSessionId,
+      ...sessionArgs,
       "--session-dir",
       this.#options.sessionDir,
       "--extension",

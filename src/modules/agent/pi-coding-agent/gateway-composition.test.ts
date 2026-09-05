@@ -1,4 +1,4 @@
-import { mkdtemp, realpath, rm } from "node:fs/promises";
+import { mkdtemp, mkdir, realpath, rm, writeFile } from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 import { afterEach, describe, expect, it, vi } from "vitest";
@@ -143,6 +143,67 @@ describe("Gateway + Pi module composition", () => {
       storeProbe = null;
       await core.stop();
       await rm(dir, { recursive: true, force: true });
+    }
+  });
+
+  it("adopts an external provider session through command.session.resume end to end", async () => {
+    const base = await mkdtemp(path.join(os.tmpdir(), "pi-gateway-adopt-"));
+    const projectDir = path.join(base, "external-project");
+    await mkdir(projectDir, { recursive: true });
+    const projectCanonical = await realpath(projectDir);
+    const bridgeDir = path.join(base, "bridge-sessions");
+    await mkdir(bridgeDir);
+    const sessionId = "aaaaaaaa-1111-2222-3333-444444444444";
+    const sessionFile = path.join(bridgeDir, `2026-01-01T00-00-00-000Z_${sessionId}.jsonl`);
+    await writeFile(
+      sessionFile,
+      `${JSON.stringify({ type: "session", version: 3, id: sessionId, cwd: projectDir })}\n`,
+    );
+
+    const store = createInMemoryChannelStateStore();
+    const imAdapter = new FakeIMAdapter();
+    // Route the module's sessionDir into the temp bridge dir for the test.
+    const core = new GatewayCore({
+      imAdapter,
+      agentModule: piCodingAgentModule,
+      agentConfig: { sessionDir: bridgeDir },
+      agentIdleTimeoutMs: 60_000,
+      channelStateStore: store,
+      agentSessionStateRegistry: createAgentSessionStateRegistry(store),
+      common: { channelName: "test-channel", language: "en-US" },
+    });
+
+    storeProbe = store;
+    try {
+      await core.start();
+      await imAdapter.emit({
+        type: "command.session.resume",
+        clientSessionId: "client-1",
+        providerSessionId: sessionId,
+      });
+
+      await vi.waitFor(() => {
+        expect(fakeClients).toHaveLength(1);
+        expect(fakeClients[0]!.started).toBe(true);
+      });
+
+      // The adopted provider session drives the spawn directory.
+      expect(fakeClients[0]?.cwd).toBe(projectCanonical);
+
+      const document = await store.load();
+      const agentSessionId = document.bindings["client-1"];
+      expect(agentSessionId).toMatch(/^pi-coding-agent:/);
+      expect(document.agentSessions[agentSessionId!]!.state).toEqual({
+        version: 1,
+        workingDirectory: projectCanonical,
+        workingDirectorySource: "user",
+        sessionFile,
+      });
+      expect(imAdapter.outputs.some((event) => event.type === "assistant.message")).toBe(true);
+    } finally {
+      storeProbe = null;
+      await core.stop();
+      await rm(base, { recursive: true, force: true });
     }
   });
 

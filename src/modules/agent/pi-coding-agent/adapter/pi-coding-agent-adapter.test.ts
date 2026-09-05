@@ -1,4 +1,4 @@
-import { chmod, mkdir, mkdtemp, realpath, rm } from "node:fs/promises";
+import { chmod, mkdir, mkdtemp, realpath, rm, writeFile } from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
@@ -19,9 +19,10 @@ import type { AgentOutputEvent, AgentSessionRecord, NewAgentSessionStateApi } fr
 import { createAgentSessionStateRegistry } from "../../../../config/agent-session-state";
 import { createInMemoryChannelStateStore } from "../../../../config/channel-state";
 import { piCodingAgentSessionStateCodec, type PiCodingAgentSessionStateV1 } from "../index";
+import { toPiSessionId } from "./pi-session-id";
 
 const rpcClients: Array<{
-  options: { cwd?: string; agentSessionId?: string; piSessionId?: string };
+  options: { cwd?: string; agentSessionId?: string; piSessionId?: string; sessionFile?: string };
   emit: (event: { type: string; [key: string]: unknown }) => void;
 }> = [];
 
@@ -48,7 +49,7 @@ vi.mock("./pi-rpc-client", () => {
     PiRpcClient: class FakePiRpcClient {
       #listener: ((event: { type: string; [key: string]: unknown }) => void) | null = null;
 
-      constructor(options: { cwd?: string; agentSessionId?: string; piSessionId?: string }) {
+      constructor(options: { cwd?: string; agentSessionId?: string; piSessionId?: string; sessionFile?: string }) {
         rpcClients.push({
           options,
           emit: (event) => {
@@ -246,9 +247,194 @@ describe("PiCodingAgentAdapter", () => {
       expect(rpcClients[0]?.options).toEqual(
         expect.objectContaining({ cwd: canonical, agentSessionId: "pi-coding-agent:cwd" }),
       );
+      // Regular sessions keep the legacy spawn form.
+      expect(rpcClients[0]?.options.sessionFile).toBeUndefined();
+      await adapter.stop();
     } finally {
       await rm(dir, { recursive: true, force: true });
     }
+  });
+
+  describe("provider session adoption (/resume <id>)", () => {
+    let base: string;
+    let bridgeDir: string;
+    let projectDir: string;
+    let projectCanonical: string;
+    let sessionFile: string;
+    const sessionId = "aaaaaaaa-1111-2222-3333-444444444444";
+
+    beforeEach(async () => {
+      rpcClients.length = 0;
+      base = await mkdtemp(path.join(os.tmpdir(), "pi-adapter-adopt-"));
+      bridgeDir = path.join(base, "bridge-sessions");
+      await mkdir(bridgeDir);
+      projectDir = path.join(base, "project");
+      await mkdir(projectDir);
+      projectCanonical = await realpath(projectDir);
+      sessionFile = path.join(bridgeDir, `2026-01-01T00-00-00-000Z_${sessionId}.jsonl`);
+      await writeFile(
+        sessionFile,
+        `${JSON.stringify({ type: "session", version: 3, id: sessionId, cwd: projectDir })}\n`,
+      );
+    });
+
+    afterEach(async () => {
+      await rm(base, { recursive: true, force: true });
+    });
+
+    function makeAdoptAdapter(
+      id: string,
+      handle: NewAgentSessionStateApi<PiCodingAgentSessionStateV1>,
+      extra?: { allowedWorkingDirectoryRoots?: string[] },
+    ): PiCodingAgentAdapter {
+      return new PiCodingAgentAdapter({
+        agentSessionId: id,
+        mode: "create",
+        sessionState: handle,
+        providerSessionId: sessionId,
+        sessionDir: bridgeDir,
+        ...extra,
+      });
+    }
+
+    it("spawns with --session <file>, without --session-id, in the header cwd", async () => {
+      const { store, handle } = await makeCreateHandle("pi-coding-agent:adopt-1");
+
+      const adapter = makeAdoptAdapter("pi-coding-agent:adopt-1", handle);
+      await adapter.start(() => {});
+
+      expect(rpcClients[0]?.options).toEqual(
+        expect.objectContaining({
+          cwd: projectCanonical,
+          sessionFile,
+          piSessionId: "pi-coding-agent.adopt-1",
+        }),
+      );
+      const document = await store.load();
+      expect(document.agentSessions["pi-coding-agent:adopt-1"]!.state).toEqual({
+        version: 1,
+        workingDirectory: projectCanonical,
+        workingDirectorySource: "user",
+        sessionFile,
+      });
+      // Contract used by the core for the /resume confirmation reply.
+      await expect(adapter.getWorkingDirectory?.()).resolves.toBe(projectCanonical);
+      await adapter.stop();
+      expect(await adapter.getWorkingDirectory?.()).toBe(projectCanonical);
+    });
+
+    it("locates the session by unique id prefix and records the canonical file path", async () => {
+      const { store, handle } = await makeCreateHandle("pi-coding-agent:adopt-prefix");
+
+      const adapter = new PiCodingAgentAdapter({
+        agentSessionId: "pi-coding-agent:adopt-prefix",
+        mode: "create",
+        sessionState: handle,
+        providerSessionId: "aaaaaaaa-1111",
+        sessionDir: bridgeDir,
+      });
+      await adapter.start(() => {});
+
+      expect(rpcClients[0]?.options.sessionFile).toBe(sessionFile);
+      const document = await store.load();
+      expect(document.agentSessions["pi-coding-agent:adopt-prefix"]!.state).toMatchObject({ sessionFile });
+      await adapter.stop();
+    });
+
+    it("fails with the raw id when the provider session cannot be located", async () => {
+      const { handle } = await makeCreateHandle("pi-coding-agent:adopt-missing");
+
+      const missingId = "12345678-1111-2222-3333-444444444444";
+      const failing = new PiCodingAgentAdapter({
+        agentSessionId: "pi-coding-agent:adopt-missing",
+        mode: "create",
+        sessionState: handle,
+        providerSessionId: missingId,
+        sessionDir: bridgeDir,
+      });
+      await expect(failing.start(() => {})).rejects.toThrow(new RegExp(missingId));
+      expect(rpcClients).toHaveLength(0);
+    });
+
+    it("fails when the header cwd does not exist and never spawns", async () => {
+      await writeFile(
+        sessionFile,
+        `${JSON.stringify({ type: "session", version: 3, id: sessionId, cwd: path.join(base, "gone") })}\n`,
+      );
+      const { store, handle } = await makeCreateHandle("pi-coding-agent:adopt-gone");
+
+      const adapter = makeAdoptAdapter("pi-coding-agent:adopt-gone", handle);
+      await expect(adapter.start(() => {})).rejects.toThrow(/cannot be adopted/);
+      expect(rpcClients).toHaveLength(0);
+      const document = await store.load();
+      expect(document.agentSessions["pi-coding-agent:adopt-gone"]).toBeUndefined();
+    });
+
+    it("enforces the allowlist on the canonicalized header cwd", async () => {
+      const { handle } = await makeCreateHandle("pi-coding-agent:adopt-allow");
+      const allowedRoot = path.join(base, "elsewhere");
+      await mkdir(allowedRoot, { recursive: true });
+
+      const adapter = makeAdoptAdapter("pi-coding-agent:adopt-allow", handle, {
+        allowedWorkingDirectoryRoots: [allowedRoot],
+      });
+      await expect(adapter.start(() => {})).rejects.toThrow(/not inside an allowed root/);
+      expect(rpcClients).toHaveLength(0);
+      await expect(adapter.stop()).resolves.toBeUndefined();
+    });
+
+    it("preserves the raw header cwd path spelling after realpath no-op", async () => {
+      const { store, handle } = await makeCreateHandle("pi-coding-agent:adopt-canonical");
+
+      const adapter = makeAdoptAdapter("pi-coding-agent:adopt-canonical", handle);
+      await adapter.start(() => {});
+
+      const document = await store.load();
+      expect(document.agentSessions["pi-coding-agent:adopt-canonical"]!.state).toMatchObject({
+        workingDirectory: projectCanonical,
+      });
+      await adapter.stop();
+    });
+
+    it("rejects a second live adopt of the same session file and releases the slot on stop", async () => {
+      const firstHandle = await makeCreateHandle("pi-coding-agent:adopt-a");
+      const secondHandle = await makeCreateHandle("pi-coding-agent:adopt-b");
+
+      const first = makeAdoptAdapter("pi-coding-agent:adopt-a", firstHandle.handle);
+      await first.start(() => {});
+
+      const second = makeAdoptAdapter("pi-coding-agent:adopt-b", secondHandle.handle);
+      await expect(second.start(() => {})).rejects.toThrow(/already adopted/);
+      expect(rpcClients).toHaveLength(1);
+
+      await first.stop();
+      const third = makeAdoptAdapter("pi-coding-agent:adopt-b", secondHandle.handle);
+      await third.start(() => {});
+      expect(rpcClients).toHaveLength(2);
+      await third.stop();
+    });
+
+    it("rejects providerSessionId combined with workingDirectory or the resume mode", () => {
+      expect(
+        () =>
+          new PiCodingAgentAdapter({
+            agentSessionId: "x",
+            mode: "create",
+            sessionState: createFakeHandle(),
+            providerSessionId: "abc",
+            workingDirectory: "/tmp",
+          }),
+      ).toThrow(/mutually exclusive/);
+      expect(
+        () =>
+          new PiCodingAgentAdapter({
+            agentSessionId: "x",
+            mode: "resume",
+            sessionState: createFakeHandle(),
+            providerSessionId: "abc",
+          }),
+      ).toThrow(/only valid in create mode/);
+    });
   });
 
   it("forwards tool execution events with tool ids and labels but without generic display text", async () => {
@@ -798,6 +984,110 @@ describe("PiCodingAgentAdapter session working directory state", () => {
       workingDirectory: canonical,
       workingDirectorySource: "user",
     });
+  });
+
+  it("keeps the legacy --session-id spawn for an old-format record written without sessionFile", async () => {
+    // Full boundary chain: a record persisted by a pre-adoption writer (no
+    // sessionFile key) is decoded through the real codec-backed handle and
+    // must keep the legacy spawn form — no session file flag at all.
+    const dir = path.join(base, "legacy-format");
+    await mkdir(dir, { recursive: true });
+    const canonical = await realpath(dir);
+    const { store, handle } = await makeOpenHandle("pi-coding-agent:legacy-format", {
+      version: 1,
+      workingDirectory: canonical,
+      workingDirectorySource: "user",
+    });
+    // The stored JSON must not carry the new key at all.
+    const document = await store.load();
+    expect(document.agentSessions["pi-coding-agent:legacy-format"]!.state).not.toHaveProperty("sessionFile");
+
+    const adapter = new PiCodingAgentAdapter({
+      agentSessionId: "pi-coding-agent:legacy-format",
+      mode: "resume",
+      sessionState: handle,
+    });
+    await adapter.start(() => {});
+
+    expect(rpcClients[0]?.options).toEqual(
+      expect.objectContaining({
+        cwd: canonical,
+        piSessionId: toPiSessionId("pi-coding-agent:legacy-format"),
+      }),
+    );
+    expect(rpcClients[0]?.options.sessionFile).toBeUndefined();
+    await adapter.stop();
+  });
+
+  it("continues the adopted session file on resume when the state carries sessionFile", async () => {
+    const dir = path.join(base, "adopted");
+    await mkdir(dir, { recursive: true });
+    const canonical = await realpath(dir);
+    const sessionFile = path.join(base, "adopted-session.jsonl");
+    await writeFile(sessionFile, "{\"type\":\"session\"}\n");
+    const { handle } = await makeOpenHandle("pi-coding-agent:resume-file", {
+      version: 1,
+      workingDirectory: canonical,
+      workingDirectorySource: "user",
+      sessionFile,
+    });
+
+    const adapter = new PiCodingAgentAdapter({
+      agentSessionId: "pi-coding-agent:resume-file",
+      mode: "resume",
+      sessionState: handle,
+    });
+    await adapter.start(() => {});
+
+    expect(rpcClients[0]?.options).toEqual(
+      expect.objectContaining({ cwd: canonical, sessionFile }),
+    );
+    await adapter.stop();
+  });
+
+  it("rejects a second live resume of an adopted session file and releases it on stop", async () => {
+    const dir = path.join(base, "adopted");
+    await mkdir(dir, { recursive: true });
+    const canonical = await realpath(dir);
+    const sessionFile = path.join(base, "adopted-session.jsonl");
+    await writeFile(sessionFile, "{\"type\":\"session\"}\n");
+    const firstHandle = await makeOpenHandle("pi-coding-agent:resume-a", {
+      version: 1,
+      workingDirectory: canonical,
+      workingDirectorySource: "user",
+      sessionFile,
+    });
+    const secondHandle = await makeOpenHandle("pi-coding-agent:resume-b", {
+      version: 1,
+      workingDirectory: canonical,
+      workingDirectorySource: "user",
+      sessionFile,
+    });
+
+    const first = new PiCodingAgentAdapter({
+      agentSessionId: "pi-coding-agent:resume-a",
+      mode: "resume",
+      sessionState: firstHandle.handle,
+    });
+    await first.start(() => {});
+
+    const second = new PiCodingAgentAdapter({
+      agentSessionId: "pi-coding-agent:resume-b",
+      mode: "resume",
+      sessionState: secondHandle.handle,
+    });
+    await expect(second.start(() => {})).rejects.toThrow(/already driven/);
+    expect(rpcClients).toHaveLength(1);
+
+    await first.stop();
+    const third = new PiCodingAgentAdapter({
+      agentSessionId: "pi-coding-agent:resume-b",
+      mode: "resume",
+      sessionState: secondHandle.handle,
+    });
+    await third.start(() => {});
+    expect(rpcClients).toHaveLength(2);
+    await third.stop();
   });
 
   it("upgrades a legacy migrated record without a working directory to the current cwd as default", async () => {

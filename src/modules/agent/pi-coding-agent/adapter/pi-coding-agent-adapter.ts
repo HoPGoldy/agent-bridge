@@ -13,6 +13,7 @@ import { createLogger, type Logger } from "../../../../core/logger";
 import { extractMediaMarkers } from "../../media-convention";
 import { PiRpcClient } from "./pi-rpc-client";
 import { toPiSessionId } from "./pi-session-id";
+import { locatePiSession } from "./session-locator";
 import { resolveWorkingDirectory } from "../working-directory";
 import type { PiCodingAgentSessionStateV1 } from "../index";
 
@@ -41,8 +42,18 @@ export interface PiCodingAgentAdapterOptions {
    * Raw user-requested working directory for a brand-new session. Absent (or
    * empty) only for implicitly created sessions (first user message): a `/new`
    * command always carries a concrete directory resolved by the client side.
+   * Mutually exclusive with `providerSessionId`.
    */
   workingDirectory?: string;
+  /**
+   * Raw provider session reference to adopt (`/resume <id>`, create mode
+   * only): located to a session jsonl file before the spawn, with the file
+   * header's `cwd` becoming the session working directory (user source,
+   * allowlist-checked) and the file persisted as `sessionFile` so later
+   * resumes continue the exact same file. The raw string is never
+   * re-validated here beyond locating it.
+   */
+  providerSessionId?: string;
   /**
    * Trust classification of `workingDirectory` as decided by the client
    * adapter. When absent it is derived from whether a directory was supplied
@@ -62,6 +73,68 @@ export interface PiCodingAgentAdapterOptions {
   logger?: Logger;
 }
 
+/**
+ * In-process occupancy registry for adopted provider session files (adopt
+ * spec decision 7): one jsonl file must never be driven by two live adapters
+ * of this process, or both pi processes would append to the same session
+ * history. Keyed by the canonical session file path, valued by the owning
+ * bridge agentSessionId. Released in `stop()`.
+ */
+const occupiedSessionFiles = new Map<string, string>();
+
+/** Locates a session file, acquires the occupancy slot and initializes the session state. */
+async function initializeAdoptedSession(
+  handle: NewAgentSessionStateApi<PiCodingAgentSessionStateV1>,
+  options: {
+    agentSessionId: string;
+    providerSessionId: string;
+    sessionDir?: string;
+    allowedWorkingDirectoryRoots?: string[];
+  },
+): Promise<{ sessionFile: string; cwd: string }> {
+  const located = await locatePiSession(options.providerSessionId, { sessionDir: options.sessionDir });
+
+  let canonicalCwd: string;
+  try {
+    // The header cwd comes from an external (possibly TUI-created) session:
+    // canonicalize and treat as user-supplied, so the configured allowlist
+    // applies before anything is persisted or spawned.
+    canonicalCwd = await resolveWorkingDirectory(located.cwd, {
+      allowedWorkingDirectoryRoots: options.allowedWorkingDirectoryRoots,
+    });
+  } catch (error) {
+    const detail = error instanceof Error ? error.message : String(error);
+    throw new Error(
+      `provider session "${options.providerSessionId}" cannot be adopted: its recorded working directory failed validation: ${detail}`,
+    );
+  }
+
+  const existing = occupiedSessionFiles.get(located.sessionFile);
+  if (existing !== undefined && existing !== options.agentSessionId) {
+    throw new Error(
+      `provider session "${options.providerSessionId}" is already adopted by live agent session ${existing}`,
+    );
+  }
+  // Claim synchronously before the first await so concurrent adopts of the
+  // same file cannot interleave between the check and the claim; released if
+  // initialization fails.
+  occupiedSessionFiles.set(located.sessionFile, options.agentSessionId);
+  try {
+    await handle.initialize({
+      version: 1,
+      workingDirectory: canonicalCwd,
+      workingDirectorySource: "user",
+      sessionFile: located.sessionFile,
+    });
+  } catch (error) {
+    if (occupiedSessionFiles.get(located.sessionFile) === options.agentSessionId) {
+      occupiedSessionFiles.delete(located.sessionFile);
+    }
+    throw error;
+  }
+  return { sessionFile: located.sessionFile, cwd: canonicalCwd };
+}
+
 export class PiCodingAgentAdapter implements AgentAdapter {
   readonly #agentSessionId: string;
   readonly #piSessionId: string;
@@ -76,9 +149,16 @@ export class PiCodingAgentAdapter implements AgentAdapter {
   readonly #workingDirectorySource?: "user" | "default";
   readonly #allowedWorkingDirectoryRoots?: string[];
   readonly #logger: Logger;
+  readonly #providerSessionId?: string;
   #client: PiRpcClient | null = null;
   #onOutput: ((event: AgentOutputEvent) => Promise<void> | void) | null = null;
   #activeRun = false;
+  /** Canonical cwd resolved by `start()`; surfaced through `getWorkingDirectory()`. */
+  #resolvedWorkingDirectory: string | undefined;
+  /** Adopted session file claimed by this adapter (occupancy slot held). */
+  #claimedSessionFile: string | null = null;
+  /** Session file this instance continues via `--session <path>`; null keeps the legacy `--session-id` spawn. */
+  #sessionFile: string | undefined;
   #toolLabelByCallId = new Map<string, string>();
   #toolInputByCallId = new Map<string, unknown>();
 
@@ -99,6 +179,13 @@ export class PiCodingAgentAdapter implements AgentAdapter {
             sessionState: options.sessionState as AgentSessionStateApi<PiCodingAgentSessionStateV1>,
           };
     this.#workingDirectory = options.workingDirectory;
+    this.#providerSessionId = options.providerSessionId;
+    if (options.mode === "resume" && options.providerSessionId !== undefined) {
+      throw new Error("providerSessionId is only valid in create mode");
+    }
+    if (options.mode === "create" && options.providerSessionId !== undefined && options.workingDirectory !== undefined) {
+      throw new Error("providerSessionId and workingDirectory are mutually exclusive");
+    }
     this.#workingDirectorySource = options.workingDirectorySource;
     this.#allowedWorkingDirectoryRoots = options.allowedWorkingDirectoryRoots;
     this.#sessionDir = options.sessionDir;
@@ -115,6 +202,7 @@ export class PiCodingAgentAdapter implements AgentAdapter {
     // spawn: creation failures (missing/invalid/unallowed path, revoke) must
     // never reach the process spawn step.
     const cwd = await this.#prepareWorkingDirectory();
+    this.#resolvedWorkingDirectory = cwd;
 
     this.#client = new PiRpcClient({
       agentSessionId: this.#agentSessionId,
@@ -125,6 +213,9 @@ export class PiCodingAgentAdapter implements AgentAdapter {
       model: this.#model,
       extraArgs: this.#extraArgs,
       logger: this.#logger,
+      // Adopted (or sessionFile-carrying) sessions continue the exact jsonl
+      // file; never combine `--session` with `--session-id` (context §3.3).
+      ...(this.#sessionFile !== undefined ? { sessionFile: this.#sessionFile } : {}),
     });
     this.#client.onEvent((rpcEvent) => {
       void this.#handleRpcEvent(rpcEvent);
@@ -153,6 +244,21 @@ export class PiCodingAgentAdapter implements AgentAdapter {
   async #prepareWorkingDirectory(): Promise<string> {
     if (this.#handle.mode === "create") {
       const { sessionState } = this.#handle;
+
+      // Adopt path (`/resume <id>`): the provider session file supplies the
+      // working directory; the raw requested directory must stay unset.
+      if (this.#providerSessionId !== undefined) {
+        const { sessionFile, cwd } = await initializeAdoptedSession(sessionState, {
+          agentSessionId: this.#agentSessionId,
+          providerSessionId: this.#providerSessionId,
+          sessionDir: this.#sessionDir,
+          allowedWorkingDirectoryRoots: this.#allowedWorkingDirectoryRoots,
+        });
+        this.#claimedSessionFile = sessionFile;
+        this.#sessionFile = sessionFile;
+        return cwd;
+      }
+
       const requested = this.#workingDirectory;
       const source: "user" | "default" =
         this.#workingDirectorySource ??
@@ -205,7 +311,21 @@ export class PiCodingAgentAdapter implements AgentAdapter {
         version: 1,
         workingDirectory: canonical,
         workingDirectorySource: current.workingDirectorySource,
+        ...(current.sessionFile !== undefined ? { sessionFile: current.sessionFile } : {}),
       }));
+    }
+    if (state.sessionFile !== undefined) {
+      // Adopted session resumed after idle release or restart: continue the
+      // same jsonl file, protected by the same occupancy rule as the adopt.
+      const existing = occupiedSessionFiles.get(state.sessionFile);
+      if (existing !== undefined && existing !== this.#agentSessionId) {
+        throw new Error(
+          `provider session file "${state.sessionFile}" is already driven by live agent session ${existing}`,
+        );
+      }
+      occupiedSessionFiles.set(state.sessionFile, this.#agentSessionId);
+      this.#claimedSessionFile = state.sessionFile;
+      this.#sessionFile = state.sessionFile;
     }
     return canonical;
   }
@@ -217,7 +337,17 @@ export class PiCodingAgentAdapter implements AgentAdapter {
     this.#client = null;
     this.#activeRun = false;
     this.#onOutput = null;
+    if (this.#claimedSessionFile !== null) {
+      if (occupiedSessionFiles.get(this.#claimedSessionFile) === this.#agentSessionId) {
+        occupiedSessionFiles.delete(this.#claimedSessionFile);
+      }
+      this.#claimedSessionFile = null;
+    }
     this.#logger.info(`session ${this.#agentSessionId} stopped`);
+  }
+
+  async getWorkingDirectory(): Promise<string | undefined> {
+    return this.#resolvedWorkingDirectory;
   }
 
   async abort(): Promise<void> {

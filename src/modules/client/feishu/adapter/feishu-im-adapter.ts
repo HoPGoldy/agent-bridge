@@ -22,6 +22,7 @@ import {
   type ScheduleHereUsageCommand,
   type ScheduleRunCommand,
   type ScheduleRunUsageCommand,
+  type SessionResumeUsageCommand,
 } from "../../utils/slash-commands";
 import {
   createInMemoryImClientSessionStateStore,
@@ -174,6 +175,16 @@ export class FeishuIMAdapter implements IMAdapter {
           // Adapter-local target binding (spec D7): never reaches the core.
           this.#logger.info(`received local schedule-here command ${normalizedText} (session=${clientSessionId})`);
           await this.#handleScheduleHere(parsedCommand, chatId, messageId);
+          return;
+        }
+        if (parsedCommand.type === "command.session.resume.usage") {
+          // Adapter-local usage error (spec /resume): never reaches the core.
+          // Intercepting here also narrows the union for TS before
+          // `resolveSlashCommandEvent`, which only accepts `ClientOutputEvent`
+          // shapes (see plan §3.4).
+          this.#logger.info(`received local resume command ${normalizedText} (session=${clientSessionId})`);
+          await this.#client?.sendText(chatId, this.#t("client.resumeUsage"), messageId);
+          await this.#client?.stopTyping(chatId);
           return;
         }
         this.#logger.info(`received command ${normalizedText} (session=${clientSessionId})`);

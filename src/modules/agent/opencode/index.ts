@@ -246,6 +246,18 @@ function runtimeKey(channelName: string, config: OpenCodeAgentConfig): string {
   ].join("\0");
 }
 
+/**
+ * Prefix of a runtime key up to (and excluding) the directory component:
+ * channel, server URL, username and password digest together identify one
+ * OpenCode Server. Two runtimes whose keys share this prefix talk to the same
+ * Server through different directories, so a provider-session id is only
+ * unique within this group.
+ */
+function serverKeyOf(key: string): string {
+  const parts = key.split("\0");
+  return [parts[0], parts[1], parts[3], parts[4]].join("\0");
+}
+
 async function verifyServer(api: OpenCodeApi, config: OpenCodeAgentConfig): Promise<void> {
   const health = await api.health();
   if (!health.healthy || !health.version) throw new Error("OpenCode Server returned an invalid health response");
@@ -366,6 +378,21 @@ export function createOpenCodeAgentModule(
     return runtime;
   };
 
+  /**
+   * Precise occupancy check over every live runtime of the same OpenCode
+   * Server (adopt spec decision 7): it fails only when the exact target
+   * provider session is already adopted by a live adapter of this process —
+   * unrelated live sessions on sibling directories never block an adoption.
+   */
+  const assertSessionAvailable = (channelName: string, config: OpenCodeAgentConfig, sessionId: string): void => {
+    const serverKey = serverKeyOf(runtimeKey(channelName, config));
+    for (const [existingKey, existingRuntime] of runtimes) {
+      if (serverKeyOf(existingKey) === serverKey) {
+        existingRuntime.assertSessionAvailable(sessionId);
+      }
+    }
+  };
+
   return {
     type: "opencode",
     sessionStateCodec: openCodeAgentSessionStateCodec,
@@ -376,7 +403,10 @@ export function createOpenCodeAgentModule(
      * working-directory policy, provider session creation, state
      * initialization and runtime registration inside `start()`.
      */
-    async createAgentSession({ config, common, agentSessionId, sessionState, workingDirectory, workingDirectorySource, allowedWorkingDirectoryRoots, model }) {
+    async createAgentSession({ config, common, agentSessionId, sessionState, workingDirectory, workingDirectorySource, allowedWorkingDirectoryRoots, model, providerSessionId }) {
+      if (providerSessionId !== undefined) {
+        logger.info(`adopting provider session "${providerSessionId}" as ${agentSessionId} for channel ${common.channelName}`);
+      }
       logger.info(`creating agent session ${agentSessionId} for channel ${common.channelName}`);
       // Per-task model override (design spec `docs/scheduled-task-model-spec.md`):
       // the effective model is the task override when present, else the channel
@@ -400,7 +430,9 @@ export function createOpenCodeAgentModule(
         ...(workingDirectorySource !== undefined ? { workingDirectorySource } : {}),
         ...(allowedWorkingDirectoryRoots !== undefined ? { allowedWorkingDirectoryRoots } : {}),
         ...(override !== undefined ? { model: override } : {}),
+        ...(providerSessionId !== undefined ? { providerSessionId } : {}),
         getRuntime,
+        assertSessionAvailable,
       });
     },
 

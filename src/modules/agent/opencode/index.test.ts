@@ -498,6 +498,248 @@ describe("OpenCode agent module", () => {
     });
   });
 
+  describe("provider session adoption (/resume <id>)", () => {
+    async function adopt(module: OpenCodeModule, api: OpenCodeApi, agentSessionId: string, config: OpenCodeAgentConfig = { baseUrl: "http://127.0.0.1:4096" }) {
+      const { store, handle } = await reserveHandle(module, agentSessionId);
+      const adapter = await module.createAgentSession({
+        config,
+        common,
+        agentSessionId,
+        sessionState: handle,
+        providerSessionId: "opencode:ses_target",
+      });
+      const output = vi.fn();
+      await adapter.start(output);
+      return { store, handle, adapter, output };
+    }
+
+    it("adopts an existing provider session: verifies with getSession, never creates, records the id and registers into the runtime", async () => {
+      const api = createApi({
+        getSession: vi.fn(async () => ({ id: "ses_target" }) as Session),
+      });
+      const module = createOpenCodeAgentModule({ apiFactory: () => api });
+
+      const { store, adapter } = await adopt(module, api, "opencode:adopt-1");
+      try {
+        expect(api.createSession).not.toHaveBeenCalled();
+        expect(api.getSession).toHaveBeenCalledWith("ses_target");
+        // Registered into the runtime: start() only completes after the SSE
+        // subscription of the directory-scoped runtime is live.
+        expect(api.subscribe).toHaveBeenCalledOnce();
+        await expect(store.load()).resolves.toEqual(
+          expect.objectContaining({
+            agentSessions: expect.objectContaining({
+              "opencode:adopt-1": expect.objectContaining({
+                state: {
+                  version: 1,
+                  openCodeSessionId: "ses_target",
+                  workingDirectory: process.cwd(),
+                  workingDirectorySource: "bridge-default",
+                },
+              }),
+            }),
+          }),
+        );
+        await expect(adapter.openCodeSessionId).toBe("ses_target");
+      } finally {
+        await adapter.stop();
+      }
+    });
+
+    it("treats the opencode: prefix as optional: prefixed and bare ids are equivalent", async () => {
+      const api = createApi({
+        getSession: vi.fn(async () => ({ id: "ses_target" }) as Session),
+      });
+      const module = createOpenCodeAgentModule({ apiFactory: () => api });
+      const bare = createApi({
+        getSession: vi.fn(async () => ({ id: "ses_target" }) as Session),
+      });
+      const bareModule = createOpenCodeAgentModule({ apiFactory: () => bare });
+
+      const prefixed = await adopt(module, api, "opencode:adopt-prefix");
+      const { store, handle } = await reserveHandle(bareModule, "opencode:adopt-bare");
+      const bareAdapter = await bareModule.createAgentSession({
+        config: { baseUrl: "http://127.0.0.1:4096" },
+        common,
+        agentSessionId: "opencode:adopt-bare",
+        sessionState: handle,
+        providerSessionId: "ses_target",
+      });
+      await bareAdapter.start(vi.fn());
+
+      try {
+        expect(api.getSession).toHaveBeenCalledWith("ses_target");
+        expect(bare.getSession).toHaveBeenCalledWith("ses_target");
+        expect((await prefixed.store.load()).agentSessions["opencode:adopt-prefix"]!.state).toMatchObject({
+          openCodeSessionId: "ses_target",
+        });
+        expect((await store.load()).agentSessions["opencode:adopt-bare"]!.state).toMatchObject({
+          openCodeSessionId: "ses_target",
+        });
+      } finally {
+        await prefixed.adapter.stop();
+        await bareAdapter.stop();
+      }
+    });
+
+    it("fails without registering the runtime when the provider session does not exist", async () => {
+      const api = createApi({
+        getSession: vi.fn(async () => {
+          throw new Error("not found");
+        }),
+      });
+      const module = createOpenCodeAgentModule({ apiFactory: () => api });
+
+      const { store, handle } = await reserveHandle(module, "opencode:adopt-missing");
+      const adapter = await module.createAgentSession({
+        config: { baseUrl: "http://127.0.0.1:4096" },
+        common,
+        agentSessionId: "opencode:adopt-missing",
+        sessionState: handle,
+        providerSessionId: "opencode:ses_nope",
+      });
+      await expect(adapter.start(vi.fn())).rejects.toThrow(
+        'provider session "opencode:ses_nope" does not name an existing OpenCode session: not found',
+      );
+
+      // The reserved record stays uninitialized (the gateway deletes it) and
+      // the runtime is inert: it never subscribed and a later create on the
+      // same directory starts a fresh loop instead of reusing a poisoned one.
+      const document = await store.load();
+      expect(document.agentSessions["opencode:adopt-missing"]).toBeUndefined();
+      expect(api.subscribe).not.toHaveBeenCalled();
+      api.createSession.mockResolvedValue({ id: "session-new" } as Session);
+      const { handle: retryHandle } = await reserveHandle(module, "opencode:adopt-retry");
+      const retry = await module.createAgentSession({
+        config: { baseUrl: "http://127.0.0.1:4096" },
+        common,
+        agentSessionId: "opencode:adopt-retry",
+        sessionState: retryHandle,
+        workingDirectory: "/srv/x",
+      });
+      await retry.start(vi.fn());
+      await retry.stop();
+    });
+
+    it("fails when the target provider session is already adopted by a live adapter of the same process", async () => {
+      const api = createApi({
+        getSession: vi.fn(async () => ({ id: "ses_target" }) as Session),
+      });
+      const module = createOpenCodeAgentModule({ apiFactory: () => api });
+
+      const first = await adopt(module, api, "opencode:adopt-holder");
+      try {
+        const { handle } = await reserveHandle(module, "opencode:adopt-second");
+        const second = await module.createAgentSession({
+          config: { baseUrl: "http://127.0.0.1:4096" },
+          common,
+          agentSessionId: "opencode:adopt-second",
+          sessionState: handle,
+          providerSessionId: "opencode:ses_target",
+        });
+        await expect(second.start(vi.fn())).rejects.toThrow(
+          'provider session "ses_target" is already adopted by live agent session opencode:adopt-holder',
+        );
+        expect(api.createSession).not.toHaveBeenCalled();
+      } finally {
+        await first.adapter.stop();
+      }
+
+      // Releasing the holder frees the provider session for a new adoption.
+      const retry = await adopt(module, api, "opencode:adopt-retry");
+      await retry.adapter.stop();
+    });
+
+    it("lets an unrelated live session on a sibling directory of the same server coexist", async () => {
+      const apis: OpenCodeApi[] = [];
+      const module = createOpenCodeAgentModule({
+        apiFactory: (config) => {
+          const api = createApi({
+            getSession: vi.fn(async () => ({ id: config.directory === "/srv/a" ? "ses_other" : "ses_target" }) as Session),
+          });
+          apis.push(api);
+          return api;
+        },
+      });
+
+      // A live adapter holds an unrelated provider session under /srv/a.
+      const { handle: firstHandle } = await reserveHandle(module, "opencode:coexist-holder");
+      const first = await module.createAgentSession({
+        config: { baseUrl: "http://127.0.0.1:4096", directory: "/srv/a" },
+        common,
+        agentSessionId: "opencode:coexist-holder",
+        sessionState: firstHandle,
+        workingDirectory: "/srv/a",
+      });
+      await first.start(vi.fn());
+      try {
+        // Adopting a different provider session under /srv/b must succeed:
+        // only the exact target id is protected, not the whole server.
+        const adopted = await adopt(
+          module,
+          apis[apis.length - 1]!,
+          "opencode:coexist-adopt",
+          { baseUrl: "http://127.0.0.1:4096", directory: "/srv/b" },
+        );
+        try {
+          expect(apis[0]!.getSession).not.toHaveBeenCalled();
+          expect(apis[1]!.getSession).toHaveBeenCalledWith("ses_target");
+          expect(apis[1]!.createSession).not.toHaveBeenCalled();
+        } finally {
+          await adopted.adapter.stop();
+        }
+      } finally {
+        await first.stop();
+      }
+    });
+
+    it("reports the effective working directory through getWorkingDirectory (create, adopt and resume)", async () => {
+      const api = createApi({
+        getSession: vi.fn(async () => ({ id: "ses_target" }) as Session),
+      });
+      const module = createOpenCodeAgentModule({ apiFactory: () => api });
+
+      const plain = await module.createAgentSession({
+        config: { baseUrl: "http://127.0.0.1:4096" },
+        common,
+        agentSessionId: "opencode:wd-plain",
+        sessionState: (await reserveHandle(module, "opencode:wd-plain")).handle,
+        workingDirectory: "/srv/plain",
+      });
+      await plain.start(vi.fn());
+      expect(await plain.getWorkingDirectory?.()).toBe("/srv/plain");
+      await plain.stop();
+
+      const adopted = await adopt(
+        module,
+        api,
+        "opencode:wd-adopt",
+        { baseUrl: "http://127.0.0.1:4096", directory: "/srv/channel" },
+      );
+      try {
+        expect(await adopted.adapter.getWorkingDirectory?.()).toBe("/srv/channel");
+      } finally {
+        await adopted.adapter.stop();
+      }
+
+      const { handle } = await openHandle(module, "opencode:wd-resume", {
+        version: 1,
+        openCodeSessionId: "ses_target",
+        workingDirectory: "/srv/persisted",
+        workingDirectorySource: "user",
+      });
+      const resumed = await module.resumeAgentSession?.({
+        config: { baseUrl: "http://127.0.0.1:4096" },
+        common,
+        agentSessionId: "opencode:wd-resume",
+        sessionState: handle,
+      });
+      await resumed!.start(vi.fn());
+      expect(await resumed!.getWorkingDirectory?.()).toBe("/srv/persisted");
+      await resumed!.stop();
+    });
+  });
+
   describe("per-task model override", () => {
     it("applies the task model override over the channel config model", async () => {
       const api = createApi({

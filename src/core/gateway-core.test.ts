@@ -102,6 +102,11 @@ class FakeAgentAdapter implements AgentAdapter {
   setModelCalls: string[] = [];
   startError?: Error;
   stopError?: Error;
+  workingDirectoryResult?: string;
+  getWorkingDirectoryError?: Error;
+  getWorkingDirectoryCalls = 0;
+  /** Set by the fake module: the providerSessionId passed to the create call (undefined = not a resume). */
+  createdWithProviderSessionId?: string;
   #onOutput: ((event: AgentOutputEvent) => Promise<void> | void) | null = null;
 
   constructor(readonly agentSessionId: string) {}
@@ -159,6 +164,14 @@ class FakeAgentAdapter implements AgentAdapter {
       throw new Error("setModel not configured");
     }
     return this.setModelResult;
+  }
+
+  async getWorkingDirectory(): Promise<string | undefined> {
+    this.getWorkingDirectoryCalls += 1;
+    if (this.getWorkingDirectoryError) {
+      throw this.getWorkingDirectoryError;
+    }
+    return this.workingDirectoryResult;
   }
 
   async emitAssistant(text: string): Promise<void> {
@@ -236,6 +249,8 @@ function makeFakeModule(options: {
         return options.create(args, options.createdAdapters ?? []);
       }
       const adapter = new FakeAgentAdapter(args.agentSessionId);
+      adapter.createdWithProviderSessionId = args.providerSessionId;
+      adapter.workingDirectoryResult = args.workingDirectory;
       options.createdAdapters?.push(adapter);
       return adapter;
     },
@@ -250,12 +265,33 @@ function makeFakeModule(options: {
   };
 }
 
-/** In-memory ChannelStateStore with serialized transactions. */
+/**
+ * In-memory ChannelStateStore with serialized transactions.
+ *
+ * `reserveLoads` optionally parks the registry's store `load()` calls inside
+ * `reserve()` (the registry pre-registers each session synchronously before
+ * that await) at deterministic points, so tests can interleave two concurrent
+ * creates at the exact point where a shared pending-slot would leak a resume
+ * id into a racing create. The queue is FIFO: slot 0 is the first `load()`
+ * seen while armed — typically `core.start()`'s initial load, so tests enable
+ * `reserveLoads` AFTER `start()` and make slot 0 the first reserve's load.
+ */
 class InMemoryStateStore implements ChannelStateStore {
   state: ChannelPersistentState = emptyChannelState();
   #tail: Promise<void> = Promise.resolve();
+  /** When non-empty, the next store load parks at this slot until released. */
+  reserveLoads: Array<{ release: () => void }> = [];
+  /** Slots already consumed by a parked reserve(); release them to resume. */
+  parkedReserves: Array<{ release: () => void }> = [];
 
   load(): Promise<ChannelPersistentState> {
+    const gate = this.reserveLoads.shift();
+    if (gate) {
+      this.parkedReserves.push(gate);
+      return new Promise<ChannelPersistentState>((resolve) => {
+        gate.release = () => resolve(this.state);
+      });
+    }
     return Promise.resolve(this.state);
   }
 
@@ -1078,6 +1114,7 @@ describe("GatewayCore", () => {
       sessionStateCodec: fakeStateCodec,
       async createAgentSession(args) {
         const adapter = new FakeAgentAdapter(args.agentSessionId);
+        adapter.workingDirectoryResult = args.workingDirectory;
         createdAdapters.push(adapter);
         return adapter;
       },
@@ -3842,5 +3879,526 @@ describe("GatewayCore", () => {
       });
     });
     expect(createdAdapters).toHaveLength(0);
+  });
+
+  it("adopts a provider session on /resume: passes the raw id to create and replies with the working directory", async () => {
+    const imAdapter = new FakeIMAdapter();
+    const store = makeStore();
+    const createdAdapters: FakeAgentAdapter[] = [];
+
+    const agentModule = makeFakeModule({
+      createdAdapters,
+      create: async (args) => {
+        const adapter = new FakeAgentAdapter(args.agentSessionId);
+        adapter.createdWithProviderSessionId = args.providerSessionId;
+        // The real adopted adapter knows the restored provider cwd.
+        adapter.workingDirectoryResult = "/resumed/project";
+        createdAdapters.push(adapter);
+        return adapter;
+      },
+    });
+
+    const core = new GatewayCore({
+      imAdapter,
+      agentModule,
+      agentConfig: {},
+      agentIdleTimeoutMs: 60_000,
+      channelStateStore: store,
+      common: { channelName: "feishu-dev", language: "en-US" },
+    });
+    running.push(core);
+    await core.start();
+
+    await imAdapter.emit({
+      type: "command.session.resume",
+      clientSessionId: "client-1",
+      providerSessionId: "ses_abc123",
+    });
+
+    await waitFor(() => {
+      expect(createdAdapters).toHaveLength(1);
+      // Zero-validation pass-through (decision 4): the raw id reaches the
+      // module untouched, and /resume never carries a /new directory.
+      expect(createdAdapters[0]!.createdWithProviderSessionId).toBe("ses_abc123");
+      expect(createdAdapters[0]!.getWorkingDirectoryCalls).toBe(1);
+      expect(imAdapter.outputs).toContainEqual({
+        type: "assistant.message",
+        clientSessionId: "client-1",
+        text: "Resumed session `ses_abc123` (working directory: /resumed/project).",
+      });
+      expect(store.state.bindings["client-1"]).toBe(createdAdapters[0]!.agentSessionId);
+      expect(store.state.agentSessions[createdAdapters[0]!.agentSessionId]).toBeDefined();
+    });
+  });
+
+  it("omits the working directory from the /resume reply when the adapter cannot provide it", async () => {
+    const imAdapter = new FakeIMAdapter();
+    const store = makeStore();
+    const createdAdapters: FakeAgentAdapter[] = [];
+
+    // Plain fake module: createdWithProviderSessionId is set but
+    // workingDirectoryResult stays undefined for a /resume create.
+    const agentModule = makeFakeModule({ createdAdapters });
+
+    const core = new GatewayCore({
+      imAdapter,
+      agentModule,
+      agentConfig: {},
+      agentIdleTimeoutMs: 60_000,
+      channelStateStore: store,
+      common: { channelName: "feishu-dev", language: "en-US" },
+    });
+    running.push(core);
+    await core.start();
+
+    await imAdapter.emit({
+      type: "command.session.resume",
+      clientSessionId: "client-1",
+      providerSessionId: "ses_abc123",
+    });
+
+    await waitFor(() => {
+      expect(createdAdapters).toHaveLength(1);
+      expect(imAdapter.outputs).toContainEqual({
+        type: "assistant.message",
+        clientSessionId: "client-1",
+        text: "Resumed session `ses_abc123`.",
+      });
+    });
+  });
+
+  it("keeps the previous session untouched when the adopted create fails", async () => {
+    const imAdapter = new FakeIMAdapter();
+    const store = makeStore();
+    const createdAdapters: FakeAgentAdapter[] = [];
+    let failNextCreate = false;
+
+    const agentModule = makeFakeModule({
+      createdAdapters,
+      create: async (args) => {
+        if (failNextCreate) {
+          throw new Error("provider session not found");
+        }
+        const adapter = new FakeAgentAdapter(args.agentSessionId);
+        adapter.createdWithProviderSessionId = args.providerSessionId;
+        adapter.workingDirectoryResult = args.workingDirectory;
+        createdAdapters.push(adapter);
+        return adapter;
+      },
+    });
+
+    const core = new GatewayCore({
+      imAdapter,
+      agentModule,
+      agentConfig: {},
+      agentIdleTimeoutMs: 60_000,
+      channelStateStore: store,
+      common: { channelName: "feishu-dev", language: "en-US" },
+    });
+    running.push(core);
+    await core.start();
+
+    await imAdapter.emit({
+      type: "user.message",
+      clientSessionId: "client-1",
+      text: "hello",
+    });
+    await waitFor(() => {
+      expect(createdAdapters).toHaveLength(1);
+    });
+
+    failNextCreate = true;
+    await imAdapter.emit({
+      type: "command.session.resume",
+      clientSessionId: "client-1",
+      providerSessionId: "bad-id",
+    });
+
+    await waitFor(() => {
+      // The previous session is still bound, running, and its record kept.
+      expect(createdAdapters[0]!.stopCount).toBe(0);
+      expect(store.state.bindings).toEqual({ "client-1": createdAdapters[0]!.agentSessionId });
+      expect(Object.keys(store.state.agentSessions)).toHaveLength(1);
+      expect(imAdapter.outputs).toContainEqual({
+        type: "assistant.message",
+        clientSessionId: "client-1",
+        text: "Failed to adopt the provider session: provider session not found",
+      });
+    });
+
+    // The old session still receives traffic after the failed resume.
+    await createdAdapters[0]!.emitAssistant("still alive");
+    await waitFor(() => {
+      expect(imAdapter.outputs.some((event) => event.text === "still alive")).toBe(true);
+    });
+  });
+
+  it("ignores /resume for synthetic sessions", async () => {
+    const imAdapter = new FakeIMAdapter();
+    const store = makeStore();
+    const debugSpy = vi.spyOn(console, "debug").mockImplementation(() => {});
+    const createdAdapters: FakeAgentAdapter[] = [];
+
+    try {
+      const core = new GatewayCore({
+        imAdapter,
+        agentModule: makeFakeModule({ createdAdapters }),
+        agentConfig: {},
+        agentIdleTimeoutMs: 60_000,
+        channelStateStore: store,
+        common: { channelName: "feishu-dev", language: "en-US" },
+      });
+      running.push(core);
+      await core.start();
+
+      await core.input({
+        type: "command.session.resume",
+        clientSessionId: "schedule:report:1",
+        providerSessionId: "ses_abc123",
+      });
+      await core.input({
+        type: "command.session.resume",
+        clientSessionId: "queue:build:task-1",
+        providerSessionId: "ses_abc123",
+      });
+      await sleep(30);
+
+      // Defensive no-op: no session was created, nothing was delivered and
+      // nothing was persisted for the controller-owned ids.
+      expect(createdAdapters).toHaveLength(0);
+      expect(imAdapter.outputs).toEqual([]);
+      expect(store.state.bindings).toEqual({});
+      expect(Object.keys(store.state.agentSessions)).toHaveLength(0);
+    } finally {
+      debugSpy.mockRestore();
+    }
+  });
+
+  it("stops the previous runtime and deletes its record after a successful /resume switch", async () => {
+    const imAdapter = new FakeIMAdapter();
+    const store = makeStore();
+    const createdAdapters: FakeAgentAdapter[] = [];
+
+    const agentModule = makeFakeModule({
+      createdAdapters,
+      create: async (args) => {
+        const adapter = new FakeAgentAdapter(args.agentSessionId);
+        adapter.createdWithProviderSessionId = args.providerSessionId;
+        adapter.workingDirectoryResult = args.workingDirectory;
+        createdAdapters.push(adapter);
+        return adapter;
+      },
+    });
+
+    const core = new GatewayCore({
+      imAdapter,
+      agentModule,
+      agentConfig: {},
+      agentIdleTimeoutMs: 60_000,
+      channelStateStore: store,
+      common: { channelName: "feishu-dev", language: "zh-CN" },
+    });
+    running.push(core);
+    await core.start();
+
+    await imAdapter.emit({
+      type: "user.message",
+      clientSessionId: "client-1",
+      text: "hello",
+    });
+    await waitFor(() => {
+      expect(createdAdapters).toHaveLength(1);
+    });
+
+    await imAdapter.emit({
+      type: "command.session.resume",
+      clientSessionId: "client-1",
+      providerSessionId: "pi-coding-agent.0195c2e5",
+    });
+
+    await waitFor(() => {
+      expect(createdAdapters).toHaveLength(2);
+      expect(createdAdapters[0]!.stopCount).toBe(1);
+      expect(store.state.bindings["client-1"]).toBe(createdAdapters[1]!.agentSessionId);
+      // The old record is dropped once nothing references it.
+      expect(store.state.agentSessions[createdAdapters[0]!.agentSessionId]).toBeUndefined();
+      // Localized (zh-CN channel) confirmation with the directory-less variant
+      // (fake module leaves workingDirectoryResult undefined for /resume).
+      expect(imAdapter.outputs).toContainEqual({
+        type: "assistant.message",
+        clientSessionId: "client-1",
+        text: "已接管会话 `pi-coding-agent.0195c2e5`。",
+      });
+    });
+
+    // Traffic is routed to the adopted session.
+    await imAdapter.emit({
+      type: "user.message",
+      clientSessionId: "client-1",
+      text: "next",
+    });
+    await waitFor(() => {
+      expect(createdAdapters[1]!.inputs).toContainEqual({ type: "user.message", text: "next" });
+    });
+    expect(createdAdapters[0]!.inputs.some((event) => event.text === "next")).toBe(false);
+  });
+
+  it("keeps the resume provider id isolated per create when a scheduler fire races the resume", async () => {
+    const imAdapter = new FakeIMAdapter();
+    const store = makeStore();
+    const createdAdapters: FakeAgentAdapter[] = [];
+
+    const agentModule = makeFakeModule({
+      createdAdapters,
+      create: async (args) => {
+        const adapter = new FakeAgentAdapter(args.agentSessionId);
+        adapter.createdWithProviderSessionId = args.providerSessionId;
+        adapter.workingDirectoryResult = args.workingDirectory;
+        createdAdapters.push(adapter);
+        return adapter;
+      },
+    });
+
+    const core = new GatewayCore({
+      imAdapter,
+      agentModule,
+      agentConfig: {},
+      agentIdleTimeoutMs: 60_000,
+      channelStateStore: store,
+      common: { channelName: "feishu-dev", language: "en-US" },
+    });
+    running.push(core);
+    await core.start();
+
+    // Arm two reserve-load slots AFTER start(): slot 0 parks the resume's
+    // reserve, slot 1 parks the racing fire's reserve. The waitFor below
+    // fails with a clear message if the gate never engages.
+    store.reserveLoads = [
+      { release: () => {} },
+      { release: () => {} },
+    ];
+
+    // Park BOTH creates' reserve() on the store load: each create is inside
+    // the registry with its own reserved id, but neither has reached the
+    // module's createAgentSession yet — the exact window where a shared
+    // pending-slot would leak the resume id into the racing fire.
+    const resumeDispatch = imAdapter.emit({
+      type: "command.session.resume",
+      clientSessionId: "client-1",
+      providerSessionId: "ses_resume_target",
+    });
+    const fireDispatch = core.input({
+      type: "command.session.new",
+      clientSessionId: "schedule:report:1",
+      workingDirectory: "/tmp/task-run",
+      workingDirectorySource: "default",
+    });
+    await vi.waitFor(() => {
+      expect(
+        store.parkedReserves,
+        "reserve gate never armed: the test could not interleave the two creates",
+      ).toHaveLength(2);
+    });
+
+    // Release REVERSED so the fire's create resumes first and reads any
+    // shared pending-slot BEFORE the resume's create — the worst-case
+    // scheduler-wins interleaving.
+    for (const gate of [...store.parkedReserves].reverse()) gate.release();
+    store.parkedReserves = [];
+    await resumeDispatch;
+    await fireDispatch;
+    await sleep(30);
+
+    // Each create captured its own id with its own call (completion order
+    // is nondeterministic under the reversed release): exactly one adoption
+    // with the resume's id, and the fire's create without any id — the fire
+    // was NOT hijacked into adopting the resume's provider session.
+    expect(createdAdapters).toHaveLength(2);
+    const adoptedIds = createdAdapters.map((adapter) => adapter.createdWithProviderSessionId);
+    expect(adoptedIds).toContain("ses_resume_target");
+    expect(adoptedIds).toContain(undefined);
+    expect(new Set(adoptedIds.map((id) => id ?? "<none>")).size).toBe(2);
+    const resumedAdapter = createdAdapters.find(
+      (adapter) => adapter.createdWithProviderSessionId === "ses_resume_target",
+    )!;
+    expect(store.state.bindings["client-1"]).toBe(resumedAdapter.agentSessionId);
+    expect(store.state.bindings["schedule:report:1"]).toBeUndefined();
+    expect(imAdapter.outputs).toContainEqual({
+      type: "assistant.message",
+      clientSessionId: "client-1",
+      text: "Resumed session `ses_resume_target`.",
+    });
+  });
+
+  it("keeps concurrent /resume commands isolated per create (no id cross-talk)", async () => {
+    const imAdapter = new FakeIMAdapter();
+    const store = makeStore();
+    const createdAdapters: FakeAgentAdapter[] = [];
+
+    const agentModule = makeFakeModule({
+      createdAdapters,
+      create: async (args) => {
+        const adapter = new FakeAgentAdapter(args.agentSessionId);
+        adapter.createdWithProviderSessionId = args.providerSessionId;
+        adapter.workingDirectoryResult = args.workingDirectory;
+        createdAdapters.push(adapter);
+        return adapter;
+      },
+    });
+
+    const core = new GatewayCore({
+      imAdapter,
+      agentModule,
+      agentConfig: {},
+      agentIdleTimeoutMs: 60_000,
+      channelStateStore: store,
+      common: { channelName: "feishu-dev", language: "en-US" },
+    });
+    running.push(core);
+    await core.start();
+
+    store.reserveLoads = [
+      { release: () => {} },
+      { release: () => {} },
+    ];
+
+    const firstDispatch = imAdapter.emit({
+      type: "command.session.resume",
+      clientSessionId: "client-1",
+      providerSessionId: "ses_first",
+    });
+    const secondDispatch = imAdapter.emit({
+      type: "command.session.resume",
+      clientSessionId: "client-2",
+      providerSessionId: "ses_second",
+    });
+    await vi.waitFor(() => {
+      expect(
+        store.parkedReserves,
+        "reserve gate never armed: the test could not interleave the two creates",
+      ).toHaveLength(2);
+    });
+
+    // Release REVERSED so the second command's create reads any shared
+    // pending-slot before the first — the worst-case interleaving.
+    for (const gate of [...store.parkedReserves].reverse()) gate.release();
+    store.parkedReserves = [];
+    await firstDispatch;
+    await secondDispatch;
+    await sleep(30);
+
+    // Both adoptions happened, each with its own id (completion order is
+    // nondeterministic under the reversed release) — no cross-talk.
+    expect(createdAdapters).toHaveLength(2);
+    const adoptedIds = createdAdapters.map((adapter) => adapter.createdWithProviderSessionId);
+    expect(new Set(adoptedIds)).toEqual(new Set(["ses_first", "ses_second"]));
+    const firstAdapter = createdAdapters.find(
+      (adapter) => adapter.createdWithProviderSessionId === "ses_first",
+    )!;
+    const secondAdapter = createdAdapters.find(
+      (adapter) => adapter.createdWithProviderSessionId === "ses_second",
+    )!;
+
+    // Each chat bound to its own adopted session, each with its own id.
+    expect(store.state.bindings["client-1"]).toBe(firstAdapter.agentSessionId);
+    expect(store.state.bindings["client-2"]).toBe(secondAdapter.agentSessionId);
+    expect(imAdapter.outputs).toContainEqual({
+      type: "assistant.message",
+      clientSessionId: "client-1",
+      text: "Resumed session `ses_first`.",
+    });
+    expect(imAdapter.outputs).toContainEqual({
+      type: "assistant.message",
+      clientSessionId: "client-2",
+      text: "Resumed session `ses_second`.",
+    });
+  });
+
+  it("keeps the previous session and its record when the adopted resume binding switch fails", async () => {
+    const imAdapter = new FakeIMAdapter();
+    const store = new DeferredStateStore();
+    const createdAdapters: FakeAgentAdapter[] = [];
+
+    const agentModule = makeFakeModule({
+      createdAdapters,
+      create: async (args) => {
+        const adapter = new FakeAgentAdapter(args.agentSessionId);
+        adapter.createdWithProviderSessionId = args.providerSessionId;
+        adapter.workingDirectoryResult = args.workingDirectory;
+        createdAdapters.push(adapter);
+        return adapter;
+      },
+    });
+
+    const core = new GatewayCore({
+      imAdapter,
+      agentModule,
+      agentConfig: {},
+      agentIdleTimeoutMs: 60_000,
+      channelStateStore: store,
+      common: { channelName: "feishu-dev", language: "en-US" },
+    });
+    running.push(core);
+    await core.start();
+
+    // Establish the previous session through a user message (initialize
+    // commit is deferred 0, its binding save deferred 1).
+    const first = imAdapter.emit({
+      type: "user.message",
+      clientSessionId: "client-1",
+      text: "hello",
+    });
+    await waitFor(() => {
+      expect(store.deferreds).toHaveLength(1);
+    });
+    store.deferreds[0]!.resolve();
+    await waitFor(() => {
+      expect(store.deferreds).toHaveLength(2);
+    });
+    store.deferreds[1]!.resolve();
+    await first;
+    await waitFor(() => {
+      expect(store.state.bindings["client-1"]).toBe(createdAdapters[0]!.agentSessionId);
+    });
+
+    // /resume: the adopted create's initialize commit is deferred 2; the
+    // failed binding switch never parks (a store run checks the flag when it
+    // starts, right after the commit settles — same pattern as the /new
+    // binding-switch-failure test above), so the next parked transaction
+    // (deferred 3) is the rollback's record-delete.
+    const resumeDispatch = imAdapter.emit({
+      type: "command.session.resume",
+      clientSessionId: "client-1",
+      providerSessionId: "ses_abc123",
+    });
+    await waitFor(() => {
+      expect(store.deferreds).toHaveLength(3);
+    });
+    store.failNextWrite = true;
+    store.deferreds[2]!.resolve();
+    await waitFor(() => {
+      expect(store.deferreds).toHaveLength(4);
+    });
+    store.deferreds[3]!.resolve();
+    await resumeDispatch;
+
+    // The failed switch kept the previous session authoritative: its runtime
+    // was never stopped and its record survives; the adopted runtime and its
+    // record were cleaned up; the user got the localized failure reply.
+    expect(createdAdapters[0]!.stopCount).toBe(0);
+    expect(createdAdapters[1]!.stopCount).toBe(1);
+    expect(store.state.bindings).toEqual({ "client-1": createdAdapters[0]!.agentSessionId });
+    expect(Object.keys(store.state.agentSessions)).toEqual([createdAdapters[0]!.agentSessionId]);
+    expect(imAdapter.outputs).toContainEqual({
+      type: "assistant.message",
+      clientSessionId: "client-1",
+      text: "Failed to adopt the provider session: save boom",
+    });
+
+    // The previous session still receives traffic after the failed resume.
+    await createdAdapters[0]!.emitAssistant("still alive");
+    await waitFor(() => {
+      expect(imAdapter.outputs.some((event) => event.text === "still alive")).toBe(true);
+    });
   });
 });
