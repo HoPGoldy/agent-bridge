@@ -2,6 +2,13 @@
 
 All notable changes to this project will be documented in this file. See [commit-and-tag-version](https://github.com/absolute-version/commit-and-tag-version) for commit guidelines.
 
+## [0.8.8](https://github.com/HoPGoldy/agent-bridge/compare/v0.8.7...v0.8.8) (2026-09-06)
+
+
+### Features
+
+* **resume:** /resume <provider-session-id> adopts an external agent session into a chat ([fe70079](https://github.com/HoPGoldy/agent-bridge/commit/fe70079a4f01070057139dc191a90220dc0d0ec0))
+
 ## [0.8.7](https://github.com/HoPGoldy/agent-bridge/compare/v0.8.6...v0.8.7) (2026-08-27)
 
 
