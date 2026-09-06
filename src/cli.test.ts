@@ -14,9 +14,13 @@ const input = vi.fn(async (label: string) => {
   if (label === "Schedule (examples: every 5m, daily 09:00, weekly mon 09:00, monthly 15 09:00)") {
     return "daily 09:00";
   }
-  if (label === "Working directory (optional, blank = bridge cwd)") return "";
   if (label === "Timeout (default 5h)") return "5h";
+  if (label === "Silence window (default 30m)") return "30m";
   if (label === "Model (optional, blank = channel default)") return "";
+  if (label === "Working directory (optional, blank = bridge cwd)") return "";
+  if (label === "Shared context body (optional, blank = empty; prepended to every task prompt)") {
+    return "";
+  }
   if (label === "Queue name") return "inbox";
   if (label === "Workers (default 1)") return "1";
   throw new Error(`unexpected input prompt: ${label}`);
@@ -48,6 +52,20 @@ const rename = vi.fn(async () => {});
 const loadAllTasks = vi.fn(async () => []);
 const getSchedulesDir = vi.fn(() => "/tmp/schedules");
 
+/** Spies standing in for the one-shot Scheduler construction/trigger (schedule run). */
+const schedulerRunNow = vi.fn<(name: string) => Promise<{ ok: true } | { ok: false; reason: string }>>();
+const schedulerStart = vi.fn(async () => {});
+const schedulerStop = vi.fn(async () => {});
+const schedulerCtorArgs: Array<Record<string, unknown>> = [];
+const lastSchedulerOptions = () =>
+  schedulerCtorArgs[schedulerCtorArgs.length - 1] as unknown as {
+    channelName: string;
+    dispatchClientEvent: (event: unknown) => Promise<unknown>;
+    validateTarget: (clientSessionId: string) => boolean;
+  };
+
+/** The queue add wizard's shared-context body prompt label (T06). */
+const BODY_PROMPT = "Shared context body (optional, blank = empty; prepended to every task prompt)";
 const fakeClientModule = {
   type: "fake-client",
   createConfigCollector: () => ({
@@ -81,16 +99,46 @@ vi.mock("./config/store", () => ({
 vi.mock("./modules/client", () => ({
   listClientModules: () => [fakeClientModule],
   getClientModule: (type: string) => (type === "fake-client" ? fakeClientModule : undefined),
+  getTypedClientModule: (config: { type: string }) =>
+    config.type === "fake-client" ? fakeClientModule : undefined,
 }));
 
 vi.mock("./modules/agent", () => ({
   listAgentModules: () => [fakeAgentModule],
   getAgentModule: (type: string) => (type === "fake-agent" ? fakeAgentModule : undefined),
+  getTypedAgentModule: (config: { type: string }) =>
+    config.type === "fake-agent" ? fakeAgentModule : undefined,
 }));
 
 vi.mock("./core/channel-runner", () => ({
   runChannel: vi.fn(),
 }));
+
+vi.mock("./core/gateway-core", () => ({
+  GatewayCore: vi.fn().mockImplementation(() => ({
+    input: vi.fn(async () => ({ ok: true })),
+    start: (...args: unknown[]) => coreStart(...(args as [])),
+    stop: (...args: unknown[]) => coreStop(...(args as [])),
+  })),
+}));
+
+const coreStart = vi.fn(async () => {});
+const coreStop = vi.fn(async () => {});
+
+vi.mock("./modules/schedule/scheduler", async (importOriginal) => {
+  const original = await importOriginal<typeof import("./modules/schedule/scheduler")>();
+  return {
+    ...original,
+    Scheduler: vi.fn().mockImplementation((options: Record<string, unknown>) => {
+      schedulerCtorArgs.push(options);
+      return {
+        start: schedulerStart,
+        stop: schedulerStop,
+        runNow: (name: string) => schedulerRunNow(name),
+      };
+    }),
+  };
+});
 
 vi.mock("./config/session-bindings", () => ({
   removeSessionBindingStore: vi.fn(async () => {}),
@@ -174,7 +222,7 @@ function makeQueueDefinition(overrides: Partial<QueueDefinition> = {}): QueueDef
     name: "inbox",
     channel: "demo",
     workers: 1,
-    silenceMs: 10 * 60_000, // DEFAULT_SILENCE_MS (inlined: this module is vi.mock'ed below)
+    silenceMs: 30 * 60_000, // DEFAULT_SILENCE_MS (inlined: this module is vi.mock'ed below)
     timeoutMs: undefined,
     model: undefined,
     target: undefined,
@@ -211,6 +259,9 @@ function makeLoadedTask(
       schedule: { type: "daily", hour: 9, minute: 0 },
       directory: undefined,
       timeoutMs: 5 * 3_600_000,
+      silenceMs: 30 * 60_000,
+      model: undefined,
+      channel: undefined,
       enabled: true,
       target: undefined,
       prompt: "Do the thing.",
@@ -239,6 +290,12 @@ function resetPromptMocks() {
   confirm.mockClear();
   loadConfig.mockClear();
   saveConfig.mockClear();
+  schedulerCtorArgs.length = 0;
+  schedulerRunNow.mockReset();
+  schedulerStart.mockClear();
+  schedulerStop.mockClear();
+  coreStart.mockClear();
+  coreStop.mockClear();
 }
 
 const CHANNEL_WITH_DEMO = {
@@ -303,11 +360,32 @@ describe("schedule wizard validators", () => {
     expect(blankDir).not.toContain("directory:");
   });
 
+  it("writes a silence: line when a silence value is given and omits it when blank/absent", async () => {
+    const { buildTaskFileContent } = await import("./cli");
+    const withSilence = buildTaskFileContent({
+      schedule: "every 5m",
+      timeout: "10m",
+      silence: "15m",
+    });
+    expect(withSilence).toContain("silence: 15m");
+
+    const blankSilence = buildTaskFileContent({
+      schedule: "every 5m",
+      timeout: "10m",
+      silence: "",
+    });
+    expect(blankSilence).not.toContain("silence:");
+
+    const absentSilence = buildTaskFileContent({ schedule: "every 5m", timeout: "10m" });
+    expect(absentSilence).not.toContain("silence:");
+  });
+
   it("buildTaskFileContent keeps model between timeout and directory in the front matter", async () => {
     const { buildTaskFileContent } = await import("./cli");
     const content = buildTaskFileContent({
       schedule: "daily 09:00",
       timeout: "30m",
+      silence: "15m",
       directory: "~/reports",
       model: "azure-openai-responses/gpt-5.6-terra",
     });
@@ -315,6 +393,7 @@ describe("schedule wizard validators", () => {
     for (const needle of [
       "schedule: daily 09:00",
       "timeout: 30m",
+      "silence: 15m",
       "model: azure-openai-responses/gpt-5.6-terra",
       "directory: ~/reports",
     ]) {
@@ -404,6 +483,7 @@ describe("schedule wizard validators", () => {
 describe("runCli schedule add", () => {
   beforeEach(() => {
     resetPromptMocks();
+    delete inputOverrides["Silence window (default 30m)"];
     delete inputOverrides["Working directory (optional, blank = bridge cwd)"];
     delete inputOverrides["Model (optional, blank = channel default)"];
     mkdir.mockClear();
@@ -412,7 +492,7 @@ describe("runCli schedule add", () => {
     loadAllTasks.mockResolvedValue([]);
   });
 
-  it("writes a task file with the collected values and prints path + targeting instruction", async () => {
+  it("asks the unified question sequence and writes the collected values (T06)", async () => {
     const { runCli } = await import("./cli");
     const logs = captureLogs();
     try {
@@ -421,12 +501,14 @@ describe("runCli schedule add", () => {
       logs.restore();
     }
 
+    // Unified wizard order (T06): name → schedule → timeout → silence → model → directory.
     expect(promptCalls).toEqual([
       "input:Task name",
       "input:Schedule (examples: every 5m, daily 09:00, weekly mon 09:00, monthly 15 09:00)",
-      "input:Working directory (optional, blank = bridge cwd)",
       "input:Timeout (default 5h)",
+      "input:Silence window (default 30m)",
       "input:Model (optional, blank = channel default)",
+      "input:Working directory (optional, blank = bridge cwd)",
     ]);
     expect(loadAllTasks).toHaveBeenCalledWith();
     expect(mkdir).toHaveBeenCalledWith("/tmp/schedules", { recursive: true });
@@ -435,6 +517,8 @@ describe("runCli schedule add", () => {
     expect(filePath).toBe("/tmp/schedules/daily-report.md");
     expect(content).toContain("schedule: daily 09:00");
     expect(content).toContain("timeout: 5h");
+    // The default 30m silence answer writes the silence line.
+    expect(content).toContain("silence: 30m");
     expect(content).not.toContain("directory:");
     // Blank model answer writes no model: line.
     expect(content).not.toContain("model:");
@@ -450,6 +534,19 @@ describe("runCli schedule add", () => {
     );
     expect(logs.lines.join("\n")).not.toContain("/st");
     expect(close).toHaveBeenCalledTimes(1);
+  });
+
+  it("omits the silence: line when the silence answer is blank (built-in default applies)", async () => {
+    inputOverrides["Silence window (default 30m)"] = "";
+    const { runCli } = await import("./cli");
+    try {
+      await runCli(["node", "agent-bridge", "schedule", "add"]);
+    } finally {
+      // no-op; logs not needed here
+    }
+
+    const [, content] = writeFile.mock.calls[0] as [string, string, string];
+    expect(content).not.toContain("silence:");
   });
 
   it("includes the directory line when a working directory is provided", async () => {
@@ -675,8 +772,12 @@ describe("runCli queue add", () => {
     resetPromptMocks();
     delete inputOverrides["Queue name"];
     delete inputOverrides["Workers (default 1)"];
+    delete inputOverrides["Timeout (default 5h)"];
+    delete inputOverrides["Silence window (default 30m)"];
     delete inputOverrides["Model (optional, blank = channel default)"];
     delete inputOverrides["Working directory (optional, blank = bridge cwd)"];
+    const bodyPrompt = BODY_PROMPT;
+    delete inputOverrides[bodyPrompt];
     loadConfig.mockImplementation(async () => CHANNEL_WITH_DEMO);
     mkdir.mockClear();
     writeFile.mockClear();
@@ -687,7 +788,7 @@ describe("runCli queue add", () => {
     listQueueDefinitions.mockResolvedValue([]);
   });
 
-  it("writes a queue file with the collected values and prints binding + insert guidance", async () => {
+  it("asks the unified question sequence and writes the queue file (T06)", async () => {
     const { runCli } = await import("./cli");
     const logs = captureLogs();
     try {
@@ -696,12 +797,16 @@ describe("runCli queue add", () => {
       logs.restore();
     }
 
-    // No channel step anymore (T1): name, workers, model, directory only.
+    // Unified wizard order (T06): name → workers → timeout → silence → model
+    // → directory → body.
     expect(promptCalls).toEqual([
       "input:Queue name",
       "input:Workers (default 1)",
+      "input:Timeout (default 5h)",
+      "input:Silence window (default 30m)",
       "input:Model (optional, blank = channel default)",
       "input:Working directory (optional, blank = bridge cwd)",
+      "input:Shared context body (optional, blank = empty; prepended to every task prompt)",
     ]);
     expect(promptCalls.some((call) => call.startsWith("select"))).toBe(false);
     expect(writeFile).toHaveBeenCalledTimes(1);
@@ -710,9 +815,11 @@ describe("runCli queue add", () => {
     // channel and target (T1).
     expect(content).not.toContain("channel:");
     expect(content).toContain("workers: 1");
-    // Blank model answer writes no model: line.
+    // Default timeout/silence answers write their lines (T06).
+    expect(content).toContain("timeout: 5h");
+    expect(content).toContain("silence: 30m");
+    // Blank model/directory/body answers write no line and an empty body.
     expect(content).not.toContain("model:");
-    // Blank directory answer writes no directory: line.
     expect(content).not.toContain("directory:");
     // Atomic write commits to the queue file path.
     expect(rename).toHaveBeenCalledWith(expect.any(String), "/tmp/queues-test/inbox.md");
@@ -722,6 +829,34 @@ describe("runCli queue add", () => {
     expect(out).toContain("- Send `/queue-here inbox` in chat app to bind a chat.");
     expect(out).toContain("Insert tasks with `agent-bridge queue insert inbox --prompt");
     expect(close).toHaveBeenCalledTimes(1);
+  });
+
+  it("writes a timeout/silence line when a duration is answered and omits it when blank", async () => {
+    inputOverrides["Timeout (default 5h)"] = "1h";
+    inputOverrides["Silence window (default 30m)"] = "";
+    const { runCli } = await import("./cli");
+    try {
+      await runCli(["node", "agent-bridge", "queue", "add"]);
+    } finally {
+      // no-op; logs not needed here
+    }
+
+    const [, content] = writeFile.mock.calls[0] as [string, string, string];
+    expect(content).toContain("timeout: 1h");
+    expect(content).not.toContain("silence:");
+  });
+
+  it("writes the shared context body when one is answered", async () => {
+    inputOverrides[BODY_PROMPT] = "You are the release bot.";
+    const { runCli } = await import("./cli");
+    try {
+      await runCli(["node", "agent-bridge", "queue", "add"]);
+    } finally {
+      // no-op; logs not needed here
+    }
+
+    const [, content] = writeFile.mock.calls[0] as [string, string, string];
+    expect(content).toContain("You are the release bot.");
   });
 
   it("writes workers: 2 when a workers value is answered", async () => {
@@ -833,6 +968,75 @@ describe("runCli queue insert", () => {
     expect(insertQueueTask).toHaveBeenCalledWith("inbox", "Do the thing.", undefined, {
       directory: "/data/work",
     });
+  });
+
+  it("passes --model/--timeout/--silence through as the task-level overrides (T03)", async () => {
+    loadQueueDefinition.mockResolvedValue(makeQueueDefinition({ target: "chat:123" }));
+    const { runCli } = await import("./cli");
+    const logs = captureLogs();
+    try {
+      await runCli([
+        "node",
+        "agent-bridge",
+        "queue",
+        "insert",
+        "inbox",
+        "--prompt",
+        "Do the thing.",
+        "--model",
+        "azure-openai-responses/gpt-5.6-terra",
+        "--timeout",
+        "10m",
+        "--silence",
+        "30m",
+      ]);
+    } finally {
+      logs.restore();
+    }
+
+    expect(insertQueueTask).toHaveBeenCalledWith("inbox", "Do the thing.", undefined, {
+      model: "azure-openai-responses/gpt-5.6-terra",
+      timeout: "10m",
+      silence: "30m",
+    });
+  });
+
+  it("rejects a bad --timeout before anything is written (T03)", async () => {
+    loadQueueDefinition.mockResolvedValue(makeQueueDefinition({ target: "chat:123" }));
+    const { runCli } = await import("./cli");
+    await expect(
+      runCli([
+        "node",
+        "agent-bridge",
+        "queue",
+        "insert",
+        "inbox",
+        "--prompt",
+        "Do the thing.",
+        "--timeout",
+        "10x",
+      ]),
+    ).rejects.toThrow('Invalid value for --timeout: "10x"');
+    expect(insertQueueTask).not.toHaveBeenCalled();
+  });
+
+  it("rejects a bad --silence before anything is written (T03)", async () => {
+    loadQueueDefinition.mockResolvedValue(makeQueueDefinition({ target: "chat:123" }));
+    const { runCli } = await import("./cli");
+    await expect(
+      runCli([
+        "node",
+        "agent-bridge",
+        "queue",
+        "insert",
+        "inbox",
+        "--prompt",
+        "Do the thing.",
+        "--silence",
+        "forever",
+      ]),
+    ).rejects.toThrow('Invalid value for --silence: "forever"');
+    expect(insertQueueTask).not.toHaveBeenCalled();
   });
 
   it("prints a warning when the queue has no target", async () => {
@@ -1231,5 +1435,460 @@ describe("runCli queue history", () => {
     expect(out.indexOf("1s")).toBeLessThan(out.indexOf("1m30s"));
     // Table rows only: header + two data rows.
     expect(logs.lines).toHaveLength(3);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// `queue retry <queue> <task-id>` (spec D2/T02). The queue-file module is
+// mocked at the top (listQueueDefinitions/loadQueueDefinition/insertQueueTask/
+// listQueueTasks overridden; the rest is the real module), so the real
+// retryQueueTask is wired through a spy below per test.
+// ---------------------------------------------------------------------------
+
+describe("runCli queue retry", () => {
+  beforeEach(() => {
+    resetPromptMocks();
+    listQueueTasks.mockClear();
+    listQueueTasks.mockResolvedValue([]);
+  });
+
+  it("re-queues a failed task: state back to pending, dead-letter lines cleared", async () => {
+    const queueFile = await import("./modules/queue/queue-file");
+    // Seed a real failed task file under the fixed temp root via the mocked
+    // node:fs/promises: writeQueueDefinition-equivalent seeding is overkill;
+    // retryQueueTask itself is spied, so assert the call-through and output.
+    const retrySpy = vi
+      .spyOn(queueFile, "retryQueueTask")
+      .mockResolvedValue({ ok: true });
+    const { runCli } = await import("./cli");
+    const logs = captureLogs();
+    try {
+      await runCli(["node", "agent-bridge", "queue", "retry", "inbox", "1750000000000-abcd"]);
+    } finally {
+      logs.restore();
+    }
+    expect(retrySpy).toHaveBeenCalledWith("inbox", "1750000000000-abcd");
+    expect(logs.lines.join("\n")).toContain(
+      're-queued (state: pending)',
+    );
+    expect(logs.lines.join("\n")).toContain("1750000000000-abcd");
+    retrySpy.mockRestore();
+  });
+
+  it("rejects a task that is not in the failed state", async () => {
+    const queueFile = await import("./modules/queue/queue-file");
+    const retrySpy = vi.spyOn(queueFile, "retryQueueTask").mockResolvedValue({
+      ok: false,
+      reason: 'task "1750000000000-abcd" is not failed (state: running) — only failed tasks can be retried',
+    });
+    listQueueTasks.mockResolvedValue([makeQueueTask({ state: "running" })]);
+    const { runCli } = await import("./cli");
+    await expect(
+      runCli(["node", "agent-bridge", "queue", "retry", "inbox", "1750000000000-abcd"]),
+    ).rejects.toThrow(/not failed.*running/);
+    retrySpy.mockRestore();
+  });
+
+  it("rejects a missing task", async () => {
+    const queueFile = await import("./modules/queue/queue-file");
+    const retrySpy = vi.spyOn(queueFile, "retryQueueTask").mockResolvedValue({
+      ok: false,
+      reason: 'task "1750000000000-abcd" not found in queue "inbox"',
+    });
+    const { runCli } = await import("./cli");
+    await expect(
+      runCli(["node", "agent-bridge", "queue", "retry", "inbox", "1750000000000-abcd"]),
+    ).rejects.toThrow('Task "1750000000000-abcd" not found in queue "inbox".');
+    retrySpy.mockRestore();
+  });
+
+  it("rejects an invalid task id shape", async () => {
+    const queueFile = await import("./modules/queue/queue-file");
+    const retrySpy = vi.spyOn(queueFile, "retryQueueTask");
+    const { runCli } = await import("./cli");
+    await expect(
+      runCli(["node", "agent-bridge", "queue", "retry", "inbox", "not-an-id"]),
+    ).rejects.toThrow('Task "not-an-id" not found in queue "inbox".');
+    expect(retrySpy).not.toHaveBeenCalled();
+    retrySpy.mockRestore();
+  });
+
+  it("rejects an invalid queue name without touching storage", async () => {
+    const queueFile = await import("./modules/queue/queue-file");
+    const retrySpy = vi.spyOn(queueFile, "retryQueueTask");
+    const { runCli } = await import("./cli");
+    await expect(
+      runCli(["node", "agent-bridge", "queue", "retry", "Bad_Name", "1750000000000-abcd"]),
+    ).rejects.toThrow("Queue name must be [a-z0-9-]+");
+    expect(retrySpy).not.toHaveBeenCalled();
+    retrySpy.mockRestore();
+  });
+
+  it("end-to-end against the real writers: failed task file is flipped to pending and cleaned", async () => {
+    // Drive the REAL retryQueueTask through the mocked node:fs/promises the
+    // same way the queue add wizard tests do (fixed temp root). The real
+    // function is captured from the mocked module BEFORE it is spied (the
+    // vi.mock spread keeps the original export reachable).
+    const queueFile = await import("./modules/queue/queue-file");
+    const realRetry = queueFile.retryQueueTask;
+    const taskPath = `${TEST_QUEUES_ROOT}/inbox.tasks/1750000000000-abcd.md`;
+    // Seed: the real retryQueueTask reads the failed task file via readFile.
+    (readFile as ReturnType<typeof vi.fn>).mockImplementation(async (p: unknown) => {
+      if (String(p) === taskPath) {
+        return "---\nstate: failed\nenqueuedAt: 2026-08-19T08:00:00.000Z\nfailedAt: 2026-08-20T08:00:00.000Z\nreason: boom\nagentSessionId: pi-coding-agent:1\n---\n\nDo the thing.\n";
+      }
+      throw Object.assign(new Error("ENOENT"), { code: "ENOENT" });
+    });
+    let written = "";
+    (writeFile as ReturnType<typeof vi.fn>).mockImplementation(
+      async (_p: unknown, content: unknown) => {
+        written = String(content);
+      },
+    );
+    const retrySpy = vi
+      .spyOn(queueFile, "retryQueueTask")
+      .mockImplementation(((name: string, taskId: string, root?: string) =>
+        realRetry(name, taskId, root ?? TEST_QUEUES_ROOT)) as typeof realRetry);
+    const { runCli } = await import("./cli");
+    const logs = captureLogs();
+    try {
+      await runCli(["node", "agent-bridge", "queue", "retry", "inbox", "1750000000000-abcd"]);
+    } finally {
+      logs.restore();
+    }
+    // ONE atomic write: state back to pending, all three dead-letter lines
+    // removed, body and enqueuedAt intact.
+    expect(written).toBe(
+      "---\nstate: pending\nenqueuedAt: 2026-08-19T08:00:00.000Z\n---\n\nDo the thing.\n",
+    );
+    expect(logs.lines.join("\n")).toContain("re-queued (state: pending)");
+    retrySpy.mockRestore();
+  });
+});
+
+// ---------------------------------------------------------------------------
+// `schedule run <task-name>` (spec D6/T06). The Scheduler module is mocked at
+// the top (the class constructor captured; runNow/start/stop are spies), so
+// these tests assert the CLI's wiring and outputs without a real runtime.
+// ---------------------------------------------------------------------------
+
+describe("runCli schedule run", () => {
+  /** Mutable wait knobs from the module under test (set per test). */
+  let WAIT: { pollMs: number; graceMs: number; extraTimeoutMs: number };
+  beforeEach(async () => {
+    resetPromptMocks();
+    // A configured channel is the default fixture; the no-channels test
+    // overrides it back to an empty config.
+    loadConfig.mockImplementation(async () => CHANNEL_WITH_DEMO);
+    loadAllTasks.mockClear();
+    loadAllTasks.mockResolvedValue([makeLoadedTask()]);
+    schedulerRunNow.mockResolvedValue({ ok: true });
+    // Shrink the settle-wait knobs so the history polling stays fast; the
+    // mocked run-history reader throws ENOENT, which the settle-wait
+    // swallows, so the bounded deadline (extraTimeoutMs) releases the wait.
+    ({ SCHEDULE_RUN_WAIT: WAIT } = await import("./cli"));
+    WAIT.pollMs = 1;
+    WAIT.graceMs = 1;
+    WAIT.extraTimeoutMs = 50;
+  });
+
+  it("constructs the one-shot scheduler, calls runNow and prints the trigger confirmation", async () => {
+    // A fresh terminal history line makes the wait settle immediately.
+    const { RUN_HISTORY_DIR } = await import("./config/channel-state");
+    WAIT.extraTimeoutMs = 60_000;
+    seedHistory({
+      [`${RUN_HISTORY_DIR}/schedule.jsonl`]: makeHistoryLine({ ts: new Date().toISOString() }),
+    });
+    const { runCli } = await import("./cli");
+    const logs = captureLogs();
+    try {
+      await runCli(["node", "agent-bridge", "schedule", "run", "daily-report"]);
+    } finally {
+      logs.restore();
+    }
+    seedHistory({});
+
+    // Existence check first, then the trigger through the Scheduler entry.
+    expect(loadAllTasks).toHaveBeenCalledWith();
+    expect(schedulerRunNow).toHaveBeenCalledWith("daily-report");
+    expect(schedulerStart).toHaveBeenCalledTimes(1);
+    expect(schedulerStop).toHaveBeenCalledTimes(1);
+    // The one-shot channel brings the client adapter online before the fire
+    // (deliveries must resolve the target chat) and stops scheduler/core in
+    // the teardown order.
+    expect(fakeClientModule.createClientAdapter).toHaveBeenCalled();
+    expect(coreStart).toHaveBeenCalledTimes(1);
+    expect(coreStop).toHaveBeenCalledTimes(1);
+    expect(logs.lines.join("\n")).toContain(
+      'Scheduled task "daily-report" triggered — the run result will be delivered to the task\'s target chat.',
+    );
+  });
+  it("validates the task name shape before touching storage", async () => {
+    const { runCli } = await import("./cli");
+    await expect(
+      runCli(["node", "agent-bridge", "schedule", "run", "Bad_Name"]),
+    ).rejects.toThrow("Task name must be [a-z0-9-]+");
+    expect(loadAllTasks).not.toHaveBeenCalled();
+    expect(schedulerRunNow).not.toHaveBeenCalled();
+  });
+
+  it("waits for the run's terminal history line, then prints the success message (settled)", async () => {
+    // Seed a terminal history line whose ts is NEWER than the CLI's sinceIso
+    // (fresh run): the settle-wait must release on it BEFORE the bounded
+    // deadline (extraTimeoutMs = 60 s here) fires.
+    const { RUN_HISTORY_DIR } = await import("./config/channel-state");
+    WAIT.pollMs = 5;
+    WAIT.graceMs = 1;
+    WAIT.extraTimeoutMs = 60_000;
+    const started = Date.now();
+    seedHistory({
+      [`${RUN_HISTORY_DIR}/schedule.jsonl`]: makeHistoryLine({ ts: new Date().toISOString() }),
+    });
+    const { runCli } = await import("./cli");
+    const logs = captureLogs();
+    try {
+      await runCli(["node", "agent-bridge", "schedule", "run", "daily-report"]);
+    } finally {
+      logs.restore();
+    }
+    // Released by the history line, not by the 60 s deadline; the success
+    // message is printed only on the settled path.
+    expect(Date.now() - started).toBeLessThan(60_000);
+    expect(coreStop).toHaveBeenCalledTimes(1);
+    expect(logs.lines.join("\n")).toContain(
+      'Scheduled task "daily-report" triggered — the run result will be delivered to the task\'s target chat.',
+    );
+    seedHistory({});
+  }, 20_000);
+
+  it("prints the not-settled warning (not success) when the bounded wait times out", async () => {
+    // No history at all (reader throws ENOENT): the wait runs to the bound
+    // (task timeout 10ms + extraTimeoutMs 20ms) and must NOT print the
+    // success message — the one-shot teardown kills a still-running run only
+    // past its own timeout bound.
+    loadAllTasks.mockResolvedValue([makeLoadedTask({ timeoutMs: 10 })]);
+    WAIT.pollMs = 1;
+    WAIT.graceMs = 1;
+    WAIT.extraTimeoutMs = 20;
+    const { runCli } = await import("./cli");
+    const errSpy = vi.spyOn(console, "error").mockImplementation(() => {});
+    const logs = captureLogs();
+    try {
+      await runCli(["node", "agent-bridge", "schedule", "run", "daily-report"]);
+    } finally {
+      logs.restore();
+      errSpy.mockRestore();
+    }
+    const out = logs.lines.join("\n");
+    expect(out).not.toContain(
+      "triggered — the run result will be delivered",
+    );
+    // Still tears the channel down (the run is past its own timeout bound).
+    expect(schedulerStop).toHaveBeenCalledTimes(1);
+    expect(coreStop).toHaveBeenCalledTimes(1);
+  }, 20_000);
+
+  it("prints the interrupted warning and exits non-zero when SIGINT lands mid-wait", async () => {
+    // Flip the SIGINT flag a moment after runNow is accepted; the wait must
+    // end as interrupted: warning on stderr, non-zero exit code, no success
+    // message, teardown still performed.
+    WAIT.pollMs = 5;
+    WAIT.graceMs = 1;
+    WAIT.extraTimeoutMs = 60_000;
+    schedulerRunNow.mockImplementation(async () => {
+      process.emit("SIGINT");
+      return { ok: true };
+    });
+    const { runCli } = await import("./cli");
+    const errLines: string[] = [];
+    const errSpy = vi.spyOn(console, "error").mockImplementation((...args: unknown[]) => {
+      errLines.push(args.map(String).join(" "));
+    });
+    const logs = captureLogs();
+    try {
+      await runCli(["node", "agent-bridge", "schedule", "run", "daily-report"]);
+    } finally {
+      logs.restore();
+      errSpy.mockRestore();
+    }
+    const out = logs.lines.join("\n");
+    expect(out).not.toContain("triggered — the run result will be delivered");
+    expect(errLines.join("\n")).toContain("interrupted by user (SIGINT)");
+    expect(process.exitCode).toBe(1);
+    expect(schedulerStop).toHaveBeenCalledTimes(1);
+    expect(coreStop).toHaveBeenCalledTimes(1);
+    process.exitCode = 0;
+  }, 20_000);
+
+  it("passes the configured working-directory allowlist into the one-shot core", async () => {
+    loadConfig.mockImplementation(async () => ({
+      channels: CHANNEL_WITH_DEMO.channels,
+      defaults: {
+        agentIdleTimeoutMs: 60_000,
+        allowedWorkingDirectoryRoots: ["/srv/work"],
+      },
+    }));
+    // A fresh terminal history line makes the wait settle immediately.
+    const { RUN_HISTORY_DIR } = await import("./config/channel-state");
+    WAIT.extraTimeoutMs = 60_000;
+    seedHistory({
+      [`${RUN_HISTORY_DIR}/schedule.jsonl`]: makeHistoryLine({ ts: new Date().toISOString() }),
+    });
+    const { runCli } = await import("./cli");
+    const gatewayCore = await import("./core/gateway-core");
+    const coreMock = vi.mocked(gatewayCore.GatewayCore);
+    const callsBefore = coreMock.mock.calls.length;
+    await runCli(["node", "agent-bridge", "schedule", "run", "daily-report"]);
+    seedHistory({});
+    const coreOptions = coreMock.mock.calls[callsBefore][0] as {
+      allowedWorkingDirectoryRoots?: string[];
+      agentIdleTimeoutMs: number;
+    };
+    expect(coreOptions.allowedWorkingDirectoryRoots).toEqual(["/srv/work"]);
+    expect(coreOptions.agentIdleTimeoutMs).toBe(60_000);
+  }, 20_000);
+
+  it("errors without constructing a scheduler when the task does not exist", async () => {
+    loadAllTasks.mockResolvedValue([]);
+    const { runCli } = await import("./cli");
+    await expect(
+      runCli(["node", "agent-bridge", "schedule", "run", "daily-report"]),
+    ).rejects.toThrow('No scheduled task "daily-report" found.');
+    expect(schedulerRunNow).not.toHaveBeenCalled();
+    expect(schedulerCtorArgs.length).toBe(0);
+  });
+
+  it("maps a failed FireResult onto a localized error with the reason", async () => {
+    schedulerRunNow.mockResolvedValue({ ok: false, reason: "task has no valid target" });
+    const { runCli } = await import("./cli");
+    await expect(
+      runCli(["node", "agent-bridge", "schedule", "run", "daily-report"]),
+    ).rejects.toThrow('Failed to trigger scheduled task "daily-report": task has no valid target');
+    expect(schedulerStop).toHaveBeenCalledTimes(1);
+    expect(coreStop).toHaveBeenCalledTimes(1);
+  });
+
+  it("wires the owning channel's agent module and validates the target with the client module", async () => {
+    loadConfig.mockImplementation(async () => CHANNEL_WITH_DEMO);
+    loadAllTasks.mockResolvedValue([
+      makeLoadedTask({ channel: "demo", target: "feishu:dm:oc_x" }),
+    ]);
+    // A fresh terminal history line makes the wait settle immediately.
+    const { RUN_HISTORY_DIR } = await import("./config/channel-state");
+    WAIT.extraTimeoutMs = 60_000;
+    seedHistory({
+      [`${RUN_HISTORY_DIR}/schedule.jsonl`]: makeHistoryLine({ ts: new Date().toISOString() }),
+    });
+    const { runCli } = await import("./cli");
+    const gatewayCore = await import("./core/gateway-core");
+    const coreMock = vi.mocked(gatewayCore.GatewayCore);
+    const coreCallsBefore = coreMock.mock.calls.length;
+    await runCli(["node", "agent-bridge", "schedule", "run", "daily-report"]);
+    seedHistory({});
+
+    // The core is constructed exactly once (for the task's owning channel).
+    expect(coreMock.mock.calls.length - coreCallsBefore).toBe(1);
+    // The scheduler bridges dispatch through the core and validates targets
+    // with the client module's session-id parser.
+    const options = lastSchedulerOptions();
+    expect(typeof options.dispatchClientEvent).toBe("function");
+    expect(typeof options.validateTarget).toBe("function");
+  });
+
+  it("rejects a task whose owning channel is not configured", async () => {
+    loadAllTasks.mockResolvedValue([makeLoadedTask({ channel: "ghost" })]);
+    const { runCli } = await import("./cli");
+    await expect(
+      runCli(["node", "agent-bridge", "schedule", "run", "daily-report"]),
+    ).rejects.toThrow('bound to channel "ghost"');
+    expect(schedulerRunNow).not.toHaveBeenCalled();
+  });
+
+  it("reports when no channels are configured at all", async () => {
+    loadConfig.mockImplementation(async () => ({
+      channels: {},
+      defaults: { agentIdleTimeoutMs: 60_000 },
+    }));
+    const { runCli } = await import("./cli");
+    await expect(
+      runCli(["node", "agent-bridge", "schedule", "run", "daily-report"]),
+    ).rejects.toThrow("No channels are configured");
+    expect(schedulerRunNow).not.toHaveBeenCalled();
+  });
+});
+
+// ---------------------------------------------------------------------------
+// i18n completeness (T06): every key the CLI touches must exist in BOTH
+// locales and produce non-empty, distinct-from-the-key strings. en-US is the
+// fallback locale, so a missing zh key would silently render English — the
+// explicit parity check below catches that.
+// ---------------------------------------------------------------------------
+
+describe("i18n cli key parity (en-US / zh-CN)", () => {
+  const CLI_KEYS = [
+    "cli.examplePrompt",
+    "cli.queueNamePrompt",
+    "cli.queueNameInvalid",
+    "cli.queueNameExists",
+    "cli.workersPrompt",
+    "cli.workersInvalid",
+    "cli.modelPrompt",
+    "cli.directoryPrompt",
+    "cli.timeoutPrompt",
+    "cli.silencePrompt",
+    "cli.modelPlaceholder",
+    "cli.bodyPrompt",
+    "cli.taskNamePrompt",
+    "cli.taskNameInvalid",
+    "cli.taskNameExists",
+    "cli.schedulePrompt",
+    "cli.scheduleInvalid",
+    "cli.taskCreated",
+    "cli.taskCreatedGuideFile",
+    "cli.taskCreatedGuideTarget",
+    "cli.queueCreated",
+    "cli.queueCreatedGuideFile",
+    "cli.queueCreatedGuideBind",
+    "cli.queueCreatedGuideInsert",
+    "cli.queueInserted",
+    "cli.queueInsertPromptRequired",
+    "cli.queueInsertInvalidDuration",
+    "cli.queueInsertUnboundWarning",
+    "cli.queueNotFound",
+    "cli.noQueues",
+    "cli.queueRetried",
+    "cli.queueRetryTaskNotFound",
+    "cli.queueRetryNotFailed",
+    "cli.scheduleRunTriggered",
+    "cli.scheduleRunWaitNotSettled",
+    "cli.scheduleRunWaitInterrupted",
+    "cli.scheduleRunWaitTimeout",
+    "cli.scheduleRunFailed",
+    "cli.scheduleRunTaskNotFound",
+    "cli.scheduleRunNoChannels",
+    "cli.scheduleRunChannelNotFound",
+  ] as const;
+
+  it("has a non-empty translation for every cli key in both locales", async () => {
+    const { getTranslator } = await import("./i18n");
+    const en = getTranslator("en-US");
+    const zh = getTranslator("zh-CN");
+    for (const key of CLI_KEYS) {
+      expect(en(key as never), `en-US missing ${key}`).toBeTruthy();
+      expect(en(key as never), `en-US ${key} is the raw key`).not.toBe(key);
+      expect(zh(key as never), `zh-CN missing ${key}`).toBeTruthy();
+      expect(zh(key as never), `zh-CN ${key} is the raw key`).not.toBe(key);
+    }
+  });
+
+  it("renders the localized schedule prompt with examples in both locales", async () => {
+    const { getTranslator } = await import("./i18n");
+    const examples = "every 5m, daily 09:00";
+    expect(getTranslator("en-US")("cli.schedulePrompt", { examples })).toBe(
+      `Schedule (examples: ${examples})`,
+    );
+    expect(getTranslator("zh-CN")("cli.schedulePrompt", { examples })).toBe(
+      `定时表达式（示例：${examples}）`,
+    );
   });
 });

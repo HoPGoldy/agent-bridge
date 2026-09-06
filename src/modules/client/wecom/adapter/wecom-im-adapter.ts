@@ -4,6 +4,7 @@ import type {
   ClientOutputEvent,
   ClientSessionStateStore,
   IMAdapter,
+  OnQueueHere,
   OnScheduleHere,
   OnScheduleRun,
   WecomClientConfig,
@@ -13,11 +14,14 @@ import { createLogger, type Logger } from "../../../../core/logger";
 import { isCompletedCommandResponse, isTerminalAgentError } from "../../utils/error-events";
 import { ProgressRenderer } from "../../utils/progress-renderer";
 import {
+  formatQueueHereReply,
   formatScheduleHereReply,
   formatScheduleRunReply,
   parseSlashCommand,
   resolveHelpMarkdown,
   resolveSlashCommandEvent,
+  type QueueHereCommand,
+  type QueueHereUsageCommand,
   type ScheduleHereCommand,
   type ScheduleHereUsageCommand,
   type ScheduleRunCommand,
@@ -76,6 +80,7 @@ export class WecomIMAdapter implements IMAdapter {
   readonly #sessionState: ClientSessionStateStore<ImClientSessionStateV1>;
   readonly #onScheduleRun: OnScheduleRun | undefined;
   readonly #onScheduleHere: OnScheduleHere | undefined;
+  readonly #onQueueHere: OnQueueHere | undefined;
   #onOutput: ((event: ClientOutputEvent) => Promise<void> | void) | null = null;
   #client: WecomClient | null = null;
   #egressQueue: ClientInputEvent[] = [];
@@ -113,6 +118,7 @@ export class WecomIMAdapter implements IMAdapter {
     ),
     onScheduleRun?: OnScheduleRun,
     onScheduleHere?: OnScheduleHere,
+    onQueueHere?: OnQueueHere,
   ) {
     this.#config = config;
     this.#logger = logger;
@@ -120,6 +126,7 @@ export class WecomIMAdapter implements IMAdapter {
     this.#sessionState = sessionState;
     this.#onScheduleRun = onScheduleRun;
     this.#onScheduleHere = onScheduleHere;
+    this.#onQueueHere = onQueueHere;
   }
 
   async start(onOutput: (event: ClientOutputEvent) => Promise<void> | void): Promise<void> {
@@ -173,6 +180,12 @@ export class WecomIMAdapter implements IMAdapter {
           // Adapter-local target binding (spec D7): never reaches the core.
           this.#logger.info(`received local schedule-here command ${normalizedText} (session=${clientSessionId})`);
           await this.#handleScheduleHere(parsedCommand, chatId, messageId);
+          return;
+        }
+        if (parsedCommand.type === "queue.here" || parsedCommand.type === "queue.here.usage") {
+          // Adapter-local queue target binding (spec D4): never reaches the core.
+          this.#logger.info(`received local queue-here command ${normalizedText} (session=${clientSessionId})`);
+          await this.#handleQueueHere(parsedCommand, chatId, messageId);
           return;
         }
         if (parsedCommand.type === "command.session.resume.usage") {
@@ -429,6 +442,33 @@ const replyToMessageId = this.#lastInboundMessageIdBySession.get(event.clientSes
     await this.#client?.sendText(
       chatId,
       formatScheduleHereReply(result, command.taskName, this.#t),
+      messageId,
+    );
+  }
+
+  async #handleQueueHere(
+    command: QueueHereCommand | QueueHereUsageCommand,
+    chatId: string,
+    messageId: string,
+  ): Promise<void> {
+    if (command.type === "queue.here.usage") {
+      await this.#client?.sendText(chatId, this.#t("client.queueHereUsage"), messageId);
+      return;
+    }
+
+    if (!this.#onQueueHere) {
+      // The runner always injects the bridge (spec D4); degrade gracefully
+      // if it is ever absent: log, and reply nothing.
+      this.#logger.warn(
+        `onQueueHere is not injected; dropping /queue-here for queue "${command.queueName}" (session=${command.clientSessionId})`,
+      );
+      return;
+    }
+
+    const result = await this.#onQueueHere(command.queueName, command.clientSessionId);
+    await this.#client?.sendText(
+      chatId,
+      formatQueueHereReply(result, command.queueName, this.#t),
       messageId,
     );
   }

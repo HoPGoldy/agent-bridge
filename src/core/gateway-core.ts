@@ -11,15 +11,9 @@ import type {
   IngressResult,
 } from "../types";
 import { createAgentSessionStateRegistry } from "../config/agent-session-state";
-import { createInMemoryChannelStateStore, QUEUES_DIR } from "../config/channel-state";
+import { createInMemoryChannelStateStore } from "../config/channel-state";
 import { SYNTHETIC_SESSION_PREFIX } from "../modules/schedule/scheduler";
-import {
-  isValidQueueName,
-  loadQueueDefinition,
-  QUEUE_SESSION_PREFIX,
-  bindQueue,
-  type QueueDefinition,
-} from "../modules/queue/queue-file";
+import { QUEUE_SESSION_PREFIX } from "../modules/queue/queue-file";
 import { getTranslatorForCommon, type Translator } from "../i18n";
 import { createLogger, type Logger } from "./logger";
 
@@ -53,15 +47,6 @@ export interface GatewayCoreConstructorOptions extends GatewayCoreOptions {
    * only its own prefix's events.
    */
   onQueueOutput?: (event: ClientInputEvent) => void | Promise<void>;
-  /**
-   * Root directory of the event-queue definition files (`queues/<name>.md`,
-   * spec D1). Read by the core-routed `/queue-here` command (spec D4) to
-   * check existence and binding before writing the current channel's name and
-   * the chat's `clientSessionId` into the `channel`/`target` lines (T1's
-   * `bindQueue`); defaults to the built-in `QUEUES_DIR`. Tests point this at
-   * a temporary directory.
-   */
-  queuesRoot?: string;
 }
 
 interface AgentRuntime {
@@ -93,8 +78,6 @@ export class GatewayCore {
    * channel runner to the queue controller's output handler.
    */
   readonly #onQueueOutput?: (event: ClientInputEvent) => void | Promise<void>;
-  /** Queue-definition root read and written by `/queue-here` (spec D4). */
-  readonly #queuesRoot: string;
   /** Pure routing map: client session id -> agent session id. */
   readonly #clientToAgentSession = new Map<string, string>();
   readonly #agentRuntimes = new Map<string, AgentRuntime>();
@@ -118,7 +101,6 @@ export class GatewayCore {
     common,
     onScheduleOutput,
     onQueueOutput,
-    queuesRoot,
   }: GatewayCoreConstructorOptions) {
     this.#imAdapter = imAdapter;
     this.#agentModule = agentModule;
@@ -132,7 +114,6 @@ export class GatewayCore {
     this.#t = getTranslatorForCommon(common);
     this.#onScheduleOutput = onScheduleOutput;
     this.#onQueueOutput = onQueueOutput;
-    this.#queuesRoot = queuesRoot ?? QUEUES_DIR;
   }
 
   async start(): Promise<void> {
@@ -288,19 +269,12 @@ export class GatewayCore {
       return { ok: true };
     }
 
-    // Core-routed `/queue-here <name>` (spec D4): the IM adapters do not
-    // parse this command, so an unrecognized slash command arrives here as a
-    // plain chat-originated `user.message` — the core recognizes the raw
-    // text itself. Synthetic (`schedule:*` / `queue:*`) sessions never take
-    // this path: their user.message texts are controller-injected prompts.
-    if (
-      event.type === "user.message" &&
-      !this.#isSyntheticClientSession(event.clientSessionId) &&
-      (await this.#handleQueueHereCommand(event.clientSessionId, event.text))
-    ) {
-      return { ok: true };
-    }
-
+    // The former core-routed queue-bind command handling is gone (spec D4,
+    // T05): the IM adapters parse that command locally and never reach the
+    // core with it, so every remaining `user.message` — chat text and
+    // synthetic controller-injected prompts alike — goes straight to the
+    // agent session. The synthetic-session guard inside `#handleUserMessage`
+    // stays.
     await this.#handleUserMessage(event.clientSessionId, event.text);
     return { ok: true };
   }
@@ -327,105 +301,6 @@ export class GatewayCore {
       type: "user.message",
       text,
     });
-  }
-
-  /**
-   * Core-routed `/queue-here <name>` command (spec D4): binds the current
-   * chat as the queue's delivery target by writing BOTH the current channel's
-   * config name and the chat's `clientSessionId` into the queue file's
-   * `channel`/`target` front-matter lines in one atomic write (T1's
-   * `bindQueue`); the per-channel queue controller picks the binding up on
-   * its next tick reload — no direct controller call. Unlike the
-   * adapter-local `/schedule-here` (which never reaches the core), the IM
-   * adapters do not parse this command, so the raw text arrives as a plain
-   * `user.message` and is recognized here. The `target` string is the sending
-   * chat's `clientSessionId` — the exact format the queue controller's
-   * deliver callback consumes (same as `/schedule-here`). Because `channel`
-   * is always set to the current channel at bind time, a queue can be bound
-   * from any chat (a stale `channel` line from an older file is overwritten
-   * like any other). Refuses when the queue is missing or already carries a
-   * `target` (rebinding is an AI file edit). Returns `true` when `text` was a
-   * `/queue-here` command (handled, never reaching the agent session) and
-   * `false` otherwise.
-   */
-  async #handleQueueHereCommand(clientSessionId: string, text: string): Promise<boolean> {
-    const match = text.match(/^\/queue-here(?:\s+(.*))?$/i);
-    if (match === null) {
-      return false;
-    }
-    // Queue files are lowercased slugs; normalize so `/queue-here Build`
-    // binds the `build` queue (same normalization as `/schedule-here`).
-    const name = (match[1]?.trim() ?? "").toLowerCase();
-    if (!isValidQueueName(name)) {
-      await this.#deliverClientInput({
-        type: "assistant.message",
-        clientSessionId,
-        text: this.#t("client.queueHereUsage"),
-      });
-      return true;
-    }
-
-    let definition: QueueDefinition | null;
-    try {
-      definition = await loadQueueDefinition(name, this.#queuesRoot);
-    } catch (error) {
-      const detail = error instanceof Error ? error.message : String(error);
-      this.#logger.error(`failed to load queue "${name}" for /queue-here:`, error);
-      await this.#deliverClientInput({
-        type: "assistant.message",
-        clientSessionId,
-        text: this.#t("client.queueHereFailed", { name, reason: detail }),
-      });
-      return true;
-    }
-    if (definition === null) {
-      await this.#deliverClientInput({
-        type: "assistant.message",
-        clientSessionId,
-        text: this.#t("client.queueHereQueueNotFound", { name }),
-      });
-      return true;
-    }
-    // Already-bound check: a queue whose `target` is set is refused — the
-    // channel is always rewritten to the current one at bind time, so the
-    // only way to move a queue is to unbind it first (edit the file with AI).
-    if (definition.target !== undefined) {
-      await this.#deliverClientInput({
-        type: "assistant.message",
-        clientSessionId,
-        text: this.#t("client.queueHereAlreadyBound", { name }),
-      });
-      return true;
-    }
-
-    const channelName = this.#common?.channelName;
-    if (channelName === undefined || channelName === "") {
-      await this.#deliverClientInput({
-        type: "assistant.message",
-        clientSessionId,
-        text: this.#t("client.queueHereFailed", {
-          name,
-          reason: "no channel context to bind the queue to",
-        }),
-      });
-      return true;
-    }
-
-    const result = await bindQueue(name, channelName, clientSessionId, this.#queuesRoot);
-    if (!result.ok) {
-      await this.#deliverClientInput({
-        type: "assistant.message",
-        clientSessionId,
-        text: this.#t("client.queueHereFailed", { name, reason: result.reason }),
-      });
-      return true;
-    }
-    await this.#deliverClientInput({
-      type: "assistant.message",
-      clientSessionId,
-      text: this.#t("client.queueHereBound", { name }),
-    });
-    return true;
   }
 
   async #handleSessionCompact(clientSessionId: string): Promise<void> {

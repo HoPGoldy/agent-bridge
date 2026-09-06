@@ -14,13 +14,14 @@ The most important property is **isolation**: a task run never touches the targe
    agent-bridge schedule add
    ```
 
-   The wizard asks, in order:
+   The wizard asks, in order (identical to the `queue add` wizard except the schedule step; all prompts are localized):
 
    - a task name (lowercase letters, digits and hyphens only, e.g. `daily-report`; names are globally unique — there is no channel selection),
    - a schedule string (validated against the grammar below, re-prompted on error, with examples shown),
-   - an optional working directory (blank = the bridge process's current directory),
-   - a timeout (default `5h`),
-   - an optional model (blank = the channel agent config's default model; it is not validated — the CLI can't reach provider model lists, so an invalid value only surfaces when the task runs; see [How a run works](#how-a-run-works) for the exact failure behavior).
+   - a timeout (prefilled `5h`; blank = the built-in default — no `timeout:` line is written),
+   - a silence window (prefilled `30m`; blank = the built-in default — no `silence:` line is written),
+   - an optional model (blank = the channel agent config's default model — no `model:` line; it is not validated — the CLI can't reach provider model lists, so an invalid value only surfaces when the task runs; see [How a run works](#how-a-run-works) for the exact failure behavior),
+   - an optional working directory (blank = the bridge process's current directory — no `directory:` line).
 
    It writes a task file with an example prompt body, prints the file path, and prints the targeting instruction.
 
@@ -73,7 +74,7 @@ The file is front matter plus a prompt body:
 schedule: daily 09:00
 directory: ~/reports
 timeout: 30m
-silence: 10m
+silence: 30m
 enabled: true
 channel: feishu-dev
 target: feishu:dm:oc_6f9d408e630098e6dd06bb071d6b60fc
@@ -95,13 +96,13 @@ yesterday's errors.
 | `schedule` | yes | — | Schedule grammar string (see below). Missing or invalid → the task is listed with an error and never fires. |
 | `directory` | no | bridge process cwd | Working directory of the new session. `~` is expanded, relative paths resolve against the bridge process cwd, and the path is canonicalized (`realpath`) and checked at fire time — it must exist, be a directory, and be readable. An invalid directory prevents the fire and an error is sent to the target chat. |
 | `timeout` | no | `5h` | Max run duration: `<n>s`, `<n>m` or `<n>h` (e.g. `90s`, `10m`, `1h`). Unattended runs may legitimately take hours and the timeout is destructive (abort + drop, no retry), so the default errs long — tighten per task via `timeout:`. The run is killed when exceeded and the target chat receives a timeout notice. An invalid value is listed as an error and the default is used. |
-| `silence` | no | `10m` | Silence window before a probe is sent into the run: same duration syntax as `timeout`. After this many minutes with no observable run activity, the scheduler asks the run whether it is finished (see [A run completes on DONE or ends by timing out](#a-run-completes-on-done-or-ends-by-timing-out)). An invalid value is listed as an error and the default is used. |
+| `silence` | no | `30m` | Silence window before a probe is sent into the run: same duration syntax as `timeout`. After this many minutes with no observable run activity, the scheduler asks the run whether it is finished (see [A run completes on DONE or ends by timing out](#a-run-completes-on-done-or-ends-by-timing-out)). An invalid value is listed as an error and the default is used. |
 | `enabled` | no | `true` | `false` (case-insensitive) pauses the task without deleting the file. Any other value or absence means enabled. Toggle with `agent-bridge schedule enable|disable <task-name>` or by editing the file. A disabled task never fires — not on schedule and not via `/schedule-run` (it replies "is disabled") — and in-flight runs are unaffected. Re-enabling recomputes the next run from the current clock (no catch-up). |
 | `target` | no | — | Delivery address: the destination chat's clientSessionId. The recommended way to set it initially is `/schedule-here <task-name>` sent in the destination chat; the manual way is to copy the **Chat session ID** line from `/st` in that chat (see [Changing the destination chat](#changing-the-destination-chat)). Required for delivery — without it (or when it fails validation, e.g. a typo or a chat from another channel) the fire is skipped, the skip is logged, and `schedule list` shows `Target: no`. |
 | `channel` | no | — | Owning channel config name, written by `/schedule-here <task-name>` together with `target`. Each channel's scheduler fires on schedule only tasks whose `channel` matches that channel; a task with no `channel` line never fires on schedule (but can still be triggered manually with `/schedule-run`, see below). |
 | `model` | no | — | Optional per-task agent model override. Only this task's own runs use it — the channel's chat sessions are unaffected on pi, and on opencode chat `/new` only gains the same availability check against the channel config model (see the per-task model design spec, `docs/scheduled-task-model-spec.md`). Precedence: task `model` > channel agent config's `model` > env/adapter default. Blank or absent = the channel agent config's model. Parsing only checks for a non-empty string; validity is enforced at fire time by the adapter: **pi** passes it to the pi process as `--model` at spawn (an invalid model makes the process fail at startup), **opencode** runs its availability check against the effective (override-first) model and refuses to create a session. Applies to scheduled fires and `/schedule-run` alike, since both share one fire path. |
 
-`schedule add` writes the front matter with `schedule`, `directory` (only if you entered one), `timeout` and `model` (only if you entered a non-empty one), plus the example prompt body. It does not write `enabled` (absent means enabled), `target` or `channel` — the `target` and `channel` lines are meant to be set with `/schedule-here <task-name>` (or, for later manual edits, pasted from the `/st` output), and the body is meant to be replaced with your real prompt. The wizard does not offer a `silence` prompt — that field is set (and tuned) by editing the file, defaulting to `10m`.
+`schedule add` writes the front matter with `schedule`, `timeout` and `silence` (each only when a non-blank value was entered — the prefills are the built-in defaults), `model` and `directory` (only if you entered a non-empty one), plus the example prompt body. It does not write `enabled` (absent means enabled), `target` or `channel` — the `target` and `channel` lines are meant to be set with `/schedule-here <task-name>` (or, for later manual edits, pasted from the `/st` output), and the body is meant to be replaced with your real prompt.
 
 ## Schedule grammar
 
@@ -167,7 +168,7 @@ A terminal `error` during the run ends it immediately and delivers the error det
 
 **The completion protocol.** The instruction block appended to every task prompt tells the agent: to work until the task is *fully* complete, including async follow-ups it is still waiting on (background jobs, sub-agents, external callbacks); to append `BRIDGE_TASK_STATUS_DONE` as the **last line of its final message, and only then** — never in intermediate messages; and to answer honestly if asked whether it is finished, appending the marker only when it truly is. So a task waiting on asynchronous work should simply **not emit DONE until its callbacks return** — nothing else is needed; the run just stays alive and keeps accumulating.
 
-**The silence probe.** After `silence` minutes (front matter, default `10m`) without any observable run activity, the scheduler sends a probe message into the run session asking whether the task is finished (reply DONE, or keep working / keep waiting for async callbacks). Any run event — an assistant message, tool progress, or a probe answer — resets the silence window. The probe Q&A is accumulated like any other message and is included in the kept transcript file (it is not inlined in the delivered message, which carries only the last assistant message). An unanswered probe is harmless: the wall-clock `timeout` remains the only hard cap on the run.
+**The silence probe.** After `silence` minutes (front matter, default `30m`) without any observable run activity, the scheduler sends a probe message into the run session asking whether the task is finished (reply DONE, or keep working / keep waiting for async callbacks). Any run event — an assistant message, tool progress, or a probe answer — resets the silence window. The probe Q&A is accumulated like any other message and is included in the kept transcript file (it is not inlined in the delivered message, which carries only the last assistant message). An unanswered probe is harmless: the wall-clock `timeout` remains the only hard cap on the run.
 
 Fire-time validation failures behave like failures: if the working directory is invalid or the prompt is empty, **nothing is injected**; the target chat receives `❌ Scheduled task "name" could not start: <detail>` and the fire is logged. If the task has no valid `target`, there is nowhere to deliver to — the fire is skipped and only logged, and `schedule list` shows `Target: no`.
 
@@ -225,8 +226,9 @@ Bind this chat as a task's delivery target in one step — send it **in the chat
 
 | Command | What it does |
 | --- | --- |
-| `agent-bridge schedule add` | Interactive wizard: name the task (globally unique — no channel selection), enter the schedule (validated, with examples), optionally set the working directory, timeout and a per-task model, then write the task file with an example prompt and print the targeting instruction. |
+| `agent-bridge schedule add` | Interactive wizard: name the task (globally unique — no channel selection), enter the schedule (validated, with examples), timeout and silence (prefilled `5h` / `30m`; blank = the built-in default — the line is not written), optionally set the working directory and a per-task model, then write the task file with an example prompt and print the targeting instruction. |
 | `agent-bridge schedule list` | Table of every task across all channels: Task, Schedule, Enabled (`yes`/`no`), Target (`yes`/`no`), Next run (computed from the grammar at the current clock) and Status (`ERROR:`/`WARN:` notes such as missing schedule, invalid timeout, empty body, unknown keys). |
+| `agent-bridge schedule run <task-name>` | Trigger the task once now, from the CLI (same entry as the in-chat `/schedule-run`: the scheduler's `runNow`). Starts a minimal one-shot channel in-process (real client adapter + core for the task's owning channel; no queue controller, in-memory session state), blocks until the run reaches its endpoint (bounded by the task's own timeout) — the result is delivered to the task's `target` chat, and the run history is written — then tears the channel down. If the wait is interrupted (SIGINT) or times out, a warning is printed instead of the success message (the run may still be in progress — check `schedule history`). Errors on an unknown task, an invalid name, or a task whose owning `channel` is not configured. **Caveat:** the CLI connects to the IM with the channel's credentials — on wecom/weixin this displaces a running bridge's connection on that channel; stop the channel's bridge first (feishu is not affected). |
 | `agent-bridge schedule enable <task-name>` | Set `enabled: true` in the task file (atomic single-line edit). Scheduled firing resumes on the next tick, with the next run recomputed from the current clock (no catch-up). Errors on an unknown task or an invalid name. |
 | `agent-bridge schedule disable <task-name>` | Set `enabled: false` — the task is skipped (both scheduled fires and `/schedule-run`) until re-enabled; in-flight runs are unaffected. Errors on an unknown task or an invalid name. |
 | `agent-bridge schedule remove <task-name>` | Delete the task file directly. Task names are globally unique, so no disambiguation or `--channel` option is needed. |

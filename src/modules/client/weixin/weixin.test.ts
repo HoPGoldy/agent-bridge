@@ -1,5 +1,12 @@
-import { describe, expect, it } from "vitest";
+import { describe, expect, it, vi } from "vitest";
 import { weixinClientModule } from "./index";
+
+const { WeixinIMAdapterMock } = vi.hoisted(() => ({ WeixinIMAdapterMock: vi.fn() }));
+
+vi.mock("./adapter/weixin-im-adapter", async (importOriginal) => {
+  const actual = await importOriginal<typeof import("./adapter/weixin-im-adapter")>();
+  return { ...actual, WeixinIMAdapter: WeixinIMAdapterMock };
+});
 
 describe("weixinClientModule config collector", () => {
   it("accepts a valid config", () => {
@@ -38,5 +45,53 @@ describe("weixinClientModule validateSessionId", () => {
     expect(weixinClientModule.validateSessionId("weixin:chat:xxx")).toBe(false);
     expect(weixinClientModule.validateSessionId("bogus")).toBe(false);
     expect(weixinClientModule.validateSessionId("")).toBe(false);
+  });
+});
+
+describe("weixinClientModule schedule and queue bridges", () => {
+  it("passes onScheduleRun and onScheduleHere into the adapter constructor", () => {
+    const onScheduleRun = vi.fn();
+    const onScheduleHere = vi.fn();
+    const sessionState = {} as never;
+
+    weixinClientModule.createClientAdapter({
+      config: { accountId: "bot-account", token: "bot-token" },
+      common: { channelName: "demo", language: "en-US" },
+      sessionState,
+      onScheduleRun,
+      onScheduleHere,
+    });
+
+    expect(WeixinIMAdapterMock).toHaveBeenCalledWith(
+      { accountId: "bot-account", token: "bot-token" },
+      undefined,
+      { channelName: "demo", language: "en-US" },
+      sessionState,
+      onScheduleRun,
+      onScheduleHere,
+      undefined,
+    );
+  });
+
+  it("passes the onQueueHere queue bridge into the adapter constructor (T05)", () => {
+    const onQueueHere = vi.fn();
+    const sessionState = {} as never;
+
+    weixinClientModule.createClientAdapter({
+      config: { accountId: "bot-account", token: "bot-token" },
+      common: { channelName: "demo", language: "en-US" },
+      sessionState,
+      onQueueHere,
+    });
+
+    expect(WeixinIMAdapterMock).toHaveBeenCalledWith(
+      { accountId: "bot-account", token: "bot-token" },
+      undefined,
+      { channelName: "demo", language: "en-US" },
+      sessionState,
+      undefined,
+      undefined,
+      onQueueHere,
+    );
   });
 });

@@ -8,6 +8,7 @@ import {
   DEFAULT_WORKERS,
   QUEUE_SESSION_PREFIX,
   deleteQueueTask,
+  failQueueTask,
   getQueuesDir,
   insertQueueTask,
   isValidQueueName,
@@ -18,6 +19,7 @@ import {
   parseQueueDefinition,
   parseQueueTaskFile,
   bindQueue,
+  retryQueueTask,
   setQueueEnabled,
   setQueueTaskState,
   writeQueueDefinition,
@@ -158,7 +160,7 @@ Body.
     expect(definition?.name).toBe("extra");
   });
 
-  it("parses the optional silence duration with the timeout syntax, defaulting to 10m", () => {
+  it("parses the optional silence duration with the timeout syntax, defaulting to 30m", () => {
     const { definition, errors, warnings } = parseQueueDefinition(
       "silence.md",
       "---\nchannel: feishu-dev\nsilence: 5m\n---\nBody.\n",
@@ -223,7 +225,7 @@ Body.
     expect(absent.definition?.directory).toBeUndefined();
   });
 
-  it("treats a blank silence as unset (defaults to 10m)", () => {
+  it("treats a blank silence as unset (defaults to 30m)", () => {
     for (const raw of ["silence:", "silence:  ", 'silence: ""']) {
       const { definition, errors } = parseQueueDefinition(
         "blank-silence.md",
@@ -324,6 +326,62 @@ Run the migration.
     expect(absent.task?.directory).toBeUndefined();
   });
 
+  it("parses the optional task-level model/timeout/silence run parameters (T03)", () => {
+    const all = parseQueueTaskFile(
+      "1724000000000-ab12.md",
+      "---\nstate: pending\nenqueuedAt: 2026-08-19T08:00:00.000Z\nmodel: azure-openai-responses/gpt-5.6-terra\ntimeout: 30m\nsilence: 5m\n---\nGo.\n",
+    );
+    expect(all.errors).toEqual([]);
+    expect(all.warnings).toEqual([]);
+    expect(all.task?.model).toBe("azure-openai-responses/gpt-5.6-terra");
+    expect(all.task?.timeoutMs).toBe(30 * 60_000);
+    expect(all.task?.silenceMs).toBe(5 * 60_000);
+
+    // Blank values behave like the definition side's optional fields: absent.
+    const blank = parseQueueTaskFile(
+      "1724000000001-cd34.md",
+      "---\nstate: pending\nenqueuedAt: 2026-08-19T08:00:00.000Z\nmodel:\ntimeout:  \nsilence:\n---\nGo.\n",
+    );
+    expect(blank.errors).toEqual([]);
+    expect(blank.task?.model).toBeUndefined();
+    expect(blank.task?.timeoutMs).toBeUndefined();
+    expect(blank.task?.silenceMs).toBeUndefined();
+
+    const absent = parseQueueTaskFile(
+      "1724000000002-ef56.md",
+      "---\nstate: pending\nenqueuedAt: 2026-08-19T08:00:00.000Z\n---\nGo.\n",
+    );
+    expect(absent.errors).toEqual([]);
+    expect(absent.task?.model).toBeUndefined();
+    expect(absent.task?.timeoutMs).toBeUndefined();
+    expect(absent.task?.silenceMs).toBeUndefined();
+  });
+
+  it("rejects an invalid task-level timeout or silence: the error lands in errors and the task is null (T03)", () => {
+    for (const [key, raw] of [
+      ["timeout", "10x"],
+      ["timeout", "0"],
+      ["silence", "forever"],
+    ] as const) {
+      const { task, errors } = parseQueueTaskFile(
+        "1724000000000-ab12.md",
+        `---\nstate: pending\nenqueuedAt: 2026-08-19T08:00:00.000Z\n${key}: ${raw}\n---\nGo.\n`,
+      );
+      expect(task).toBeNull();
+      expect(errors).toEqual([
+        expect.stringMatching(new RegExp(`^invalid ${key} "${raw}":`)),
+      ]);
+    }
+    // The reason text comes from parseTimeout itself.
+    const { errors } = parseQueueTaskFile(
+      "1724000000000-ab12.md",
+      "---\nstate: pending\nenqueuedAt: 2026-08-19T08:00:00.000Z\ntimeout: 10x\n---\nGo.\n",
+    );
+    expect(errors).toEqual([
+      `invalid timeout "10x": invalid timeout "10x" — expected like "10m", "1h" or "90s"`,
+    ]);
+  });
+
   it("accepts the running state and quoted values", () => {
     const { task, errors } = parseQueueTaskFile(
       "1724000000001-cd34.md",
@@ -350,7 +408,9 @@ Run the migration.
         "1724000000000-ab12.md",
         `---\nstate: ${raw}\nenqueuedAt: 2026-08-19T08:00:00.000Z\n---\nGo.\n`,
       );
-      expect(errors).toEqual([`invalid state "${raw}": must be "pending" or "running"`]);
+      expect(errors).toEqual([
+        `invalid state "${raw}": must be "pending", "running" or "failed"`,
+      ]);
       expect(task).toBeNull();
     }
     // `state:` with an empty value is an invalid state, not a missing key.
@@ -358,7 +418,7 @@ Run the migration.
       "1724000000000-ab12.md",
       "---\nstate:\nenqueuedAt: 2026-08-19T08:00:00.000Z\n---\nGo.\n",
     );
-    expect(empty.errors).toEqual(['invalid state "": must be "pending" or "running"']);
+    expect(empty.errors).toEqual(['invalid state "": must be "pending", "running" or "failed"']);
     expect(empty.task).toBeNull();
     const missing = parseQueueTaskFile(
       "1724000000000-ab12.md",
@@ -697,6 +757,53 @@ describe("insertQueueTask / listQueueTasks", () => {
     expect(blankContent).not.toContain("directory:");
   });
 
+  it("writes task-level model/timeout/silence lines only when the options are given (T03)", async () => {
+    const root = await mkdtemp(path.join(os.tmpdir(), "agent-bridge-queues-"));
+    tmpDirs.push(root);
+    await writeQueueDefinition({ name: "ops" }, root);
+
+    const withAll = await insertQueueTask("ops", "Pinned.", root, {
+      model: " azure-openai-responses/gpt-5.6-terra ",
+      timeout: " 30m ",
+      silence: " 5m ",
+    });
+    const withAllContent = await readFile(path.join(root, "ops.tasks", `${withAll}.md`), "utf8");
+    expect(withAllContent).toContain("model: azure-openai-responses/gpt-5.6-terra");
+    expect(withAllContent).toContain("timeout: 30m");
+    expect(withAllContent).toContain("silence: 5m");
+    const withAllTasks = await listQueueTasks("ops", root);
+    const withAllTask = withAllTasks.find((t) => t.id === withAll);
+    expect(withAllTask?.model).toBe("azure-openai-responses/gpt-5.6-terra");
+    expect(withAllTask?.timeoutMs).toBe(30 * 60_000);
+    expect(withAllTask?.silenceMs).toBe(5 * 60_000);
+
+    // No options → no lines (byte shape identical to the plain insert).
+    const bare = await insertQueueTask("ops", "Bare.", root);
+    const bareContent = await readFile(path.join(root, "ops.tasks", `${bare}.md`), "utf8");
+    expect(bareContent).not.toContain("model:");
+    expect(bareContent).not.toContain("timeout:");
+    expect(bareContent).not.toContain("silence:");
+    const bareTasks = await listQueueTasks("ops", root);
+    const bareTask = bareTasks.find((t) => t.id === bare);
+    expect(bareTask?.model).toBeUndefined();
+    expect(bareTask?.timeoutMs).toBeUndefined();
+    expect(bareTask?.silenceMs).toBeUndefined();
+
+    // Blank options behave like absent (no line written).
+    const blank = await insertQueueTask("ops", "Blank.", root, { model: "  ", silence: "" });
+    const blankContent = await readFile(path.join(root, "ops.tasks", `${blank}.md`), "utf8");
+    expect(blankContent).not.toContain("model:");
+    expect(blankContent).not.toContain("silence:");
+
+    // A partially-set insert only writes the given lines (stable order:
+    // directory, model, timeout, silence).
+    const partial = await insertQueueTask("ops", "Partial.", root, { silence: "2m" });
+    const partialContent = await readFile(path.join(root, "ops.tasks", `${partial}.md`), "utf8");
+    expect(partialContent).toContain("silence: 2m");
+    expect(partialContent).not.toContain("model:");
+    expect(partialContent).not.toContain("timeout:");
+  });
+
   it("inserts tasks with distinct, monotonic ids and lists them in FIFO order", async () => {
     const root = await mkdtemp(path.join(os.tmpdir(), "agent-bridge-queues-"));
     tmpDirs.push(root);
@@ -866,6 +973,160 @@ describe("setQueueTaskState / deleteQueueTask", () => {
     await expect(deleteQueueTask("Bad_Name", "1724000000000-ab12", root)).rejects.toThrow(
       'invalid queue name "Bad_Name"',
     );
+  });
+});
+
+describe("failQueueTask / retryQueueTask (dead-letter, spec D2/T02)", () => {
+  const tmpDirs: string[] = [];
+
+  afterEach(async () => {
+    while (tmpDirs.length > 0) {
+      await rm(tmpDirs.pop()!, { recursive: true, force: true });
+    }
+  });
+
+  async function setUpQueue(root: string, prompt = "Run the migration."): Promise<string> {
+    await writeQueueDefinition({ name: "ops" }, root);
+    return insertQueueTask("ops", prompt, root);
+  }
+
+  it("dead-letters in ONE atomic write: state failed + failedAt + reason + agentSessionId, body preserved", async () => {
+    const root = await mkdtemp(path.join(os.tmpdir(), "agent-bridge-queues-"));
+    tmpDirs.push(root);
+    const taskId = await setUpQueue(root, "Body line stays.\n\nSecond paragraph.");
+    const before = await readFile(path.join(root, "ops.tasks", `${taskId}.md`), "utf8");
+
+    await failQueueTask("ops", taskId, {
+      reason: "model unavailable",
+      agentSessionId: "pi-coding-agent:1111-2222",
+    }, root);
+
+    const content = await readFile(path.join(root, "ops.tasks", `${taskId}.md`), "utf8");
+    expect(content).toContain("state: failed");
+    expect(content).toContain("reason: model unavailable");
+    expect(content).toContain("agentSessionId: pi-coding-agent:1111-2222");
+    const failedAtLine = content.split("\n").find((l) => l.startsWith("failedAt:"));
+    expect(failedAtLine).toBeDefined();
+    expect(Number.isNaN(Date.parse(failedAtLine!.slice("failedAt:".length).trim()))).toBe(false);
+    // The body and the other front-matter lines are preserved byte-for-byte.
+    expect(content).toContain("Body line stays.\n\nSecond paragraph.");
+    expect(content).toContain(`enqueuedAt: ${before.match(/enqueuedAt: (.+)/)![1]}`);
+
+    const [task] = await listQueueTasks("ops", root);
+    expect(task).toMatchObject({
+      id: taskId,
+      state: "failed",
+      reason: "model unavailable",
+      agentSessionId: "pi-coding-agent:1111-2222",
+    });
+    expect(task.failedAt).toBeDefined();
+  });
+
+  it("dead-letters without an agentSessionId line when the session was never created", async () => {
+    const root = await mkdtemp(path.join(os.tmpdir(), "agent-bridge-queues-"));
+    tmpDirs.push(root);
+    const taskId = await setUpQueue(root);
+
+    await failQueueTask("ops", taskId, { reason: "dispatch failed" }, root);
+
+    const content = await readFile(path.join(root, "ops.tasks", `${taskId}.md`), "utf8");
+    expect(content).toContain("state: failed");
+    expect(content).toContain("reason: dispatch failed");
+    expect(content).not.toContain("agentSessionId:");
+  });
+
+  it("retry requires the failed state: pending/running tasks are rejected", async () => {
+    const root = await mkdtemp(path.join(os.tmpdir(), "agent-bridge-queues-"));
+    tmpDirs.push(root);
+    const taskId = await setUpQueue(root);
+
+    // A pending task cannot be retried (retrying would double-run it).
+    const pendingResult = await retryQueueTask("ops", taskId, root);
+    expect(pendingResult).toEqual({
+      ok: false,
+      reason: `task "${taskId}" is not failed (state: pending) — only failed tasks can be retried`,
+    });
+
+    // A running task likewise.
+    await setQueueTaskState("ops", taskId, "running", root);
+    const runningResult = await retryQueueTask("ops", taskId, root);
+    expect(runningResult).toMatchObject({ ok: false });
+    expect(runningResult).toEqual({
+      ok: false,
+      reason: `task "${taskId}" is not failed (state: running) — only failed tasks can be retried`,
+    });
+  });
+
+  it("retry flips failed back to pending and clears the failedAt/reason/agentSessionId lines in one write", async () => {
+    const root = await mkdtemp(path.join(os.tmpdir(), "agent-bridge-queues-"));
+    tmpDirs.push(root);
+    const taskId = await setUpQueue(root, "Retry me.");
+    await failQueueTask("ops", taskId, {
+      reason: "boom",
+      agentSessionId: "pi-coding-agent:3333-4444",
+    }, root);
+
+    const result = await retryQueueTask("ops", taskId, root);
+    expect(result).toEqual({ ok: true });
+
+    const content = await readFile(path.join(root, "ops.tasks", `${taskId}.md`), "utf8");
+    expect(content).toContain("state: pending");
+    expect(content).not.toContain("failedAt:");
+    expect(content).not.toContain("reason:");
+    expect(content).not.toContain("agentSessionId:");
+    expect(content).toContain("Retry me.");
+    const [task] = await listQueueTasks("ops", root);
+    expect(task).toMatchObject({ id: taskId, state: "pending" });
+    expect(task.failedAt).toBeUndefined();
+    expect(task.reason).toBeUndefined();
+    expect(task.agentSessionId).toBeUndefined();
+  });
+
+  it("fail and retry throw / return error results for missing tasks and invalid ids", async () => {
+    const root = await mkdtemp(path.join(os.tmpdir(), "agent-bridge-queues-"));
+    tmpDirs.push(root);
+    await writeQueueDefinition({ name: "ops" }, root);
+    await expect(
+      failQueueTask("ops", "1724000000000-ab12", { reason: "x" }, root),
+    ).rejects.toThrow('task "1724000000000-ab12" not found in queue "ops"');
+    await expect(failQueueTask("Bad_Name", "1724000000000-ab12", { reason: "x" }, root)).rejects.toThrow(
+      'invalid queue name "Bad_Name"',
+    );
+    await expect(
+      failQueueTask("ops", "not-an-id", { reason: "x" }, root),
+    ).rejects.toThrow('invalid task id "not-an-id"');
+    expect(await retryQueueTask("ops", "1724000000000-ab12", root)).toEqual({
+      ok: false,
+      reason: 'task "1724000000000-ab12" not found in queue "ops"',
+    });
+    expect(await retryQueueTask("Bad_Name", "1724000000000-ab12", root)).toEqual({
+      ok: false,
+      reason: "invalid queue name",
+    });
+    expect(await retryQueueTask("ops", "not-an-id", root)).toEqual({
+      ok: false,
+      reason: "invalid task id",
+    });
+  });
+
+  it("a retried task survives a further fail/retry cycle (fields re-written, then re-cleared)", async () => {
+    const root = await mkdtemp(path.join(os.tmpdir(), "agent-bridge-queues-"));
+    tmpDirs.push(root);
+    const taskId = await setUpQueue(root);
+
+    await failQueueTask("ops", taskId, { reason: "first failure" }, root);
+    await retryQueueTask("ops", taskId, root);
+    await failQueueTask("ops", taskId, { reason: "second failure" }, root);
+
+    let content = await readFile(path.join(root, "ops.tasks", `${taskId}.md`), "utf8");
+    expect(content).toContain("state: failed");
+    expect(content).toContain("reason: second failure");
+    expect(content.match(/^reason:/gm)).toHaveLength(1);
+
+    expect(await retryQueueTask("ops", taskId, root)).toEqual({ ok: true });
+    content = await readFile(path.join(root, "ops.tasks", `${taskId}.md`), "utf8");
+    expect(content).toContain("state: pending");
+    expect(content).not.toContain("reason:");
   });
 });
 

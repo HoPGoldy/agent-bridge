@@ -19,9 +19,11 @@
  *   {@link QueueController.handleOutput} or when the timer fires;
  * - firing: a synthetic `command.session.new` (carrying the queue's pinned
  *   `model` when it has one) followed by a `user.message` whose text is the
- *   queue body plus the task prompt (spec D2). Fire failures are
- *   fail-and-drop (decided): the failure notice goes to the queue's `target`
- *   chat and the task file is deleted.
+ *   queue body plus the task prompt (spec D2). Runtime failures — after the
+ *   session was created — dead-letter the task (`state: failed`, the file is
+ *   kept for tracing and `queue retry`); the only fail-and-drop path left is
+ *   a task-level `directory:` that fails validation before the session even
+ *   exists.
  *
  * All external interaction goes through the injected callbacks:
  * `dispatchClientEvent` (synthetic client-output events — the runner wires
@@ -48,13 +50,17 @@ import {
 } from "../run-completion";
 import {
   QUEUE_SESSION_PREFIX,
+  bindQueue,
   deleteQueueTask,
+  failQueueTask,
   listQueueDefinitions,
   listQueueTasks,
+  loadQueueDefinition,
   setQueueTaskState,
   type QueueDefinition,
   type QueueTask,
 } from "./queue-file";
+import type { QueueHereResult } from "../../types";
 
 /** Default tick interval: 30 s (spec D2). */
 export const DEFAULT_TICK_MS = 30_000;
@@ -85,6 +91,20 @@ export interface QueueControllerOptions {
    */
   historyRoot?: string;
   logger?: Logger;
+}
+
+/** Fire-time resolved run parameters (the unified override chain, T03). */
+interface RunParams {
+  /**
+   * Model override (task level > definition level; the last rung is the
+   * channel agent config's model, reached by leaving this undefined — no
+   * built-in default participates).
+   */
+  model: string | undefined;
+  /** Wall-clock run timeout in ms (task level > definition level > default). */
+  timeoutMs: number;
+  /** Silence-probe window in ms (task level > definition level > default). */
+  silenceMs: number;
 }
 
 interface RunRecord {
@@ -151,12 +171,14 @@ export class QueueController {
   }
 
   /**
-   * Effective run timeout for a queue: the definition's `timeout:` value
-   * when set, else the controller-level fallback (`runTimeoutMs` option,
-   * tests use it to shorten runs; default {@link DEFAULT_TIMEOUT_MS}).
+   * Effective run timeout for a task (T03 unified override chain: task
+   * level > queue definition level > built-in default): the task-level
+   * `timeout:` when set, else the definition's, else the controller-level
+   * fallback (`runTimeoutMs` option, tests use it to shorten runs; default
+   * {@link DEFAULT_TIMEOUT_MS}).
    */
-  #effectiveRunTimeout(definition: QueueDefinition): number {
-    return definition.timeoutMs ?? this.#runTimeoutMs;
+  #effectiveRunTimeout(task: QueueTask, definition: QueueDefinition): number {
+    return task.timeoutMs ?? definition.timeoutMs ?? this.#runTimeoutMs;
   }
 
   /**
@@ -197,6 +219,51 @@ export class QueueController {
   }
 
   /**
+   * Binds a chat as the queue's delivery target (spec D4, `/queue-here`):
+   * writes BOTH this channel's config name and the sending chat's
+   * `clientSessionId` into the queue file's `channel`/`target` front-matter
+   * lines in one atomic write (`bindQueue`); the controller picks the binding
+   * up on its next tick reload — no direct coupling. The queue must exist —
+   * resolved with an immediate directory load so a file written after the
+   * last tick is still claimable. A queue that is already bound (`target`
+   * set) is refused with "queue already bound": rebinding is a manual/AI file
+   * edit — there is no command for it. A missing channel context (the runner
+   * always passes `channelName`, so this is defensive only) is refused like
+   * the core's old path. Unknown queue or a write failure returns
+   * `{ ok: false, reason }`; the localized reply for the triggering chat is
+   * the caller's job (the adapter, via `formatQueueHereReply`).
+   */
+  async claimTarget(queueName: string, clientSessionId: string): Promise<QueueHereResult> {
+    let definition: QueueDefinition | null;
+    try {
+      definition = await loadQueueDefinition(queueName, this.#queuesRoot);
+    } catch (error) {
+      const detail = error instanceof Error ? error.message : String(error);
+      this.#logger.error(
+        `[queue] failed to load queue "${queueName}" while claiming target:`,
+        error,
+      );
+      return { ok: false, reason: detail };
+    }
+    if (definition === null) {
+      this.#logger.warn(`[queue] queue "${queueName}" not found; nothing to claim`);
+      return { ok: false, reason: "queue not found" };
+    }
+    // Already-bound check: a queue whose `target` is set is refused — the
+    // channel is always rewritten to the current one at bind time, so the
+    // only way to move a queue is to unbind it first (edit the file with AI).
+    if (definition.target !== undefined) {
+      this.#logger.warn(`[queue] queue "${queueName}" is already bound; refusing to rebind`);
+      return { ok: false, reason: "queue already bound" };
+    }
+    const channelName = this.#channelName;
+    if (channelName === undefined || channelName === "") {
+      return { ok: false, reason: "no channel context to bind the queue to" };
+    }
+    return bindQueue(queueName, channelName, clientSessionId, this.#queuesRoot);
+  }
+
+  /**
    * Routes a diverted agent-output event for a `queue:*` session (T4,
    * three-layer completion protocol per the 2026-08-19（二）grill).
    *
@@ -208,8 +275,9 @@ export class QueueController {
    * is deleted and the worker slot is freed — the
    * slot is held until DONE/failure/timeout (WAITING, decided), so with
    * `workers=1` a second task cannot fire between the first message and DONE.
-   * A terminal `error` delivers a localized failure notice with any
-   * accumulated partial content, deletes the task file and ends the run.
+   * A terminal `error` dead-letters the task (state: failed, spec D2/T02)
+   * and delivers a localized failure notice with any accumulated partial
+   * content.
    * Events whose run-unique id has no active run are dropped and logged
    * (orphan).
    */
@@ -350,11 +418,12 @@ export class QueueController {
    * Fires one task (spec D2): resolves the working directory (task
    * `directory:` > queue `directory:` > bridge process cwd — the queue-level
    * value arrives already validated/canonical from #tick; an invalid
-   * task-level override fails just this task, fail-and-drop + notice),
+   * task-level override is a pre-session configuration error: the task is
+   * dropped with a notice, the only remaining fail-and-drop path),
    * marks the task `running`, registers the run with its timeout timer
    * BEFORE dispatching (the run id must exist before any output can
-   * arrive), then dispatches `command.session.new` (carrying the queue's
-   * pinned `model` when it has one) and checks the ingress result —
+   * arrive), then dispatches `command.session.new` (carrying the resolved
+   * `model` when one is pinned) and checks the ingress result —
    * a failed session creation stops the fire right there, so the follow-up
    * `user.message` can never auto-create a model-less session (T6). The
    * `user.message` text is `<queue body>\n\n<task prompt>` (body empty →
@@ -371,6 +440,17 @@ export class QueueController {
       this.#logger.warn(`[queue] queue "${definition.name}" has no target; skipping task "${task.id}"`);
       return;
     }
+
+    // Unified run-parameter override chain (T03, context D1), resolved once
+    // at the top of #fire: the task-level front matter wins, the queue
+    // definition is the fallback. `timeout` / `silence` end at the
+    // controller's built-in defaults; `model` ends at the channel agent
+    // config (undefined here) — no built-in default participates in its chain.
+    const params: RunParams = {
+      model: task.model ?? definition.model,
+      timeoutMs: this.#effectiveRunTimeout(task, definition),
+      silenceMs: task.silenceMs ?? definition.silenceMs,
+    };
 
     // A task-level `directory:` override is validated here, BEFORE the task
     // is marked running, so an invalid one drops the task cleanly without a
@@ -391,6 +471,9 @@ export class QueueController {
         this.#logger.warn(
           `[queue] task "${task.id}" of queue "${definition.name}" has an invalid working directory "${validation.directory}": ${validation.detail}`,
         );
+        // Pre-session configuration error (spec D2 dead-letter split): no
+        // agent session exists to trace, so the fail-and-drop semantics stay
+        // — delete the file and tell the target no session was created.
         await this.#deleteTask(definition.name, task.id);
         await this.#deliverToTarget(
           target,
@@ -411,10 +494,11 @@ export class QueueController {
       return;
     }
 
-    const record = await this.#registerRun(definition, task, target);
+    const record = await this.#registerRun(definition, task, target, params);
     if (record === null) {
       // SF-2 (or the header write failed and #registerRun already handled
-      // the fail-and-drop): stopped-path tasks stay `running` and are
+      // the fail-and-drop equivalent for the SF-2 stop race): stopped-path
+      // tasks stay `running` and are
       // re-enqueued at the next start (at-least-once).
       return;
     }
@@ -426,10 +510,10 @@ export class QueueController {
         clientSessionId: sessionId,
         workingDirectory,
         workingDirectorySource: "default",
-        // Per-queue model override (spec D1): only present when the queue
-        // pins one; absent stays undefined so the channel config model
-        // resolution is unchanged.
-        ...(definition.model !== undefined ? { model: definition.model } : {}),
+        // Resolved model override (T03 chain): only present when the task or
+        // the queue pins one; absent stays undefined so the channel config
+        // model resolution is unchanged.
+        ...(params.model !== undefined ? { model: params.model } : {}),
       });
       if (!sessionResult.ok) {
         await this.#failFire(record, sessionResult.reason);
@@ -463,12 +547,15 @@ export class QueueController {
 
   /**
    * Fails a fire whose synthetic dispatch reported `{ ok: false }` (T6):
-   * ends the run and delivers a localized failure notice with the real
-   * reason to the queue's `target`, then deletes the task file (fail-and-drop,
-   * decided). Stop-race (SF-2): a dispatch in flight across a stop resolves
-   * `{ ok: false, reason: "gateway is not running" }` — that is not a task
-   * failure; no history line is written, nothing is delivered and the task
-   * file stays `running` so the next start re-enqueues it (at-least-once).
+   * ends the run, dead-letters the task file (spec D2/T02 — `state: failed`
+   * plus the dead-letter trace fields, the file is KEPT for tracing and
+   * `queue retry`) and delivers ONE localized failure notice with the real
+   * reason to the queue's `target`, carrying the agent session id when the
+   * session was created before the failure. Stop-race (SF-2): a dispatch in
+   * flight across a stop resolves `{ ok: false, reason: "gateway is not
+   * running" }` — that is not a task failure; no history line is written,
+   * nothing is delivered, the file is not dead-lettered and the task stays
+   * `running` so the next start re-enqueues it (at-least-once).
    */
   async #failFire(record: RunRecord, reason: string): Promise<void> {
     // SF-2 / run-history D2 / stale-fire guard: identity-check the fire's
@@ -504,12 +591,45 @@ export class QueueController {
     }
     this.#logger.warn(`[queue] task "${record.taskId}" of queue "${record.queueName}" failed: ${reason}`);
     if (!this.#started) return;
-    await this.#deleteTask(record.queueName, record.taskId);
-    // T1: content first (the real reason), then a trailing italic one-liner
-    // referencing the kept accumulation file.
+    await this.#failRun(record, reason);
+  }
+
+  /**
+   * The shared runtime dead-letter tail (spec D2/T02), used by every
+   * failure path AFTER a run record exists: one atomic `state: failed`
+   * write (with `failedAt` / `reason` and the recorded `agentSessionId`, if
+   * any) keeps the task file on disk, and exactly one notice goes to the
+   * target — the reason first, then a trailing italic one-liner referencing
+   * the kept accumulation file; when the agent session exists its id is
+   * included so the failure can be traced (or resumed) on the agent side.
+   */
+  async #failRun(record: RunRecord, reason: string): Promise<void> {
+    try {
+      await failQueueTask(
+        record.queueName,
+        record.taskId,
+        {
+          reason,
+          ...(record.agentSessionId !== undefined ? { agentSessionId: record.agentSessionId } : {}),
+        },
+        this.#queuesRoot,
+      );
+    } catch (error) {
+      this.#logger.error(
+        `[queue] failed to dead-letter task "${record.taskId}" of queue "${record.queueName}":`,
+        error,
+      );
+    }
+    // T1: content first (the real reason, plus the agent session id when one
+    // exists), then a trailing italic one-liner referencing the kept
+    // accumulation file.
+    const agentLine =
+      record.agentSessionId !== undefined
+        ? `${this.#t("queue.taskFailedAgentSession", { sessionId: record.agentSessionId })}\n`
+        : "";
     await this.#deliverToTarget(
       record.target,
-      `${reason}\n\n${this.#t("queue.taskFailedSuffix", {
+      `${reason}\n${agentLine}\n${this.#t("queue.taskFailedSuffix", {
         queue: record.queueName,
         path: record.accumulator.filePath,
       })}`,
@@ -521,9 +641,10 @@ export class QueueController {
    * stripped) plus an italic suffix referencing the kept accumulation file
    * (or the suffix alone when the last message is empty), carrying every
    * attachment collected across all messages, then deletes the task file
-   * (fail-and-drop). The run/slot is already released by the caller (DONE
-   * end-run) once this runs. T1: content first, then a trailing italic
-   * one-liner — no prefix header, task id dropped from the attribution.
+   * (completion is success — the file's purpose is fulfilled). The run/slot
+   * is already released by the caller (DONE end-run) once this runs. T1:
+   * content first, then a trailing italic one-liner — no prefix header, task
+   * id dropped from the attribution.
    */
   async #completeTask(record: RunRecord): Promise<void> {
     await this.#writeHistory(record, "completed");
@@ -561,19 +682,14 @@ export class QueueController {
     await this.#deleteTask(queueName, taskId);
   }
 
-  /** Failure from a diverted `error` event (T4): notice + reason, no partial transcript. */
+  /**
+   * Failure from a diverted `error` event (T4): runtime failure after the
+   * session was created → dead-letter (spec D2/T02) + notice with the
+   * reason (and agent session id); no partial transcript inlined.
+   */
   async #failTask(record: RunRecord, reason: string): Promise<void> {
     await this.#writeHistory(record, "failed", { reason });
-    const { queueName, taskId, target } = record;
-    // The reason stays visible; the partial transcript is NOT inlined — it
-    // lives in the kept accumulation file that the suffix references.
-    const suffix = this.#t("queue.taskFailedSuffix", {
-      queue: queueName,
-      path: record.accumulator.filePath,
-    });
-    const notice = `${reason}\n\n${suffix}`;
-    await this.#deliverToTarget(target, notice);
-    await this.#deleteTask(queueName, taskId);
+    await this.#failRun(record, reason);
   }
 
   /**
@@ -581,7 +697,7 @@ export class QueueController {
    * spec D3/D4): the chain is wrapped in one top-level try/catch — the timer
    * callback is a floating promise, so an unexpected throw anywhere would
    * otherwise break the chain silently. Local steps first (history line,
-   * task-file delete), remote steps last; the release dispatch is
+   * task-file dead-letter), remote steps last; the release dispatch is
    * fire-and-forget so a hung/throwing remote step cannot block the local
    * cleanup that un-wedges the queue (a `running` file stuck mid-chain is
    * exactly the zombie the tick reconciliation would otherwise have to heal).
@@ -592,7 +708,7 @@ export class QueueController {
       if (record === undefined) return; // run already ended
       this.#runs.delete(sessionId);
       record.probe.stop();
-      const { queueName, taskId, target } = record;
+      const { queueName, taskId } = record;
 
       // Tombstone (timeout teardown spec D4): arm the reconciliation grace
       // window for the rest of this chain.
@@ -603,20 +719,14 @@ export class QueueController {
       );
 
       // Local fs steps FIRST (history writer never throws — run-history
-      // spec D3; #deleteTask catches its own fs failures), so the worker
+      // spec D3; #failRun catches its own fs failures), so the worker
       // slot un-wedges even if everything remote below hangs or throws.
+      // Timeout is a runtime failure (spec D2/T02): the task file is
+      // dead-lettered (state: failed + trace fields), not deleted.
       await this.#writeHistory(record, "timeout", {
         reason: `timed out after ${record.timeoutMs}ms`,
       });
-      await this.#deleteTask(queueName, taskId);
-
-      // The partial transcript is NOT inlined — the kept accumulation file is
-      // referenced by the trailing italic one-liner.
-      const suffix = this.#t("queue.taskTimedOutSuffix", {
-        queue: queueName,
-        path: record.accumulator.filePath,
-      });
-      await this.#deliverToTarget(target, suffix);
+      await this.#failRun(record, `timed out after ${record.timeoutMs}ms`);
 
       // Fully tear down this run's session (timeout teardown spec D2/D1):
       // unlike interactive `/stop` (abort-only), release terminates the agent
@@ -669,51 +779,61 @@ export class QueueController {
   }
 
   /**
-   * Zombie-task self-heal (timeout teardown spec D4): within an owned,
-   * enabled, bound queue, a task file still marked `running` with no live run
-   * has lost its run — its cleanup chain died midway (the incident this
-   * heals: a hung remote dispatch stalled the chain after the registry
-   * removal). The file is DELETED with a warn log, deliberately NOT reset to
-   * `pending`: a mid-session zombie proves the run terminated without local
-   * cleanup, so re-running it risks duplicate side effects; the at-least-once
-   * reset remains exclusively the restart flow ({@link #resetRunningTasks},
-   * which also owns files cleared by `stop()` — those get no tombstone).
+   * Zombie-task self-heal (timeout teardown spec D4, amended by the
+   * dead-letter semantics spec D2/T02): within an owned, enabled, bound
+   * queue, a task file still marked `running` with no live run has lost its
+   * run — its cleanup chain died midway. The heal NEVER deletes the file
+   * (dead-letter semantics, spec D2/T02): deleting it would destroy the
+   * is left to the at-least-once reset of the next start (and manual/AI
+   * cleanup). It is deliberately never reset to `pending` here: a
+   * mid-session zombie proves the run terminated without finishing, so
+   * re-running it risks duplicate side effects. Race safety against an
+   * interleaving healthy cleanup chain (ticks and run timers are independent
+   * chains): runs record a tombstone timestamp when they end
+   * (`#endRun`/`#handleTimeout`; runs cleared by `stop()` get none — those
+   * files belong to the next start's reset) and the reconciliation skips
+   * runs ended within the last 2×tickMs; tombstones are pruned every tick.
+   * Ownership filtering matches fire: disabled/unbound/foreign queues are
+   * untouched.
    */
   async #reconcileZombieTasks(queueName: string, tasks: QueueTask[]): Promise<void> {
     for (const task of tasks) {
-      if (task.state !== "running") continue;
+      if (task.state !== "running") continue; // failed/pending files are never touched
       const sessionId = `${QUEUE_SESSION_PREFIX}${queueName}:${task.id}`;
       if (this.#runs.has(sessionId)) continue; // live run — never touched
       if (this.#recentlyEnded(sessionId)) continue; // grace window (D4)
-      try {
-        await deleteQueueTask(queueName, task.id, this.#queuesRoot);
-      } catch (error) {
-        this.#logger.error(
-          `[queue] failed to delete zombie task "${task.id}" of queue "${queueName}":`,
-          error,
-        );
-        continue;
-      }
+      // Dead-letter amendment (spec D2/T02): a leftover `running` file is no
+      // longer deleted — under dead-letter semantics that would destroy the
+      // run's record without ever reaching the terminal state (e.g. the
+      // chain's failQueueTask write failed mid-way). It is left to the next
+      // start's at-least-once reset (or manual/AI cleanup) instead. Nothing
+      // is re-queued here: the at-least-once reset remains exclusively the
+      // restart flow (see #resetRunningTasks).
       this.#logger.warn(
-        `[queue] deleted zombie running task "${task.id}" of queue "${queueName}" (no active run for it)`,
+        `[queue] task "${task.id}" of queue "${queueName}" is stranded running with no active run; leaving it for the next start's reset (dead-letter semantics)`,
       );
     }
   }
 
   /** Registers the run (writing its Output File header), its timeout timer, accumulator and silence probe; `null` when stopped (SF-2). */
-  async #registerRun(definition: QueueDefinition, task: QueueTask, target: string): Promise<RunRecord | null> {
+  async #registerRun(
+    definition: QueueDefinition,
+    task: QueueTask,
+    target: string,
+    params: RunParams,
+  ): Promise<RunRecord | null> {
     if (!this.#started) return null;
     const sessionId = `${QUEUE_SESSION_PREFIX}${definition.name}:${task.id}`;
     // Captured once so the record's value and the timer duration are
     // identical by construction; a mid-run definition edit cannot touch an
     // already-running timer (the next fired run picks up the new value).
-    const timeoutMs = this.#effectiveRunTimeout(definition);
+    const timeoutMs = params.timeoutMs;
     // T4: per-run output accumulator and silence probe, alongside the
     // existing wall-clock timeout (the layer-3 backstop). The probe is armed
     // (poked) at run start so its silence window opens as soon as the run
     // registers.
     const probe = createSilenceProbe({
-      silentMs: definition.silenceMs,
+      silentMs: params.silenceMs,
       onProbe: () => {
         void this.#handleProbe(sessionId);
       },
@@ -724,7 +844,7 @@ export class QueueController {
       queueName: definition.name,
       taskId: task.id,
       target,
-      silentMs: definition.silenceMs,
+      silentMs: params.silenceMs,
       timeoutMs,
       startedAt: Date.now(),
       accumulator: createRunAccumulator({
@@ -749,21 +869,15 @@ export class QueueController {
       await this.#writeRunHeader(record, definition, task);
     } catch (error) {
       // Defensive: an fs failure here must not leave a half-registered run
-      // or a stuck `running` task. End the run and fail-and-drop exactly
-      // like a dispatch failure (notice + task deleted), with the run's own
-      // record — no history line is written for it because nothing was ever
-      // dispatched and this path is effectively unreachable on a local fs.
+      // or a stuck `running` task. End the run and dead-letter exactly like
+      // a dispatch failure (spec D2/T02: failed + trace fields + notice),
+      // with the run's own record — no history line is written for it
+      // because nothing was ever dispatched and this path is effectively
+      // unreachable on a local fs.
       this.#logger.error(`[queue] failed to write run header for "${sessionId}":`, error);
       this.#endRun(sessionId);
       if (this.#started) {
-        await this.#deleteTask(record.queueName, record.taskId);
-        await this.#deliverToTarget(
-          record.target,
-          `failed to write run output header\n\n${this.#t("queue.taskFailedSuffix", {
-            queue: record.queueName,
-            path: record.accumulator.filePath,
-          })}`,
-        );
+        await this.#failRun(record, "failed to write run output header");
       }
       return null;
     }
@@ -871,8 +985,10 @@ export class QueueController {
 
   /**
    * At-least-once restart (spec D2): every `running` task of an owned queue
-   * is reset to `pending` so the next tick re-fires it. Tasks of queues
-   * owned by other channels are untouched.
+   * is reset to `pending` so the next tick re-fires it. `failed` (the
+   * dead-letter terminal state, spec D2/T02) is deliberately untouched — a
+   * failed task is only ever re-queued explicitly (`queue retry`). Tasks of
+   * queues owned by other channels are untouched.
    */
   async #resetRunningTasks(): Promise<void> {
     let definitions: QueueDefinition[];

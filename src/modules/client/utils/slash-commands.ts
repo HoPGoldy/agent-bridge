@@ -3,6 +3,7 @@ import type {
   ClientOutputEvent,
   ClientSessionStateApi,
   ClientWorkingDirectorySource,
+  QueueHereResult,
   ScheduleHereResult,
   ScheduleRunResult,
 } from "../../../types";
@@ -150,6 +151,49 @@ function parseScheduleHereCommand(
 }
 
 /**
+ * Adapter-local `/queue-here <queue-name>` command (spec D4): the adapter
+ * binds this chat as the queue's delivery target through the injected
+ * `onQueueHere` bridge and replies with a localized result. The runner's
+ * wiring writes BOTH the current channel's name and this chat's
+ * `clientSessionId` into the queue file's `channel`/`target` lines. Never
+ * reaches the core.
+ */
+export interface QueueHereCommand {
+  type: "queue.here";
+  clientSessionId: string;
+  queueName: string;
+}
+
+/**
+ * Adapter-local usage error for a malformed `/queue-here` (spec D4): the
+ * queue name is missing or does not match `[a-z0-9-]+`. The adapter replies
+ * with a localized usage hint; nothing reaches the core.
+ */
+export interface QueueHereUsageCommand {
+  type: "queue.here.usage";
+  clientSessionId: string;
+}
+
+function parseQueueHereCommand(
+  text: string,
+  clientSessionId: string,
+): QueueHereCommand | QueueHereUsageCommand | null {
+  const match = text.match(/^\/queue-here(?:\s+(.*))?$/i);
+  if (!match) {
+    return null;
+  }
+
+  const raw = match[1]?.trim() ?? "";
+  if (!TASK_NAME_RE.test(raw)) {
+    return { type: "queue.here.usage", clientSessionId };
+  }
+
+  // Queue files are lowercased slugs; normalize so `/queue-here Build`
+  // binds the `build` queue (same normalization as `/schedule-here`).
+  return { type: "queue.here", clientSessionId, queueName: raw.toLowerCase() };
+}
+
+/**
  * Adapter-local usage error for `/resume` without a provider session id:
  * the adapter replies with a localized usage hint; nothing reaches the core.
  */
@@ -208,10 +252,11 @@ export type ParsedSlashCommand =
 
 /**
  * Parses a trimmed inbound text as one of the standard agent-bridge slash
- * commands (`/new [path]`, `/n [path]`, `/resume <id>`, `/r <id>`, `/compact`, `/c`, `/stop`, `/s`, `/status`, `/st`, `/model`, `/m`, `/schedule-run <name>`, `/schedule-here <name>`) and returns the
+ * commands (`/new [path]`, `/n [path]`, `/resume <id>`, `/r <id>`, `/compact`, `/c`, `/stop`, `/s`, `/status`, `/st`, `/model`, `/m`, `/schedule-run <name>`, `/schedule-here <name>`, `/queue-here <name>`) and returns the
  * corresponding {@link ParsedSlashCommand} (or an adapter-local
  * {@link ScheduleRunCommand}/{@link ScheduleRunUsageCommand}/
  * {@link ScheduleHereCommand}/{@link ScheduleHereUsageCommand}/
+ * {@link QueueHereCommand}/{@link QueueHereUsageCommand}/
  * {@link SessionResumeUsageCommand}), or `null` if
  * `text` is not a recognized command and should be treated as a regular user
  * message.
@@ -225,6 +270,8 @@ export function parseSlashCommand(
   | ScheduleRunUsageCommand
   | ScheduleHereCommand
   | ScheduleHereUsageCommand
+  | QueueHereCommand
+  | QueueHereUsageCommand
   | SessionResumeUsageCommand
   | null {
   // `/schedule-run` and `/schedule-here` are handled entirely by the adapter
@@ -238,6 +285,13 @@ export function parseSlashCommand(
   const scheduleHereCommand = parseScheduleHereCommand(text, clientSessionId);
   if (scheduleHereCommand) {
     return scheduleHereCommand;
+  }
+
+  // `/queue-here` is handled entirely by the adapter too (spec D4), with the
+  // same mechanics as `/schedule-here`.
+  const queueHereCommand = parseQueueHereCommand(text, clientSessionId);
+  if (queueHereCommand) {
+    return queueHereCommand;
   }
 
   const newCommand = parseNewCommand(text, clientSessionId);
@@ -428,6 +482,27 @@ export function formatScheduleHereReply(
       return t("client.scheduleHereAlreadyBound", { name: taskName });
     default:
       return t("client.scheduleHereFailed", { name: taskName, reason: result.reason });
+  }
+}
+
+/**
+ * Localized reply text for a `/queue-here` outcome (spec D4). Maps the queue
+ * controller's caller-facing English reasons (see the `claimTarget`/`bindQueue`
+ * path) to localized messages; unrecognized reasons fall back to a generic
+ * failure message carrying the raw reason.
+ */
+export function formatQueueHereReply(result: QueueHereResult, queueName: string, t: Translator): string {
+  if (result.ok) {
+    return t("client.queueHereBound", { name: queueName });
+  }
+
+  switch (result.reason) {
+    case "queue not found":
+      return t("client.queueHereQueueNotFound", { name: queueName });
+    case "queue already bound":
+      return t("client.queueHereAlreadyBound", { name: queueName });
+    default:
+      return t("client.queueHereFailed", { name: queueName, reason: result.reason });
   }
 }
 

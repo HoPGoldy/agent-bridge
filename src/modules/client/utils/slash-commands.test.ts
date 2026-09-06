@@ -4,6 +4,7 @@ import path from "node:path";
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
 import { getTranslator } from "../../../i18n";
 import {
+  formatQueueHereReply,
   formatScheduleHereReply,
   formatScheduleRunReply,
   parseSlashCommand,
@@ -349,6 +350,59 @@ describe("parse /schedule-here", () => {
   });
 });
 
+describe("parse /queue-here", () => {
+  it("parses /queue-here <queue-name> into an adapter-local queue.here command", () => {
+    expect(parseSlashCommand("/queue-here build-queue", "session-1")).toEqual({
+      type: "queue.here",
+      clientSessionId: "session-1",
+      queueName: "build-queue",
+    });
+    expect(parseSlashCommand("/queue-here 123", "session-1")).toEqual({
+      type: "queue.here",
+      clientSessionId: "session-1",
+      queueName: "123",
+    });
+  });
+
+  it("matches /queue-here case-insensitively and normalizes the queue name to lowercase", () => {
+    expect(parseSlashCommand("/Queue-Here BuildQueue", "session-1")).toEqual({
+      type: "queue.here",
+      clientSessionId: "session-1",
+      queueName: "buildqueue",
+    });
+    expect(parseSlashCommand("/QUEUE-HERE my-queue", "session-1")).toEqual({
+      type: "queue.here",
+      clientSessionId: "session-1",
+      queueName: "my-queue",
+    });
+  });
+
+  it("returns a usage error for /queue-here without a queue name", () => {
+    expect(parseSlashCommand("/queue-here", "session-1")).toEqual({
+      type: "queue.here.usage",
+      clientSessionId: "session-1",
+    });
+    expect(parseSlashCommand("/queue-here   ", "session-1")).toEqual({
+      type: "queue.here.usage",
+      clientSessionId: "session-1",
+    });
+  });
+
+  it("returns a usage error for /queue-here with an invalid queue name", () => {
+    for (const bad of ["/queue-here foo_bar", "/queue-here a b", "/queue-here täsk", "/queue-here x.y"]) {
+      expect(parseSlashCommand(bad, "session-1")).toEqual({
+        type: "queue.here.usage",
+        clientSessionId: "session-1",
+      });
+    }
+  });
+
+  it("returns null for queue-here-like text that is not the command", () => {
+    expect(parseSlashCommand("/queue-hereafter", "session-1")).toBeNull();
+    expect(parseSlashCommand("hello /queue-here build", "session-1")).toBeNull();
+  });
+});
+
 describe("parse /resume", () => {
   it("parses /resume <id> and /r <id> into a command.session.resume event", () => {
     expect(parseSlashCommand("/resume ses_abc123", "session-1")).toEqual({
@@ -456,6 +510,47 @@ describe("formatScheduleHereReply", () => {
     );
     expect(formatScheduleHereReply({ ok: false, reason: "invalid task name" }, "x", en)).toContain(
       "invalid task name",
+    );
+  });
+});
+
+describe("formatQueueHereReply", () => {
+  it("renders a localized success reply", () => {
+    const en = getTranslator("en-US");
+    const zh = getTranslator("zh-CN");
+
+    expect(formatQueueHereReply({ ok: true }, "build", en)).toContain('Queue "build"');
+    expect(formatQueueHereReply({ ok: true }, "build", en)).toContain("this chat");
+    expect(formatQueueHereReply({ ok: true }, "构建", zh)).toContain('队列 "构建"');
+    expect(formatQueueHereReply({ ok: true }, "构建", zh)).toContain("本会话");
+  });
+
+  it("maps known failure reasons to localized messages", () => {
+    const en = getTranslator("en-US");
+    const zh = getTranslator("zh-CN");
+
+    expect(formatQueueHereReply({ ok: false, reason: "queue not found" }, "build", en)).toContain(
+      'was not found',
+    );
+    expect(formatQueueHereReply({ ok: false, reason: "queue not found" }, "构建", zh)).toContain(
+      "未找到队列",
+    );
+    expect(formatQueueHereReply({ ok: false, reason: "queue already bound" }, "build", en)).toContain(
+      "already bound",
+    );
+    expect(formatQueueHereReply({ ok: false, reason: "queue already bound" }, "构建", zh)).toContain(
+      "已绑定",
+    );
+  });
+
+  it("falls back to a generic failure message carrying the raw reason", () => {
+    const en = getTranslator("en-US");
+
+    expect(formatQueueHereReply({ ok: false, reason: "failed to write queue file: boom" }, "x", en)).toContain(
+      "failed to write queue file: boom",
+    );
+    expect(formatQueueHereReply({ ok: false, reason: "target must be a non-empty string" }, "x", en)).toContain(
+      "target must be a non-empty string",
     );
   });
 });

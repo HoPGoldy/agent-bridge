@@ -34,8 +34,8 @@ export async function runChannel({ channelName, channelConfig, defaults }: RunCh
   // scheduler and `queue:*` output to the queue controller (spec D2/D3), the
   // scheduler/controller dispatch synthetic fires into the core's input path
   // and deliver egress to the client adapter (spec D1/D9). The adapter gets
-  // `onScheduleRun` before either exists; by the time it can fire (after
-  // start), they are assigned.
+  // `onScheduleRun`/`onQueueHere` before either exists; by the time it can
+  // fire (after start), they are assigned.
   let scheduler: Scheduler;
   let queueController: QueueController;
 
@@ -51,6 +51,13 @@ export async function runChannel({ channelName, channelConfig, defaults }: RunCh
     // in the destination chat locally and hand over the task name plus this
     // chat's clientSessionId; the scheduler writes them into the task file.
     onScheduleHere: (taskName, clientSessionId) => scheduler.claimTarget(taskName, clientSessionId),
+    // Target-binding bridge (spec D4): adapters handle `/queue-here` sent in
+    // the destination chat locally and hand over the queue name plus this
+    // chat's clientSessionId; the controller writes the channel name and the
+    // chat id into the queue file. Same let-declaration timing as the
+    // scheduler bridges: by the time the adapter can fire (after start), the
+    // controller is assigned.
+    onQueueHere: (queueName, clientSessionId) => queueController.claimTarget(queueName, clientSessionId),
   });
 
   const core = new GatewayCore({

@@ -204,7 +204,7 @@ Body.
     expect(task.schedule).toEqual({ type: "daily", hour: 9, minute: 0 });
   });
 
-  it("parses the silence field with the timeout duration syntax, defaulting to 10m", () => {
+  it("parses the silence field with the timeout duration syntax, defaulting to 30m", () => {
     // Bare value.
     const bare = parseTaskFile(
       "silence.md",

@@ -16,14 +16,19 @@ import type {
 } from "./types";
 import { createPromptContext } from "./config/prompt";
 import { removeSessionBindingStore } from "./config/session-bindings";
+import { createInMemoryChannelStateStore } from "./config/channel-state";
+import { createAgentSessionStateRegistry } from "./config/agent-session-state";
+import { createClientSessionStateStore } from "./config/client-session-state";
 import { getConfigPath, loadConfig, saveConfig } from "./config/store";
 import { runChannel } from "./core/channel-runner";
+import { GatewayCore } from "./core/gateway-core";
 import { DEFAULT_LOCALE, getTranslatorForCommon } from "./i18n";
-import { getAgentModule, listAgentModules } from "./modules/agent";
-import { getClientModule, listClientModules } from "./modules/client";
+import { getAgentModule, getTypedAgentModule, listAgentModules } from "./modules/agent";
+import { getClientModule, getTypedClientModule, listClientModules } from "./modules/client";
 import { readRunHistory, type RunHistoryRecord } from "./modules/run-completion/history";
 import { nextRun, parseSchedule, parseTimeout } from "./modules/schedule/grammar";
 import { parseSyntheticSessionId } from "./modules/schedule/scheduler";
+import { Scheduler } from "./modules/schedule/scheduler";
 import {
   getSchedulesDir,
   isValidTaskName,
@@ -36,10 +41,12 @@ import {
   getQueueTasksDir,
   insertQueueTask,
   isValidQueueName,
+  isValidTaskId,
   listQueueDefinitions,
   listQueueTasks,
   loadQueueDefinition,
   QUEUE_SESSION_PREFIX,
+  retryQueueTask,
   setQueueEnabled,
   writeQueueDefinition,
   type QueueDefinition,
@@ -223,25 +230,27 @@ async function startChannel(channelName: string): Promise<void> {
 /** Grammar examples shown in the schedule prompt (spec D4). */
 const SCHEDULE_EXAMPLES = ["every 5m", "daily 09:00", "weekly mon 09:00", "monthly 15 09:00"] as const;
 
-/** Validates a task-name input: slug shape plus channel-local uniqueness. */
+/** Localized validator for a task-name input: slug shape plus global uniqueness. */
 export function validateTaskNameInput(
   value: string,
   existingNames: ReadonlySet<string>,
 ): string | null {
+  const t = getTranslatorForCommon();
   if (!isValidTaskName(value)) {
-    return "Task name must be [a-z0-9-]+ (lowercase letters, digits and hyphens only)";
+    return t("cli.taskNameInvalid");
   }
   if (existingNames.has(value)) {
-    return `A task named "${value}" already exists.`;
+    return t("cli.taskNameExists", { name: value });
   }
   return null;
 }
 
-/** Validates a schedule-string input against the grammar; errors re-prompt with examples. */
+/** Localized schedule-string validator; errors re-prompt with examples. */
 export function validateScheduleInput(value: string): string | null {
+  const t = getTranslatorForCommon();
   const parsed = parseSchedule(value);
   if (parsed.ok) return null;
-  return `${parsed.reason}. Examples: ${SCHEDULE_EXAMPLES.join(" | ")}`;
+  return t("cli.scheduleInvalid", { reason: parsed.reason, examples: SCHEDULE_EXAMPLES.join(" | ") });
 }
 
 /** Validates a timeout-duration input ("10m", "1h", "90s"). */
@@ -258,6 +267,7 @@ export function validateTimeoutInput(value: string): string | null {
 export function buildTaskFileContent(options: {
   schedule: string;
   timeout: string;
+  silence?: string;
   directory?: string;
   model?: string;
   language?: LocaleCode;
@@ -266,8 +276,13 @@ export function buildTaskFileContent(options: {
     "---",
     `schedule: ${options.schedule}`,
     `timeout: ${options.timeout}`,
-    // Key order is stable (schedule, timeout, model, directory) so snapshots
-    // and the T2 parser stay predictable. Values are bare, like `directory`.
+    // Key order is stable (schedule, timeout, silence, model, directory) so
+    // snapshots and the T2 parser stay predictable. Values are bare, like
+    // `directory`; blank/absent silence/model/directory write no line (the
+    // built-in default applies).
+    ...(options.silence !== undefined && options.silence !== ""
+      ? [`silence: ${options.silence}`]
+      : []),
     ...(options.model !== undefined && options.model !== ""
       ? [`model: ${options.model}`]
       : []),
@@ -285,50 +300,58 @@ export function buildTaskFileContent(options: {
 /** `agent-bridge schedule add`: interactive task-file creation wizard. */
 async function addScheduleTask(): Promise<void> {
   const ctx = createPromptContext();
+  const t = getTranslatorForCommon();
   try {
     // T3: tasks are channel-agnostic and globally unique — no channel to pick.
     const existing = await loadAllTasks();
     const existingNames = new Set(existing.map((entry) => entry.task.name));
 
-    const name = await ctx.input("Task name", {
+    const name = await ctx.input(t("cli.taskNamePrompt"), {
       required: true,
       validate: (value) => validateTaskNameInput(value, existingNames),
     });
 
-    const schedule = await ctx.input(`Schedule (examples: ${SCHEDULE_EXAMPLES.join(", ")})`, {
+    const schedule = await ctx.input(t("cli.schedulePrompt", { examples: SCHEDULE_EXAMPLES.join(", ") }), {
       required: true,
       validate: validateScheduleInput,
     });
 
-    // Blank = the bridge process cwd. Deliberately not validated against the
-    // filesystem here — the bridge may run elsewhere (spec D6, fire-time
-    // validation only).
-    const directory = await ctx.input("Working directory (optional, blank = bridge cwd)");
-
-    const timeout = await ctx.input("Timeout (default 5h)", {
+    // Blank = the built-in 5h default: the line is not written at all.
+    const timeout = await ctx.input(t("cli.timeoutPrompt"), {
       defaultValue: "5h",
+      validate: validateTimeoutInput,
+    });
+
+    // Blank = the built-in 30m default (D7): the line is not written.
+    const silence = await ctx.input(t("cli.silencePrompt"), {
+      defaultValue: "30m",
       validate: validateTimeoutInput,
     });
 
     // Blank = the channel agent config's model (existing resolution unchanged).
     // Deliberately not validated — the CLI cannot reach provider model lists;
     // a typo fails fast at fire time (spec failure semantics).
-    const model = await ctx.input("Model (optional, blank = channel default)", {
-      placeholder: "Example: azure-openai-responses/gpt-5.6-terra",
+    const model = await ctx.input(t("cli.modelPrompt"), {
+      placeholder: t("cli.modelPlaceholder"),
     });
+
+    // Blank = the bridge process cwd. Deliberately not validated against the
+    // filesystem here — the bridge may run elsewhere (spec D6, fire-time
+    // validation only).
+    const directory = await ctx.input(t("cli.directoryPrompt"));
 
     const schedulesDir = getSchedulesDir();
     await mkdir(schedulesDir, { recursive: true });
     const filePath = path.join(schedulesDir, `${name}.md`);
     await writeFile(
       filePath,
-      buildTaskFileContent({ schedule, timeout, directory, model, language: DEFAULT_LOCALE }),
+      buildTaskFileContent({ schedule, timeout, silence, directory, model, language: DEFAULT_LOCALE }),
       "utf8",
     );
 
-    console.log("Created successfully!");
-    console.log(`- Edit ${filePath} to set your prompt.`);
-    console.log(`- Send \`/schedule-here ${name}\` in chat app to set the report place.`);
+    console.log(t("cli.taskCreated"));
+    console.log(`- ${t("cli.taskCreatedGuideFile", { filePath })}`);
+    console.log(`- ${t("cli.taskCreatedGuideTarget", { name })}`);
   } finally {
     ctx.close();
   }
@@ -418,7 +441,7 @@ async function removeScheduleTask(taskName: string): Promise<void> {
  */
 async function setScheduleTaskEnabled(taskName: string, enabled: boolean): Promise<void> {
   if (!isValidTaskName(taskName)) {
-    throw new Error("Task name must be [a-z0-9-]+ (lowercase letters, digits and hyphens only)");
+    throw new Error(getTranslatorForCommon()("cli.taskNameInvalid"));
   }
   const loaded = await loadAllTasks();
   if (!loaded.some((entry) => entry.task.name === taskName)) {
@@ -487,25 +510,46 @@ async function addQueue(): Promise<void> {
       validate: validateWorkersInput,
     });
 
+    // Blank = the built-in 5h controller default (same as scheduled tasks):
+    // the line is not written.
+    const timeout = await ctx.input(t("cli.timeoutPrompt"), {
+      defaultValue: "5h",
+      validate: validateTimeoutInput,
+    });
+
+    // Blank = the built-in 30m default (D7): the line is not written.
+    const silence = await ctx.input(t("cli.silencePrompt"), {
+      defaultValue: "30m",
+      validate: validateTimeoutInput,
+    });
+
     // Blank = the channel agent config's model (same resolution as scheduled
     // tasks); deliberately not validated — a typo fails fast at fire time.
     const model = await ctx.input(t("cli.modelPrompt"), {
-      placeholder: "Example: azure-openai-responses/gpt-5.6-terra",
+      placeholder: t("cli.modelPlaceholder"),
     });
 
     // Blank = the bridge process cwd. Deliberately not validated against the
     // filesystem here — the bridge may run elsewhere (spec D6, fire-time
     // validation only), same convention as `schedule add`.
-    const directory = await ctx.input(t("cli.queueDirectoryPrompt"));
+    const directory = await ctx.input(t("cli.directoryPrompt"));
+
+    // Optional shared context appended to every task prompt; blank = an
+    // empty body (the file stays editable afterwards, same as before).
+    const body = await ctx.input(t("cli.bodyPrompt"));
 
     // No `channel` is written: a queue stays ownerless and unbound until
     // `/queue-here` binds a chat (writing both `channel` and `target`).
     const result = await writeQueueDefinition({
       name,
       workers: Number(workers),
-      // Blank = channel default; the storage layer rejects a present-but-blank model.
+      // Blank = built-in defaults: the storage layer rejects a present-but-blank
+      // value, so each "empty → no line" answer is normalized to undefined here.
+      timeout: timeout.trim() === "" ? undefined : timeout,
+      silence: silence.trim() === "" ? undefined : silence,
       model: model.trim() === "" ? undefined : model,
       directory: directory.trim() === "" ? undefined : directory,
+      body,
     });
     if (!result.ok) {
       throw new Error(result.reason);
@@ -523,16 +567,36 @@ async function addQueue(): Promise<void> {
 /**
  * `agent-bridge queue insert <name> --prompt "..."`: enqueue a task.
  * Errors (thrown, non-zero exit) when the prompt is empty or the queue does
- * not exist. The task is durable the moment the file lands; an unbound queue
- * simply waits until `/queue-here` binds a chat (spec D4, decided in grill).
+ * not exist; `--timeout` / `--silence` are pre-validated here with the same
+ * duration grammar as scheduled tasks (a bad value exits before anything is
+ * written), while `--model` / `--directory` land in the task front matter
+ * as-is (fire-time validation only). The overrides become the task-level run
+ * parameters (T03): each beats the queue definition's same-named field.
  */
 async function insertQueueCommand(
   queueName: string,
-  options: { prompt?: string; directory?: string },
+  options: {
+    prompt?: string;
+    directory?: string;
+    model?: string;
+    timeout?: string;
+    silence?: string;
+  },
 ): Promise<void> {
   const t = getTranslatorForCommon();
   if (options.prompt === undefined || options.prompt.trim() === "") {
     throw new Error(t("cli.queueInsertPromptRequired"));
+  }
+  for (const [flag, value] of [
+    ["--timeout", options.timeout],
+    ["--silence", options.silence],
+  ] as const) {
+    if (value !== undefined) {
+      const parsed = parseTimeout(value);
+      if (!parsed.ok) {
+        throw new Error(t("cli.queueInsertInvalidDuration", { flag, value, detail: parsed.reason }));
+      }
+    }
   }
 
   const definition = await loadQueueDefinition(queueName);
@@ -540,13 +604,18 @@ async function insertQueueCommand(
     throw new Error(t("cli.queueNotFound", { name: queueName }));
   }
 
-  // `--directory` lands in the task front matter as-is (fire-time validation
-  // only, spec D6 — the bridge may run elsewhere); a blank value is treated
-  // as absent (no line written, the queue-level/default resolution applies).
-  const directory = options.directory?.trim();
-  const taskId = await insertQueueTask(queueName, options.prompt, undefined, {
-    ...(directory !== undefined && directory !== "" ? { directory } : {}),
-  });
+  // The task-level overrides land in the task front matter as-is (the
+  // timeout/silence grammar was already checked above; model/directory are
+  // fire-time validated, spec D6 — the bridge may run elsewhere); a blank
+  // value is treated as absent (no line written, the queue-level/default
+  // resolution applies).
+  const overrides = {
+    directory: options.directory?.trim(),
+    model: options.model?.trim(),
+    timeout: options.timeout?.trim(),
+    silence: options.silence?.trim(),
+  };
+  const taskId = await insertQueueTask(queueName, options.prompt, undefined, overrides);
   console.log(t("cli.queueInserted", { name: queueName, taskId }));
 
   if (definition.target === undefined) {
@@ -648,6 +717,261 @@ async function setQueueEnabledCommand(queueName: string, enabled: boolean): Prom
   console.log(
     `Queue "${queueName}" is now ${enabled ? "enabled" : "disabled (tasks wait until re-enabled)"}.`,
   );
+}
+
+/**
+ * `agent-bridge queue retry <queue-name> <task-id>`: re-queue a dead-lettered
+ * task (spec D2/T02). Only a `state: failed` task can be retried — the edit
+ * flips it back to `pending` and clears the `failedAt` / `reason` /
+ * `agentSessionId` lines in one atomic write; the controller then consumes it
+ * naturally on its next tick (retry is only a state flip, no firing here).
+ */
+async function retryQueueCommand(queueName: string, taskId: string): Promise<void> {
+  const t = getTranslatorForCommon();
+  if (!isValidQueueName(queueName)) {
+    throw new Error(t("cli.queueNameInvalid"));
+  }
+  if (!isValidTaskId(taskId)) {
+    throw new Error(t("cli.queueRetryTaskNotFound", { name: queueName, taskId }));
+  }
+  const result = await retryQueueTask(queueName, taskId);
+  if (!result.ok) {
+    // Map the storage-layer reasons onto localized CLI messages: missing
+    // file, failed validation, or a non-`failed` state.
+    if (result.reason.endsWith("not found") || result.reason.includes("not found in queue")) {
+      throw new Error(t("cli.queueRetryTaskNotFound", { name: queueName, taskId }));
+    }
+    if (result.reason.includes("is not failed")) {
+      // Re-load to report the actual state in the message.
+      const tasks = await listQueueTasks(queueName);
+      const state = tasks.find((task) => task.id === taskId)?.state ?? "unknown";
+      throw new Error(t("cli.queueRetryNotFailed", { name: queueName, taskId, state }));
+    }
+    throw new Error(result.reason);
+  }
+  console.log(t("cli.queueRetried", { name: queueName, taskId }));
+}
+
+// ---------------------------------------------------------------------------
+// `schedule run <task-name>` (spec D6/T06): manual trigger from the CLI.
+//
+// A CLI invocation is NOT the bridge process: the scheduler normally lives
+// inside a running channel (constructed by channel-runner, wired to the
+// core's ingress and the client adapter's egress). Delivering the run result
+// to the task's `target` chat requires a real client-adapter connection, and
+// the synthetic dispatch requires a started core (`input()` rejects while
+// `#started` is false), so the CLI starts a minimal one-shot channel here —
+// the exact construction channel-runner performs, minus the queue
+// controller:
+//
+// - the configured channel's real client adapter (deliver resolves egress
+//   to the `target` chat through it) and a real GatewayCore;
+// - an in-memory channel state store (only the one synthetic `schedule:*`
+//   session runs here and its bindings are in-memory only by design; a
+//   concurrently running real bridge's state files are never touched).
+//
+// The trigger itself is NOT duplicated: everything goes through the same
+// `Scheduler.runNow` the in-channel `/schedule-run` uses. `runNow` resolves
+// when the prompt dispatch is accepted (for pi AND opencode the run then
+// continues in the background), so afterwards the command polls the run's
+// TERMINAL run-history line (written at every endpoint — completed/failed/
+// timeout — before the delivery is enqueued) plus a short delivery grace, and
+// only then tears the one-shot channel down. The wait is bounded by the
+// TASK'S OWN timeout (+small grace): a healthy run always reaches an endpoint
+// (the timeout path writes the history line itself) before that bound. If the
+// wait is interrupted (SIGINT) or the bound passes without a terminal line,
+// the CLI prints an honest warning (NOT the success message) and tears the
+// channel down — the run may still be in progress or was just interrupted;
+// `schedule history` tells which.
+// ---------------------------------------------------------------------------
+
+/**
+ * `agent-bridge schedule run <task-name>`: validate the task exists, then
+ * fire it through the same `Scheduler.runNow` entry the in-channel
+ * `/schedule-run` uses (no trigger logic is duplicated here).
+ *
+ * `runNow` resolves when the prompt dispatch is accepted — the run itself
+ * continues in the background for both agent backends — so afterwards the
+ * command polls the run's TERMINAL run-history line (written at every
+ * endpoint: completed/failed/timeout, before the delivery is enqueued) plus
+ * a short delivery grace, then tears the one-shot channel down. The wait is
+ * bounded by the task's own timeout (+small grace); an interrupted or
+ * timed-out wait prints a differentiated warning instead of the success
+ * message.
+ */
+/** Poll/grace knobs for the settle wait (tests shrink these). */
+export const SCHEDULE_RUN_WAIT = { pollMs: 1_000, graceMs: 2_000, extraTimeoutMs: 60_000 };
+
+function delay(ms: number): Promise<void> {
+  return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
+/** How the settle wait ended (drives the CLI's closing message). */
+type ScheduleRunWaitOutcome = "settled" | "timeout" | "interrupted";
+
+/**
+ * Polls the run-history index until a run of `taskName` started at/after
+ * `sinceIso` has a TERMINAL line (`"settled"`). Ends as `"interrupted"` as
+ * soon as `isInterrupted()` turns true, or `"timeout"` once the bound —
+ * the task's own timeout plus a small grace (a healthy run's timeout path
+ * writes the terminal line itself) — passes without one. Never throws for
+ * history read failures: history is a best-effort synchronization signal,
+ * not something a dispatch should fail over.
+ */
+async function waitForRunSettled(
+  taskName: string,
+  sinceIso: string,
+  taskTimeoutMs: number,
+  isInterrupted: () => boolean,
+): Promise<ScheduleRunWaitOutcome> {
+  // The run registers right before `runNow` dispatches, so its own timeout
+  // fires at ~registerTime + taskTimeoutMs; the extra grace covers history
+  // write/delivery lag past that endpoint.
+  const deadline = Date.now() + taskTimeoutMs + SCHEDULE_RUN_WAIT.extraTimeoutMs;
+  for (;;) {
+    if (isInterrupted()) return "interrupted";
+    let records: RunHistoryRecord[] = [];
+    try {
+      records = await readRunHistory("schedule");
+    } catch {
+      // History is a best-effort synchronization signal; a read failure must
+      // not turn a dispatched run into a CLI error.
+    }
+    const settled = records.some(
+      (record) =>
+        parseSyntheticSessionId(record.runId)?.taskName === taskName && record.ts >= sinceIso,
+    );
+    if (settled) return "settled";
+    if (Date.now() >= deadline) return "timeout";
+    await delay(SCHEDULE_RUN_WAIT.pollMs);
+  }
+}
+
+async function runScheduleTask(taskName: string): Promise<void> {
+  const t = getTranslatorForCommon();
+  if (!isValidTaskName(taskName)) {
+    throw new Error(t("cli.taskNameInvalid"));
+  }
+  const loaded = await loadAllTasks();
+  if (!loaded.some((entry) => entry.task.name === taskName)) {
+    throw new Error(t("cli.scheduleRunTaskNotFound", { name: taskName }));
+  }
+
+  // Ownership pre-check: `runNow` refuses a task bound to another channel
+  // (the fire can only deliver through the owning channel's adapter), so the
+  // CLI must construct THAT channel's core. No `channel` line = unbound; any
+  // configured channel's core accepts it (same rule as the in-channel
+  // command) — the first configured one is used.
+  const task = loaded.find((entry) => entry.task.name === taskName)!.task;
+  const config = await loadConfig();
+  const configuredNames = Object.keys(config.channels).sort();
+  const channelName = task.channel ?? configuredNames[0];
+  if (channelName === undefined || config.channels[channelName] === undefined) {
+    throw new Error(
+      task.channel === undefined
+        ? t("cli.scheduleRunNoChannels")
+        : t("cli.scheduleRunChannelNotFound", { name: taskName, channel: task.channel }),
+    );
+  }
+  const channelConfig = config.channels[channelName]!;
+
+  const channelStateStore = createInMemoryChannelStateStore();
+  const agentSessionStateRegistry = createAgentSessionStateRegistry(channelStateStore);
+  const clientModule = getTypedClientModule(channelConfig.client);
+  const agentModule = getTypedAgentModule(channelConfig.agent);
+  const common = { channelName, language: channelConfig.common.language };
+
+  // One-shot scheduler and core, mirroring the channel-runner wiring. The
+  // scheduler is declared first and assigned after the core exists: the core
+  // diverts `schedule:*` agent output to the scheduler (spec D2), the
+  // scheduler dispatches synthetic fires into the core's ingress and
+  // delivers egress through the real client adapter (spec D1/D9).
+  let scheduler: Scheduler;
+
+  const imAdapter = clientModule.createClientAdapter({
+    config: channelConfig.client.config,
+    common,
+    sessionState: createClientSessionStateStore({
+      channelStateStore,
+      clientType: clientModule.type,
+      codec: clientModule.sessionStateCodec,
+    }),
+  });
+
+  const core: GatewayCore = new GatewayCore({
+    imAdapter,
+    agentModule,
+    agentConfig: channelConfig.agent.config,
+    agentIdleTimeoutMs: config.defaults.agentIdleTimeoutMs,
+    // Same allowlist the runner passes: a configured working-directory root
+    // allowlist must bind CLI-fired runs too, not just channel ones.
+    ...(config.defaults.allowedWorkingDirectoryRoots !== undefined
+      ? { allowedWorkingDirectoryRoots: config.defaults.allowedWorkingDirectoryRoots }
+      : {}),
+    channelStateStore,
+    agentSessionStateRegistry,
+    common,
+    onScheduleOutput: (event) => scheduler.handleOutput(event),
+  });
+
+  scheduler = new Scheduler({
+    channelName,
+    dispatchClientEvent: (event) => core.input(event),
+    deliver: (event) => imAdapter.input(event),
+    validateTarget: (clientSessionId) => clientModule.validateSessionId(clientSessionId),
+    t: getTranslatorForCommon(common),
+  });
+
+  // Starting the core brings the client adapter online (deliveries resolve
+  // the `target` chat through it); starting the scheduler arms the tick
+  // loop. Unlike a long-lived channel there is no queue controller here.
+  // SIGINT flips the interrupted flag; the settle wait observes it and the
+  // teardown below runs through the normal path (releasing the agent
+  // session) before the default exit kills the process.
+  let interrupted = false;
+  const onSignal = () => {
+    interrupted = true;
+  };
+  process.once("SIGINT", onSignal);
+  await core.start();
+  await scheduler.start();
+  try {
+    // `runNow` resolves at dispatch-accept (the run continues in the
+    // background for both agent backends). The result is delivered to the
+    // task's target by the run itself; afterwards wait for the run's
+    // terminal history line + a short delivery grace so the one-shot
+    // teardown below never kills an in-flight run or drops its delivery.
+    const sinceIso = new Date(Date.now() - 5_000).toISOString();
+    const result = await scheduler.runNow(taskName);
+    if (!result.ok) {
+      throw new Error(t("cli.scheduleRunFailed", { name: taskName, reason: result.reason }));
+    }
+    const waitOutcome = await waitForRunSettled(taskName, sinceIso, task.timeoutMs, () => interrupted);
+    if (waitOutcome === "settled") {
+      await delay(SCHEDULE_RUN_WAIT.graceMs);
+      console.log(t("cli.scheduleRunTriggered", { name: taskName }));
+    } else {
+      // Honest failure-to-confirm, NOT the success message: on interrupt the
+      // teardown below releases the run (likely interrupting it); on timeout
+      // the run may genuinely still be working past its own timeout bound.
+      // Either way the run history tells what actually happened.
+      console.error(
+        t("cli.scheduleRunWaitNotSettled", {
+          name: taskName,
+          reason: waitOutcome === "interrupted"
+            ? t("cli.scheduleRunWaitInterrupted")
+            : t("cli.scheduleRunWaitTimeout"),
+        }),
+      );
+      process.exitCode = 1;
+    }
+  } finally {
+    process.removeListener("SIGINT", onSignal);
+    // Completed, interrupted or timed-out wait: stop in the same order as
+    // the channel teardown, releasing the agent session and the adapter.
+    await scheduler.stop();
+    await core.stop();
+  }
 }
 
 // ---------------------------------------------------------------------------
@@ -812,6 +1136,17 @@ export async function runCli(argv = process.argv): Promise<void> {
     });
 
   schedule
+    .command("run")
+    .description(
+      "Trigger a scheduled task once now (the result is delivered to the task's target chat). "+
+      "Note: connects to the IM with the channel's credentials — a running bridge on that channel may be displaced (wecom/weixin); consider stopping it first.",
+    )
+    .argument("<task-name>")
+    .action(async (taskName: string) => {
+      await runScheduleTask(taskName);
+    });
+
+  schedule
     .command("enable")
     .description("Enable a scheduled task (resume scheduled firing)")
     .argument("<task-name>")
@@ -864,7 +1199,10 @@ export async function runCli(argv = process.argv): Promise<void> {
     .argument("<queue-name>")
     .option("--prompt <prompt>", "Task prompt")
     .option("--directory <path>", "Working directory for this task (overrides the queue's directory)")
-    .action(async (queueName: string, options: { prompt?: string; directory?: string }) => {
+    .option("--model <model>", "Agent model for this task (overrides the queue's model)")
+    .option("--timeout <duration>", "Wall-clock run limit for this task, e.g. 10m (overrides the queue's timeout)")
+    .option("--silence <duration>", "Silence-probe window for this task, e.g. 30m (overrides the queue's silence)")
+    .action(async (queueName: string, options: { prompt?: string; directory?: string; model?: string; timeout?: string; silence?: string }) => {
       await insertQueueCommand(queueName, options);
     });
 
@@ -905,6 +1243,15 @@ export async function runCli(argv = process.argv): Promise<void> {
     .argument("<queue-name>")
     .action(async (queueName: string) => {
       await queueHistory(queueName);
+    });
+
+  queue
+    .command("retry")
+    .description("Re-queue a failed (dead-lettered) task: state goes back to pending")
+    .argument("<queue-name>")
+    .argument("<task-id>")
+    .action(async (queueName: string, taskId: string) => {
+      await retryQueueCommand(queueName, taskId);
     });
 
   await program.parseAsync(argv);

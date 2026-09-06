@@ -38,7 +38,7 @@ Output events for the synthetic `schedule:*` session cannot be delivered as-is (
 
 - Any output event whose resolved clientSessionId starts with `schedule:` is handed to the scheduler instead of `imAdapter.input`.
 - Intermediate/progress events (tool calls, thinking, the "started new session" confirmation, ...) are discarded; `assistant.message` events are accumulated (T3) into a per-run local file under `run-outputs/`.
-- Completion is the three-layer DONE protocol (T3), not the first `assistant.message`: the scheduler accumulates every `assistant.message`, and when one carries the `BRIDGE_TASK_STATUS_DONE` marker as its last line it delivers the **full accumulated transcript** exactly once by emitting a normal `assistant.message` egress event through `imAdapter.input`, addressed to the task's **`target` clientSessionId** (from the front matter), prefixed with a localized one-line header identifying the task (e.g. `📋 Scheduled task "daily-report":`). After `silence` minutes (front matter, default 10m) without any run event the scheduler sends a probe `user.message` into the session asking whether the run is finished; the probe Q&A is accumulated and included in the delivered transcript. Client adapters resolve the target chat from the clientSessionId alone (e.g. Feishu's `parseFeishuSessionId`), so no binding lookup is needed and the chat's own session state is never touched.
+- Completion is the three-layer DONE protocol (T3), not the first `assistant.message`: the scheduler accumulates every `assistant.message`, and when one carries the `BRIDGE_TASK_STATUS_DONE` marker as its last line it delivers the **full accumulated transcript** exactly once by emitting a normal `assistant.message` egress event through `imAdapter.input`, addressed to the task's **`target` clientSessionId** (from the front matter), prefixed with a localized one-line header identifying the task (e.g. `📋 Scheduled task "daily-report":`). After `silence` minutes (front matter, default 30m) without any run event the scheduler sends a probe `user.message` into the session asking whether the run is finished; the probe Q&A is accumulated and included in the delivered transcript. Client adapters resolve the target chat from the clientSessionId alone (e.g. Feishu's `parseFeishuSessionId`), so no binding lookup is needed and the chat's own session state is never touched.
 
 Because delivery goes through the standard egress event path, message chunking, `MEDIA:` attachment claiming, and formatting all behave exactly like a normal agent reply — for free.
 
@@ -52,6 +52,12 @@ Every run is also recorded as one line in an append-only JSONL index at `~/.conf
 
 If the task has no valid `target`, nothing can be delivered; the fire is skipped, logged, and shown as "no target" in `schedule list`.
 
+- **`agent-bridge schedule run <task-name>` (manual trigger from the CLI, D7a/T06)** — a CLI process is not a running channel: the synthetic dispatch needs a started core and the result delivery needs a real client-adapter connection, so the CLI starts a minimal one-shot channel in-process (the configured channel's client adapter + `GatewayCore` + `Scheduler`, the exact construction `channel-runner` performs, minus the queue controller, with an in-memory channel-state store) and calls the SAME `runNow` entry `/schedule-run` uses — no trigger logic is duplicated. The existence/ownership pre-check runs first (`loadAllTasks`): an unknown task errors out; a task bound to a channel that is not configured errors out; an unbound task runs through any configured channel.
+
+  **Wait semantics**: after the trigger is accepted the CLI blocks until the run's terminal run-history line lands (the result is delivered to the task's `target` chat while it runs), bounded by the task's own timeout plus a small grace; then the one-shot channel is torn down like a channel stop. If the wait is interrupted (SIGINT) or the bound passes without a terminal line, the CLI prints a warning (the run may still be in progress or was interrupted by the teardown — check `schedule history`) and exits non-zero instead of printing the success message.
+
+  **Concurrent-bridge caveat**: the CLI connects to the IM platform with the channel's own credentials. On platforms that allow only one active session per credential (**wecom**, **weixin**) this DISPLACES a concurrently running bridge's connection on that channel — the bridge stops receiving messages until it reconnects. Stop the channel's bridge (or use the in-chat `/schedule-run`) before using the CLI trigger; feishu is not affected.
+
 The scheduler injects its synthetic events through a new public `GatewayCore.input(event)` — the exact same handler the client adapters' messages flow through, including the shutdown guard.
 
 ### D3. Tasks are Markdown files with front matter
@@ -63,7 +69,7 @@ Location: `~/.config/agent-bridge/schedules/<task-name>.md` — a **flat, channe
 schedule: daily 09:00
 directory: ~/reports
 timeout: 30m
-silence: 10m
+silence: 30m
 enabled: true
 channel: feishu-dev
 target: feishu:dm:oc_6f9d408e630098e6dd06bb071d6b60fc
@@ -85,7 +91,7 @@ Front matter keys:
 | `schedule` | yes | — | Schedule grammar string (D4) |
 | `directory` | no | bridge process cwd | Working directory of the new session (`~` expanded, relative → bridge cwd, canonicalized at fire time) |
 | `timeout` | no | `10m` | Max run duration (`<n>m` / `<n>h`); the run is killed when exceeded (D5) |
-| `silence` | no | `10m` | Silence window (same duration syntax as `timeout`) before a probe `user.message` is sent into the run asking whether it is finished (D2/D5); an invalid value is listed as an error and the default is used |
+| `silence` | no | `30m` | Silence window (same duration syntax as `timeout`) before a probe `user.message` is sent into the run asking whether it is finished (D2/D5); an invalid value is listed as an error and the default is used |
 | `enabled` | no | `true` | `false` pauses the task without deleting it |
 | `target` | no | — | Delivery address: the clientSessionId of the destination chat, copied from `/st` in that chat or set by `/schedule-here` (D7). Missing/invalid → fire skipped, logged, shown by `schedule list` |
 | `channel` | no | — | Owning channel config name, written by `/schedule-here` alongside `target` (D7). A scheduler fires on schedule only tasks whose `channel` equals its own name; a task with no `channel` never fires on schedule |
@@ -111,7 +117,7 @@ Every fire unconditionally starts a **fresh, fully isolated run**; runs never in
 1. **Completion (three-layer DONE protocol, T3)** — the agent appends the `BRIDGE_TASK_STATUS_DONE` marker as the last line of its final `assistant.message`; the scheduler strips it and delivers the **full accumulated transcript** once (per D2), and the run is done. A terminal `error` also ends the run and delivers a failure notice per D2. The old "first `assistant.message` ends the run" semantics is gone.
 2. **Timeout** — the run exceeds the task's `timeout` (default `10m`): the scheduler aborts the run's `schedule:<task>:<seq>` session, releases it, and delivers a localized "task timed out" notice to the target chat, preceded by any partial output already accumulated.
 
-**The silence probe (layer 2).** After `silence` minutes (front matter, default 10m) with no run event, the scheduler sends a probe `user.message` into the run asking whether it is finished (reply DONE, or keep working / keep waiting for async callbacks). Any run event resets the silence window; the probe Q&A is accumulated and delivered with the transcript. An unanswered probe is harmless — the wall-clock `timeout` (layer 3) remains the only cap. A task waiting on async follow-ups simply does not emit DONE until its callbacks return; nothing else is needed.
+**The silence probe (layer 2).** After `silence` minutes (front matter, default 30m) with no run event, the scheduler sends a probe `user.message` into the run asking whether it is finished (reply DONE, or keep working / keep waiting for async callbacks). Any run event resets the silence window; the probe Q&A is accumulated and delivered with the transcript. An unanswered probe is harmless — the wall-clock `timeout` (layer 3) remains the only cap. A task waiting on async follow-ups simply does not emit DONE until its callbacks return; nothing else is needed.
 
 Consequence to document: if the schedule interval is shorter than the timeout (e.g. `every 1m` with `timeout: 30m`), several runs of the same task can be alive concurrently. Because each run has its own synthetic session id, they are genuinely isolated (results can never cross), but concurrency costs resources — the docs recommend choosing an interval comfortably larger than the expected run duration.
 
@@ -172,6 +178,7 @@ graph LR
   subgraph CLI
     ADD[agent-bridge schedule add] -->|writes| F[schedules/&lt;task&gt;.md]
     LS[agent-bridge schedule list] -->|reads| F
+    RUN[agent-bridge schedule run] -->|runNow: one-shot Scheduler + core.input| CORE
   end
   subgraph Bridge process per channel
     SCH[Scheduler in ChannelRunner] -->|tick: scan/load| F
@@ -202,17 +209,19 @@ graph LR
 ```
 agent-bridge schedule add       # interactive wizard — no channel selection (task names are globally unique)
 agent-bridge schedule list      # global list: Channel, Task, Schedule, Enabled, Target, Next run (computed from the grammar), Status
+agent-bridge schedule run <task-name>      # manual once-now trigger through the scheduler's runNow (same entry as /schedule-run)
 agent-bridge schedule remove <task-name>   # direct delete — no --channel option (task names are globally unique)
 ```
 
-Wizard steps for `add`:
+Wizard steps for `add` (identical to the queue wizard except step 2 — all prompts are localized):
 
 1. Task name (slug-validated, globally unique — no channel selection).
 2. Schedule string (validated against the grammar, re-prompt on error, with examples shown).
-3. Working directory (optional; blank = bridge cwd). Not validated against the filesystem here — validation happens at fire time (D6), since the bridge may run elsewhere.
-4. Timeout (duration string, default `10m`).
-5. Model (optional; blank = the channel agent config's default model. The CLI does not validate it — it cannot reach the provider's model list; an invalid model is fail-fast rejected by the adapter when the session is created, which fails the whole fire: the run ends, a `schedule.taskFailed` notice with the error detail is delivered to the task's `target` chat, and there is no fallback to the default model (see D6). A non-empty value is written as the `model:` line).
-6. Writes the file with a localized example prompt body (a trivial time-telling task, in the CLI's default locale — no channel is selected to localize by), then prints the file path and the targeting instruction: *"Edit the file to set your prompt. To choose the destination chat, send `/schedule-here <task-name>` in that chat (later changes: `/st` shows the chat session ID for manual `target` edits)."*
+3. Timeout (duration string, prefilled `5h`; blank = the built-in default — no `timeout:` line is written).
+4. Silence window (duration string, prefilled `30m`; blank = the built-in default — no `silence:` line is written).
+5. Model (optional; blank = the channel agent config's default model — no `model:` line. The CLI does not validate it — it cannot reach the provider's model list; an invalid model is fail-fast rejected by the adapter when the session is created, which fails the whole fire: the run ends, a `schedule.taskFailed` notice with the error detail is delivered to the task's `target` chat, and there is no fallback to the default model (see D6). A non-empty value is written as the `model:` line).
+6. Working directory (optional; blank = bridge cwd — no `directory:` line). Not validated against the filesystem here — validation happens at fire time (D6), since the bridge may run elsewhere.
+7. Writes the file with a localized example prompt body (a trivial time-telling task, in the CLI's default locale — no channel is selected to localize by), then prints the file path and the targeting instruction: *"Edit the file to set your prompt. To choose the destination chat, send `/schedule-here <task-name>` in that chat (later changes: `/st` shows the chat session ID for manual `target` edits)."*
 
 ## Component Map
 
@@ -229,7 +238,7 @@ Wizard steps for `add`:
 | `src/modules/client/utils/status-markdown.ts` | Render one extra `/st` line: the chat's clientSessionId ("Chat session ID") |
 | 3 IM adapters | Handle `/schedule-run` via injected callback + localized replies |
 | `src/modules/agent/*` | pi-coding-agent: passes `model ?? config.model ?? PI_MODEL` to the pi process at spawn; opencode: asserts the effective (override-first) model and creates the provider session with it |
-| `src/cli.ts` + `src/config/prompt.ts` | `schedule add/list/remove` (+ optional Model wizard step)
+| `src/cli.ts` + `src/config/prompt.ts` | `schedule add/list/remove/run` (+ optional Model/Silence wizard steps)
 | `src/i18n/index.ts` | `/st` chat-session-ID label, task result header, task failure/timeout notices, `/schedule-run` replies, CLI strings |
 | `docs/scheduled-tasks.md` | User documentation (grammar, file format, targeting via `/st`, isolation semantics) |
 
@@ -254,7 +263,8 @@ Wizard steps for `add`:
 - Runner/core divert: schedule-session progress events dropped; intermediate `assistant.message` accumulated (no run end); DONE-marked `assistant.message` delivered to the task's `target` with header and completing the run; silence probe dispatched and its Q&A accumulated; terminal `error` delivered as failure; non-schedule sessions untouched; the target chat's own binding never modified.
 - Channel state: unchanged (assert no scheduler writes).
 - `/schedule-run`: adapter-level test (Feishu) — success and error paths; `/st` renders the chat session ID line.
-- CLI: wizard validation loops (schedule string, task name), file creation shape.
+- CLI: wizard validation loops (schedule string, task name), file creation shape; `schedule run` (existence check, one-shot scheduler wiring, localized outputs).
+- i18n: every `cli.*` key exists in both `en-US` and `zh-CN` (parity assertion).
 - Manual e2e on the `feishu-dev` channel: add → copy `/st` id into `target` → edit prompt → `/schedule-run` → verify result message arrives while a parallel interactive conversation in the same chat keeps its session intact; verify timeout kill with a short `timeout` and a slow prompt.
 
 ## Rejected Alternatives

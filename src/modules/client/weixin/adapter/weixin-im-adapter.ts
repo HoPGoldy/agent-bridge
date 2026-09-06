@@ -4,6 +4,7 @@ import type {
   ClientOutputEvent,
   ClientSessionStateStore,
   IMAdapter,
+  OnQueueHere,
   OnScheduleHere,
   OnScheduleRun,
   WeixinClientConfig,
@@ -13,11 +14,14 @@ import { createLogger, type Logger } from "../../../../core/logger";
 import { isCompletedCommandResponse, isTerminalAgentError } from "../../utils/error-events";
 import { ProgressRenderer } from "../../utils/progress-renderer";
 import {
+  formatQueueHereReply,
   formatScheduleHereReply,
   formatScheduleRunReply,
   parseSlashCommand,
   resolveHelpMarkdown,
   resolveSlashCommandEvent,
+  type QueueHereCommand,
+  type QueueHereUsageCommand,
   type ScheduleHereCommand,
   type ScheduleHereUsageCommand,
   type ScheduleRunCommand,
@@ -94,6 +98,7 @@ export class WeixinIMAdapter implements IMAdapter {
   readonly #sessionState: ClientSessionStateStore<ImClientSessionStateV1>;
   readonly #onScheduleRun: OnScheduleRun | undefined;
   readonly #onScheduleHere: OnScheduleHere | undefined;
+  readonly #onQueueHere: OnQueueHere | undefined;
   #onOutput: ((event: ClientOutputEvent) => Promise<void> | void) | null = null;
   #client: WeixinClient | null = null;
   #egressQueue: EgressEvent[] = [];
@@ -114,6 +119,7 @@ export class WeixinIMAdapter implements IMAdapter {
     ),
     onScheduleRun?: OnScheduleRun,
     onScheduleHere?: OnScheduleHere,
+    onQueueHere?: OnQueueHere,
   ) {
     this.#config = config;
     this.#logger = logger;
@@ -121,6 +127,7 @@ export class WeixinIMAdapter implements IMAdapter {
     this.#sessionState = sessionState;
     this.#onScheduleRun = onScheduleRun;
     this.#onScheduleHere = onScheduleHere;
+    this.#onQueueHere = onQueueHere;
   }
 
   async start(onOutput: (event: ClientOutputEvent) => Promise<void> | void): Promise<void> {
@@ -195,6 +202,12 @@ export class WeixinIMAdapter implements IMAdapter {
           // Adapter-local target binding (spec D7): never reaches the core.
           this.#logger.info(`received local schedule-here command ${normalizedText} (session=${clientSessionId})`);
           await this.#handleScheduleHere(parsedCommand, chatId, clientSessionId);
+          return;
+        }
+        if (parsedCommand.type === "queue.here" || parsedCommand.type === "queue.here.usage") {
+          // Adapter-local queue target binding (spec D4): never reaches the core.
+          this.#logger.info(`received local queue-here command ${normalizedText} (session=${clientSessionId})`);
+          await this.#handleQueueHere(parsedCommand, chatId, clientSessionId);
           return;
         }
         if (parsedCommand.type === "command.session.resume.usage") {
@@ -661,6 +674,40 @@ export class WeixinIMAdapter implements IMAdapter {
     await this.#client?.sendText(
       chatId,
       formatScheduleHereReply(result, command.taskName, this.#t),
+    );
+    await cleanup();
+  }
+
+  async #handleQueueHere(
+    command: QueueHereCommand | QueueHereUsageCommand,
+    chatId: string,
+    clientSessionId: string,
+  ): Promise<void> {
+    const cleanup = async (): Promise<void> => {
+      this.#stopProgressTimer(clientSessionId);
+      await this.#cancelTyping(chatId, clientSessionId);
+    };
+
+    if (command.type === "queue.here.usage") {
+      await this.#client?.sendText(chatId, this.#t("client.queueHereUsage"));
+      await cleanup();
+      return;
+    }
+
+    if (!this.#onQueueHere) {
+      // The runner always injects the bridge (spec D4); degrade gracefully
+      // if it is ever absent: log, and reply nothing.
+      this.#logger.warn(
+        `onQueueHere is not injected; dropping /queue-here for queue "${command.queueName}" (session=${command.clientSessionId})`,
+      );
+      await cleanup();
+      return;
+    }
+
+    const result = await this.#onQueueHere(command.queueName, command.clientSessionId);
+    await this.#client?.sendText(
+      chatId,
+      formatQueueHereReply(result, command.queueName, this.#t),
     );
     await cleanup();
   }

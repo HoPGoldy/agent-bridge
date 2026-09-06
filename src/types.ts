@@ -289,6 +289,22 @@ export type OnScheduleHere = (
   clientSessionId: string,
 ) => Promise<ScheduleHereResult>;
 
+/** Outcome of binding a chat as a queue's delivery target (`/queue-here`, spec D4). */
+export type QueueHereResult = { ok: true } | { ok: false; reason: string };
+
+/**
+ * Target-binding bridge (spec D4): the client adapter calls this for a local
+ * `/queue-here <queue>` command sent in the destination chat; the channel
+ * runner wires it to the per-channel queue controller's `claimTarget`, which
+ * writes the current channel's name and the sending chat's `clientSessionId`
+ * into the queue file's `channel`/`target` fields. Optional: adapters degrade
+ * gracefully (log, no reply) when absent.
+ */
+export type OnQueueHere = (
+  queueName: string,
+  clientSessionId: string,
+) => Promise<QueueHereResult>;
+
 export interface ClientModule<TConfig = unknown, TState extends object = Record<string, never>> {
   readonly type: string;
   /**
@@ -327,6 +343,15 @@ export interface ClientModule<TConfig = unknown, TState extends object = Record<
      * `target` field. Optional: adapters must degrade gracefully when absent.
      */
     onScheduleHere?: OnScheduleHere;
+    /**
+     * Target-binding bridge (spec D4): called by the adapter for a local
+     * `/queue-here <queue>` command sent in the destination chat; the runner
+     * wires it to the per-channel queue controller's `claimTarget`, which
+     * writes the current channel's name and the sending chat's
+     * `clientSessionId` into the queue file. Optional: adapters must degrade
+     * gracefully when absent.
+     */
+    onQueueHere?: OnQueueHere;
   }): IMAdapter;
 }
 

@@ -45,6 +45,7 @@ const schedulerCtor = vi.fn().mockImplementation((options: SchedulerOptions) => 
 
 const queueControllerStart = vi.fn(async () => {});
 const queueControllerStop = vi.fn(async () => {});
+const queueControllerClaimTarget = vi.fn(async () => ({ ok: true as const }));
 const queueControllerHandleOutput = vi.fn();
 /** Options captured from the runner's `new QueueController(...)` call, per test. */
 let queueControllerOptions: QueueControllerOptions | undefined;
@@ -53,6 +54,7 @@ const queueControllerCtor = vi.fn().mockImplementation((options: QueueController
   return {
     start: queueControllerStart,
     stop: queueControllerStop,
+    claimTarget: queueControllerClaimTarget,
     handleOutput: queueControllerHandleOutput,
   };
 });
@@ -144,6 +146,7 @@ describe("runChannel", () => {
     queueControllerCtor.mockClear();
     queueControllerStart.mockClear();
     queueControllerStop.mockClear();
+    queueControllerClaimTarget.mockClear();
     queueControllerHandleOutput.mockClear();
     queueControllerOptions = undefined;
     clientModule.validateSessionId.mockClear();
@@ -180,6 +183,7 @@ describe("runChannel", () => {
       sessionState: expect.any(Object),
       onScheduleRun: expect.any(Function),
       onScheduleHere: expect.any(Function),
+      onQueueHere: expect.any(Function),
     });
     expect(gatewayCoreCtor).toHaveBeenCalledWith(
       expect.objectContaining({
@@ -621,5 +625,36 @@ describe("runChannel", () => {
     const result = await adapterOptions.onScheduleHere("report", "wecom:dm:oc_abc");
     expect(schedulerClaimTarget).toHaveBeenCalledWith("report", "wecom:dm:oc_abc");
     expect(result).toEqual({ ok: false, reason: "task not found" });
+  });
+
+  it("exposes queueController.claimTarget to the client adapter via onQueueHere", async () => {
+    const { runChannel } = await import("./channel-runner");
+    const channelConfig: ChannelConfig = {
+      common: { language: "en-US" },
+      client: {
+        type: "wecom",
+        config: { botId: "bot-id", secret: "secret" },
+      },
+      agent: {
+        type: "pi-coding-agent",
+        config: {},
+      },
+    };
+
+    await runChannel({
+      channelName: "demo-channel",
+      channelConfig,
+      defaults: { agentIdleTimeoutMs: 60_000 },
+    });
+
+    const adapterOptions = createClientAdapter.mock.calls[0]![0] as {
+      onQueueHere: (queueName: string, clientSessionId: string) => Promise<unknown>;
+    };
+    expect(typeof adapterOptions.onQueueHere).toBe("function");
+
+    queueControllerClaimTarget.mockResolvedValue({ ok: false, reason: "queue already bound" });
+    const result = await adapterOptions.onQueueHere("build", "wecom:dm:oc_abc");
+    expect(queueControllerClaimTarget).toHaveBeenCalledWith("build", "wecom:dm:oc_abc");
+    expect(result).toEqual({ ok: false, reason: "queue already bound" });
   });
 });

@@ -68,6 +68,29 @@ describe("feishuClientModule schedule bridges", () => {
       sessionState,
       onScheduleRun,
       onScheduleHere,
+      undefined,
+    );
+  });
+
+  it("passes the onQueueHere queue bridge into the adapter constructor (T05)", () => {
+    const onQueueHere = vi.fn();
+    const sessionState = {} as never;
+
+    feishuClientModule.createClientAdapter({
+      config: { appId: "cli_x", appSecret: "secret" },
+      common: { channelName: "demo", language: "en-US" },
+      sessionState,
+      onQueueHere,
+    });
+
+    expect(FeishuIMAdapterMock).toHaveBeenCalledWith(
+      { appId: "cli_x", appSecret: "secret" },
+      undefined,
+      { channelName: "demo", language: "en-US" },
+      sessionState,
+      undefined,
+      undefined,
+      onQueueHere,
     );
   });
 });

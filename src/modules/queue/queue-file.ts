@@ -29,13 +29,21 @@
  */
 
 import type { Dirent } from "node:fs";
-import { access, mkdir, readFile, readdir, rename, unlink, writeFile } from "node:fs/promises";
-import { randomBytes, randomUUID } from "node:crypto";
-import os from "node:os";
+import { access, mkdir, readFile, readdir, unlink } from "node:fs/promises";
+import { randomBytes } from "node:crypto";
 import path from "node:path";
 import { QUEUES_DIR } from "../../config/channel-state";
 import { DEFAULT_SILENCE_MS } from "../schedule/task-file";
 import { parseTimeout } from "../schedule/grammar";
+import {
+  applyFrontMatterField,
+  expandHome,
+  nonEmptyString,
+  parseFrontMatter,
+  removeFrontMatterFields,
+  splitFrontMatter,
+  writeFileAtomic,
+} from "../shared/front-matter";
 
 /** Synthetic clientSessionId prefix for queue runs (spec D1). Shared with the core. */
 export const QUEUE_SESSION_PREFIX = "queue:";
@@ -49,7 +57,13 @@ const QUEUE_NAME_RE = /^[a-z0-9-]+$/;
 /** Task ids are `<enqueueMs>-<random4>`; the shape is part of the FIFO contract (spec D1). */
 const TASK_ID_RE = /^\d+-[0-9a-f]{4}$/;
 
-const TASK_STATES = new Set(["pending", "running"]);
+/**
+ * Task states: `pending` (waiting to fire) and `running` (in flight) are the
+ * live states; `failed` is the dead-letter terminal state (spec D2/T02): a
+ * task whose run failed after session creation keeps its file for tracing and
+ * re-queueing via `queue retry`.
+ */
+const TASK_STATES = new Set(["pending", "running", "failed"]);
 
 const KNOWN_DEFINITION_KEYS = new Set([
   "channel",
@@ -61,7 +75,22 @@ const KNOWN_DEFINITION_KEYS = new Set([
   "enabled",
   "directory",
 ]);
-const KNOWN_TASK_KEYS = new Set(["state", "enqueuedAt", "directory"]);
+// `failedAt` / `reason` / `agentSessionId` are dead-letter fields: they are
+// written together with `state: failed` (failQueueTask) and cleared again by
+// `queue retry` (retryQueueTask). `model` / `timeout` / `silence` are the
+// task-level run-parameter overrides (T03): each one overrides the same-named
+// definition field at fire time.
+const KNOWN_TASK_KEYS = new Set([
+  "state",
+  "enqueuedAt",
+  "directory",
+  "model",
+  "timeout",
+  "silence",
+  "failedAt",
+  "reason",
+  "agentSessionId",
+]);
 
 /** A parsed, validated queue definition (spec D1). */
 export interface QueueDefinition {
@@ -78,7 +107,7 @@ export interface QueueDefinition {
   workers: number;
   /**
    * Silence window before a probe message is sent into the run session
-   * (2026-08-19 grill, layer 2); parsed from the definition's `silence:`
+   * (2026-09-06 unification grill); parsed from the definition's `silence:`
    * front matter with the same duration syntax as `timeout:`, defaults to
    * {@link DEFAULT_SILENCE_MS}.
    */
@@ -120,8 +149,12 @@ export interface QueueDefinition {
 export interface QueueTask {
   /** Task id — the file name without `.md`; `queue:<name>:<taskId>` run suffix. */
   id: string;
-  /** `pending` | `running`; a `running` task at shutdown is re-enqueued on start. */
-  state: "pending" | "running";
+  /**
+   * `pending` | `running` | `failed`; a `running` task at shutdown is
+   * re-enqueued on start, a `failed` one is dead-lettered and only ever
+   * re-queued explicitly (`queue retry`).
+   */
+  state: "pending" | "running" | "failed";
   /** ISO timestamp of enqueue; the id's ms prefix comes from the same clock. */
   enqueuedAt: string;
   /** The task prompt (required, non-empty). */
@@ -132,6 +165,38 @@ export interface QueueTask {
    * like a scheduled task's `directory:` — validated at fire time only.
    */
   directory: string | undefined;
+  /**
+   * Task-level model override (T03), highest precedence over the queue
+   * definition's `model:`; written by `queue insert --model`. Absent/blank →
+   * undefined: the chain then continues at the definition and finally the
+   * channel agent config's model (no built-in default participates).
+   */
+  model: string | undefined;
+  /**
+   * Task-level wall-clock run limit in ms (T03), highest precedence over the
+   * queue definition's `timeout:`, then the controller's built-in default;
+   * written by `queue insert --timeout`. Parsed from the `timeout:` front
+   * matter with the same duration syntax as the definition's.
+   */
+  timeoutMs: number | undefined;
+  /**
+   * Task-level silence-probe window in ms (T03), highest precedence over the
+   * queue definition's `silence:`; written by `queue insert --silence`.
+   * Parsed from the `silence:` front matter with the same duration syntax.
+   */
+  silenceMs: number | undefined;
+  /**
+   * ISO timestamp of the failure (dead-letter trace, spec D2/T02); present
+   * only on `failed` tasks (cleared again by `queue retry`).
+   */
+  failedAt: string | undefined;
+  /** Failure reason of the dead-lettered run; present only on `failed` tasks. */
+  reason: string | undefined;
+  /**
+   * Agent session id of the failed run (dead-letter trace, spec D2/T02);
+   * present only on `failed` tasks whose session was actually created.
+   */
+  agentSessionId: string | undefined;
   /** Absolute path of the task file. */
   filePath: string;
 }
@@ -157,6 +222,14 @@ export interface QueueDefinitionInput {
   model?: string;
   /** Queue-level working directory; blank/absent → the line is not written. */
   directory?: string;
+  /**
+   * Queue-level run-parameter overrides (T06): raw duration strings parsed
+   * with the same grammar as the task side; blank/absent → the line is not
+   * written (the controller's built-in default applies).
+   */
+  timeout?: string;
+  silence?: string;
+  /** Shared context written as the file body; blank/absent → an empty body. */
   body?: string;
 }
 
@@ -308,7 +381,7 @@ export function parseQueueTaskFile(
   if (stateRaw === undefined) {
     errors.push('missing required front matter key "state"');
   } else if (!TASK_STATES.has(stateRaw)) {
-    errors.push(`invalid state "${stateRaw}": must be "pending" or "running"`);
+    errors.push(`invalid state "${stateRaw}": must be "pending", "running" or "failed"`);
   }
 
   const enqueuedAt = fields.enqueuedAt;
@@ -323,14 +396,44 @@ export function parseQueueTaskFile(
     errors.push("task body is empty — nothing would be sent when this task runs");
   }
 
+  // Task-level run-parameter overrides (T03), same parse rules as the
+  // definition side: `timeout` / `silence` via parseTimeout, a failure lands
+  // in `errors` and nulls the task; `model` only needs to be non-empty.
+  let timeoutMs: number | undefined;
+  if (fields.timeout !== undefined && fields.timeout.trim() !== "") {
+    const parsed = parseTimeout(fields.timeout);
+    if (parsed.ok) {
+      timeoutMs = parsed.ms;
+    } else {
+      errors.push(`invalid timeout "${fields.timeout}": ${parsed.reason}`);
+    }
+  }
+
+  let silenceMs: number | undefined;
+  if (fields.silence !== undefined && fields.silence.trim() !== "") {
+    const parsed = parseTimeout(fields.silence);
+    if (parsed.ok) {
+      silenceMs = parsed.ms;
+    } else {
+      errors.push(`invalid silence "${fields.silence}": ${parsed.reason}`);
+    }
+  }
+
   const task: QueueTask | null =
     errors.length === 0
       ? {
           id,
-          state: stateRaw as "pending" | "running",
+          state: stateRaw as QueueTask["state"],
           enqueuedAt: enqueuedAt as string,
           prompt,
           directory: nonEmptyString(fields.directory),
+          model: nonEmptyString(fields.model),
+          timeoutMs,
+          silenceMs,
+          // Dead-letter fields (spec D2/T02): present only on failed tasks.
+          failedAt: nonEmptyString(fields.failedAt),
+          reason: nonEmptyString(fields.reason),
+          agentSessionId: nonEmptyString(fields.agentSessionId),
           filePath,
         }
       : null;
@@ -420,8 +523,9 @@ export async function loadQueueDefinition(
 
 /**
  * Creates a queue definition file (the `queue add` wizard): front matter
- * `workers` (default 1) and `model` when provided, then an empty body. No
- * `channel` is written — a queue stays ownerless and unbound until
+ * `workers` (default 1), `timeout`/`silence` when provided (T06), `model` and
+ * `directory` when provided, then the body (the shared context, empty when
+ * blank). No `channel` is written — a queue stays ownerless and unbound until
  * `/queue-here` writes both `channel` and `target` at bind time. Create-only:
  * refuses to overwrite an existing file, so an already-taken name is reported
  * as an error result (callers re-ask).
@@ -430,7 +534,7 @@ export async function writeQueueDefinition(
   input: QueueDefinitionInput,
   queuesRoot: string = QUEUES_DIR,
 ): Promise<WriteQueueDefinitionResult> {
-  const { name, workers = DEFAULT_WORKERS, model, directory, body = "" } = input;
+  const { name, workers = DEFAULT_WORKERS, model, directory, timeout, silence, body = "" } = input;
   if (!isValidQueueName(name)) {
     return { ok: false, reason: "invalid queue name" };
   }
@@ -445,6 +549,14 @@ export async function writeQueueDefinition(
   if (trimmedDirectory !== undefined && trimmedDirectory === "") {
     return { ok: false, reason: "directory must be a non-empty string when present" };
   }
+  const trimmedTimeout = timeout?.trim();
+  if (trimmedTimeout !== undefined && trimmedTimeout === "") {
+    return { ok: false, reason: "timeout must be a non-empty string when present" };
+  }
+  const trimmedSilence = silence?.trim();
+  if (trimmedSilence !== undefined && trimmedSilence === "") {
+    return { ok: false, reason: "silence must be a non-empty string when present" };
+  }
 
   const filePath = getQueueFilePath(name, queuesRoot);
   try {
@@ -456,9 +568,15 @@ export async function writeQueueDefinition(
     }
   }
 
+  // Key order is stable (workers, timeout, silence, model, directory) so
+  // snapshots and the parser stay predictable; present-but-blank values are
+  // rejected above, so each line is written only when a non-empty value was
+  // given ("empty → no line" convention, same as `model`/`directory`).
   const frontMatter = [
     "---",
     `workers: ${workers}`,
+    ...(trimmedTimeout !== undefined && trimmedTimeout !== "" ? [`timeout: ${trimmedTimeout}`] : []),
+    ...(trimmedSilence !== undefined && trimmedSilence !== "" ? [`silence: ${trimmedSilence}`] : []),
     ...(trimmedModel !== undefined && trimmedModel !== "" ? [`model: ${trimmedModel}`] : []),
     ...(trimmedDirectory !== undefined && trimmedDirectory !== ""
       ? [`directory: ${trimmedDirectory}`]
@@ -480,13 +598,23 @@ export async function writeQueueDefinition(
  * demand) with `state: pending` and `enqueuedAt` from the same clock as the
  * id's ms prefix, and returns the task id. The task is durable the moment
  * the file lands. Fails (throws) when the queue definition does not exist,
- * the queue name is invalid, or the prompt is empty.
+ * the queue name is invalid, or the prompt is empty. The optional overrides
+ * (`directory` / `model` / `timeout` / `silence`) land in the task front
+ * matter as the task-level run parameters (T03); each is written only when
+ * given (blank/undefined → no line) and — except for the non-empty `model` —
+ * pre-validated by the caller (the CLI checks `timeout`/`silence` with
+ * parseTimeout before calling; the storage layer writes them verbatim).
  */
 export async function insertQueueTask(
   name: string,
   prompt: string,
   queuesRoot: string = QUEUES_DIR,
-  options: { directory?: string } = {},
+  options: {
+    directory?: string;
+    model?: string;
+    timeout?: string;
+    silence?: string;
+  } = {},
 ): Promise<string> {
   if (!isValidQueueName(name)) {
     throw new Error(`invalid queue name "${name}"`);
@@ -501,17 +629,25 @@ export async function insertQueueTask(
 
   const { id, enqueuedAt } = generateTaskId();
   const filePath = path.join(getQueueTasksDir(name, queuesRoot), `${id}.md`);
-  // `directory:` is written only when given (blank/undefined → no line), the
-  // same omission convention as the definition's `model:`.
-  const directory = options.directory?.trim();
-  const content = `---\nstate: pending\nenqueuedAt: ${enqueuedAt}\n${directory !== undefined && directory !== "" ? `directory: ${directory}\n` : ""}---\n\n${promptText}\n`;
+  // Optional fields are written only when given (blank/undefined → no line),
+  // the same omission convention as the definition's `model:`; the order is
+  // stable (directory, model, timeout, silence) so snapshots stay predictable.
+  const optionalFields = Object.entries({
+    directory: options.directory?.trim(),
+    model: options.model?.trim(),
+    timeout: options.timeout?.trim(),
+    silence: options.silence?.trim(),
+  }).filter(([, value]) => value !== undefined && value !== "");
+  const content = `---\nstate: pending\nenqueuedAt: ${enqueuedAt}\n${optionalFields
+    .map(([key, value]) => `${key}: ${value}\n`)
+    .join("")}---\n\n${promptText}\n`;
   await mkdir(path.dirname(filePath), { recursive: true });
   await writeFileAtomic(filePath, content);
   return id;
 }
 
 /**
- * Lists a queue's tasks (pending and running) in FIFO order — the
+ * Lists a queue's tasks (pending, running and failed) in FIFO order — the
  * lexicographic file-name order of the `<enqueueMs>-<random4>` ids. Invalid
  * task files (bad state, missing/bad `enqueuedAt`, empty prompt, wrong file
  * name shape) are skipped with a log. A missing tasks directory is not an
@@ -566,16 +702,22 @@ export async function listQueueTasks(
   return tasks;
 }
 
+/** The live task states {@link setQueueTaskState} flips between. */
+type LiveTaskState = "pending" | "running";
+
 /**
  * Transitions a task's `state` (`pending` ↔ `running`): a surgical,
  * atomic front-matter edit that replaces the `state:` line in place and
  * preserves the body and every other line byte-for-byte. Throws when the
- * queue name, the task id, or the task file is missing.
+ * queue name, the task id, or the task file is missing. The `failed`
+ * terminal state is intentionally out of reach here: entering it goes
+ * through {@link failQueueTask} (which co-writes the dead-letter fields),
+ * leaving it through {@link retryQueueTask} (which clears them).
  */
 export async function setQueueTaskState(
   name: string,
   taskId: string,
-  state: "pending" | "running",
+  state: LiveTaskState,
   queuesRoot: string = QUEUES_DIR,
 ): Promise<void> {
   if (!isValidQueueName(name)) {
@@ -595,6 +737,131 @@ export async function setQueueTaskState(
     throw error;
   }
   await writeFileAtomic(filePath, applyFrontMatterField(content, "state", state));
+}
+
+/**
+ * Reads a task file for the dead-letter editors below. Throws the standard
+ * "not found" error when the file is missing; the callers validate the
+ * queue name / task id shapes first.
+ */
+async function readTaskFileForEdit(
+  name: string,
+  taskId: string,
+  queuesRoot: string,
+): Promise<{ filePath: string; content: string }> {
+  const filePath = path.join(getQueueTasksDir(name, queuesRoot), `${taskId}.md`);
+  let content: string;
+  try {
+    content = await readFile(filePath, "utf8");
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException)?.code === "ENOENT") {
+      throw new Error(`task "${taskId}" not found in queue "${name}"`);
+    }
+    throw error;
+  }
+  return { filePath, content };
+}
+
+/** Input of {@link failQueueTask}: the dead-letter trace fields (spec D2). */
+export interface FailQueueTaskInput {
+  /**
+   * Agent session id of the failed run; present only when the session was
+   * actually created (a fire failure before `session.new` succeeded has
+   * none).
+   */
+  agentSessionId?: string;
+  /** Human-readable failure reason recorded alongside the state. */
+  reason: string;
+}
+
+/**
+ * Dead-letters a task (spec D2/T02): flips `state:` to `failed` and writes
+ * `failedAt` (ISO timestamp of the failure) plus `reason` — and
+ * `agentSessionId` when the run had one — in ONE atomic write (the four
+ * front-matter edits are composed in memory first, then committed together,
+ * never one rename per field). The body and every other line are preserved
+ * byte-for-byte. The failed file stays on disk for tracing; re-queueing is
+ * the explicit {@link retryQueueTask}. Throws when the queue name, the task
+ * id, or the task file is missing.
+ */
+export async function failQueueTask(
+  name: string,
+  taskId: string,
+  input: FailQueueTaskInput,
+  queuesRoot: string = QUEUES_DIR,
+): Promise<void> {
+  if (!isValidQueueName(name)) {
+    throw new Error(`invalid queue name "${name}"`);
+  }
+  if (!isValidTaskId(taskId)) {
+    throw new Error(`invalid task id "${taskId}"`);
+  }
+  const { filePath, content } = await readTaskFileForEdit(name, taskId, queuesRoot);
+  let updated = applyFrontMatterField(content, "state", "failed");
+  updated = applyFrontMatterField(updated, "failedAt", new Date().toISOString());
+  updated = applyFrontMatterField(updated, "reason", input.reason);
+  if (input.agentSessionId !== undefined) {
+    updated = applyFrontMatterField(updated, "agentSessionId", input.agentSessionId);
+  }
+  await writeFileAtomic(filePath, updated);
+}
+
+/** Outcome of {@link retryQueueTask} (the `queue retry` CLI): */
+export type RetryQueueTaskResult = { ok: true } | { ok: false; reason: string };
+
+/** The dead-letter fields {@link retryQueueTask} clears (kept in one place). */
+const FAILED_FIELD_KEYS = new Set(["failedAt", "reason", "agentSessionId"]);
+
+/**
+ * Re-queues a dead-lettered task (the `queue retry` CLI, spec D2/T02): the
+ * task must exist AND be in the `failed` terminal state — anything else is
+ * an error result (retrying a pending/running task would double-run it).
+ * The edit is one atomic write: `state:` goes back to `pending` and the
+ * `failedAt` / `reason` / `agentSessionId` dead-letter lines are removed so
+ * the file is byte-identical to a freshly enqueued one (minus `enqueuedAt`,
+ * which keeps its original value). Consumption then happens naturally on the
+ * controller's next tick. Never throws for the expected failures: an invalid
+ * queue name, a missing task, or a non-`failed` state returns an error
+ * result.
+ */
+export async function retryQueueTask(
+  name: string,
+  taskId: string,
+  queuesRoot: string = QUEUES_DIR,
+): Promise<RetryQueueTaskResult> {
+  if (!isValidQueueName(name)) {
+    return { ok: false, reason: "invalid queue name" };
+  }
+  if (!isValidTaskId(taskId)) {
+    return { ok: false, reason: "invalid task id" };
+  }
+  let filePath: string;
+  let content: string;
+  try {
+    ({ filePath, content } = await readTaskFileForEdit(name, taskId, queuesRoot));
+  } catch (error) {
+    return { ok: false, reason: (error as Error).message };
+  }
+  const { task } = parseQueueTaskFile(`${taskId}.md`, content, filePath);
+  if (task === null) {
+    return { ok: false, reason: `task "${taskId}" failed validation` };
+  }
+  if (task.state !== "failed") {
+    return {
+      ok: false,
+      reason: `task "${taskId}" is not failed (state: ${task.state}) — only failed tasks can be retried`,
+    };
+  }
+  try {
+    const updated = removeFrontMatterFields(
+      applyFrontMatterField(content, "state", "pending"),
+      FAILED_FIELD_KEYS,
+    );
+    await writeFileAtomic(filePath, updated);
+  } catch (error) {
+    return { ok: false, reason: `failed to write task file: ${(error as Error).message}` };
+  }
+  return { ok: true };
 }
 
 /**
@@ -734,130 +1001,3 @@ function generateTaskId(): { id: string; enqueuedAt: string } {
   };
 }
 
-/**
- * Splits raw file content into front matter (lines between the two `---`
- * delimiters) and body (everything after the closing `---`, untrimmed). A
- * file that does not start with `---` has no front matter: the whole content
- * is the body. An unterminated `---` block consumes the rest of the file as
- * front matter, leaving an empty body. (Same subset parser as task-file.ts.)
- */
-function splitFrontMatter(content: string): { frontMatter: string; body: string } {
-  const lines = content.split(/\r?\n/);
-  if (lines[0]?.trim() !== "---") {
-    return { frontMatter: "", body: content };
-  }
-  for (let i = 1; i < lines.length; i++) {
-    if (lines[i].trim() === "---") {
-      return { frontMatter: lines.slice(1, i).join("\n"), body: lines.slice(i + 1).join("\n") };
-    }
-  }
-  return { frontMatter: lines.slice(1).join("\n"), body: "" };
-}
-
-/** Parses the front-matter block into raw `key -> value` fields. */
-function parseFrontMatter(raw: string): { fields: Record<string, string>; warnings: string[] } {
-  const fields: Record<string, string> = {};
-  const warnings: string[] = [];
-  for (const rawLine of raw.split(/\r?\n/)) {
-    const line = rawLine.trim();
-    if (line === "" || line.startsWith("#")) continue;
-    const colon = line.indexOf(":");
-    if (colon === -1) {
-      warnings.push(`ignoring malformed front matter line "${line}" — expected "key: value"`);
-      continue;
-    }
-    const key = line.slice(0, colon).trim();
-    const value = stripQuotes(line.slice(colon + 1).trim());
-    fields[key] = value;
-  }
-  return { fields, warnings };
-}
-
-/** Strips a matching pair of surrounding single or double quotes from a value. */
-function stripQuotes(value: string): string {
-  if (value.length >= 2) {
-    const first = value[0];
-    const last = value[value.length - 1];
-    if ((first === '"' && last === '"') || (first === "'" && last === "'")) {
-      return value.slice(1, -1);
-    }
-  }
-  return value;
-}
-
-/** Returns the trimmed value, or `undefined` when empty/whitespace-only. */
-function nonEmptyString(value: string | undefined): string | undefined {
-  const trimmed = value?.trim() ?? "";
-  return trimmed === "" ? undefined : trimmed;
-}
-
-/**
- * Returns `content` with the front-matter field `key` set to `value`,
- * applying the same surgical rules as `bindTask` in task-file.ts: an
- * existing `key:` line is replaced in place; a file with front matter but no
- * such line gets one inserted just before the closing `---`; a file without
- * front matter gets a minimal block prepended; an unterminated front matter
- * block gets the line appended to the end. The returned text differs from
- * the input only where the field lives; line endings are preserved.
- */
-function applyFrontMatterField(content: string, key: string, value: string): string {
-  const eol = content.includes("\r\n") ? "\r\n" : "\n";
-  const lines = content.split(eol);
-  const line = `${key}: ${value}`;
-
-  if (lines[0]?.trim() === "---") {
-    let closeIndex = -1;
-    for (let i = 1; i < lines.length; i++) {
-      if (lines[i].trim() === "---") {
-        closeIndex = i;
-        break;
-      }
-    }
-    if (closeIndex === -1) {
-      // Unterminated block: the parser treats the rest of the file as front
-      // matter, so appending the line keeps the file's semantics unchanged.
-      lines.push(line);
-      return lines.join(eol);
-    }
-
-    let replaced = false;
-    for (let i = 1; i < closeIndex; i++) {
-      const colon = lines[i].indexOf(":");
-      const fieldKey = colon === -1 ? lines[i].trim() : lines[i].slice(0, colon).trim();
-      if (fieldKey === key) {
-        lines[i] = line;
-        replaced = true;
-        break;
-      }
-    }
-    if (!replaced) {
-      lines.splice(closeIndex, 0, line);
-    }
-    return lines.join(eol);
-  }
-
-  // No front matter: prepend a minimal block containing only the field.
-  return `---${eol}${line}${eol}---${eol}${content}`;
-}
-
-/** Expands `~` / `~/...` against the bridge user's home directory. */
-function expandHome(input: string, homedir: string = os.homedir()): string {
-  if (input === "~") return homedir;
-  if (input.startsWith("~/")) return path.join(homedir, input.slice(2));
-  return input;
-}
-
-/** Same-directory temp file + rename commit, mirroring task-file.ts. */
-async function writeFileAtomic(filePath: string, content: string): Promise<void> {
-  const tempPath = path.join(
-    path.dirname(filePath),
-    `.${path.basename(filePath)}.${process.pid}.${randomUUID()}.tmp`,
-  );
-  try {
-    await writeFile(tempPath, content, "utf8");
-    await rename(tempPath, filePath);
-  } catch (error) {
-    await unlink(tempPath).catch(() => undefined);
-    throw error;
-  }
-}

@@ -1014,6 +1014,141 @@ describe("WeixinIMAdapter", () => {
     expect(fakeClientState.stopTyping).toHaveBeenCalledWith("wxid_user_1");
   });
 
+  it("binds this chat as a queue's target locally on /queue-here and stops typing", async () => {
+    const onQueueHere = vi.fn(async () => ({ ok: true }));
+    const adapter = new WeixinIMAdapter(
+      {
+        accountId: "bot-account",
+        token: "bot-token",
+      },
+      createLogger("test"),
+      undefined,
+      undefined,
+      undefined,
+      undefined,
+      onQueueHere,
+    );
+    const onOutput = vi.fn(async (_event: ClientOutputEvent) => {});
+
+    await adapter.start(onOutput);
+    await fakeClientState.onMessage?.({
+      chatId: "wxid_user_1",
+      chatType: "dm",
+      messageId: "msg-queue-here",
+      text: "/queue-here build",
+      mentionedBot: false,
+    });
+
+    expect(onQueueHere).toHaveBeenCalledWith("build", "weixin:dm:wxid_user_1");
+    expect(onOutput).not.toHaveBeenCalled();
+    expect(fakeClientState.sendText).toHaveBeenCalledWith(
+      "wxid_user_1",
+      expect.stringContaining('Queue "build"'),
+    );
+    expect(fakeClientState.sendText.mock.calls[0]?.[1]).toContain("is now bound to this chat");
+    expect(fakeClientState.stopTyping).toHaveBeenCalledWith("wxid_user_1");
+  });
+
+  it("replies with a localized error for an unknown /queue-here queue", async () => {
+    const onQueueHere = vi.fn(async () => ({ ok: false, reason: "queue not found" }));
+    const adapter = new WeixinIMAdapter(
+      {
+        accountId: "bot-account",
+        token: "bot-token",
+      },
+      createLogger("test"),
+      undefined,
+      undefined,
+      undefined,
+      undefined,
+      onQueueHere,
+    );
+    const onOutput = vi.fn(async (_event: ClientOutputEvent) => {});
+
+    await adapter.start(onOutput);
+    await fakeClientState.onMessage?.({
+      chatId: "wxid_user_1",
+      chatType: "dm",
+      messageId: "msg-queue-here-missing",
+      text: "/queue-here missing",
+      mentionedBot: false,
+    });
+
+    expect(onQueueHere).toHaveBeenCalledWith("missing", "weixin:dm:wxid_user_1");
+    expect(onOutput).not.toHaveBeenCalled();
+    expect(fakeClientState.sendText).toHaveBeenCalledWith(
+      "wxid_user_1",
+      expect.stringContaining('Queue "missing" was not found.'),
+    );
+    expect(fakeClientState.stopTyping).toHaveBeenCalledWith("wxid_user_1");
+  });
+
+  it("shows a localized usage reply for a malformed /queue-here without calling onQueueHere", async () => {
+    const onQueueHere = vi.fn(async () => ({ ok: true }));
+    const adapter = new WeixinIMAdapter(
+      {
+        accountId: "bot-account",
+        token: "bot-token",
+      },
+      createLogger("test"),
+      { channelName: "demo-channel", language: "zh-CN" },
+      undefined,
+      undefined,
+      undefined,
+      onQueueHere,
+    );
+    const onOutput = vi.fn(async (_event: ClientOutputEvent) => {});
+
+    await adapter.start(onOutput);
+    await fakeClientState.onMessage?.({
+      chatId: "wxid_user_1",
+      chatType: "dm",
+      messageId: "msg-queue-here-bad",
+      text: "/queue-here",
+      mentionedBot: false,
+    });
+
+    expect(onQueueHere).not.toHaveBeenCalled();
+    expect(onOutput).not.toHaveBeenCalled();
+    expect(fakeClientState.sendText).toHaveBeenCalledWith(
+      "wxid_user_1",
+      expect.stringContaining("用法：`/queue-here <队列名>`"),
+    );
+    expect(fakeClientState.stopTyping).toHaveBeenCalledWith("wxid_user_1");
+  });
+
+  it("degrades gracefully when onQueueHere is absent: logs and replies nothing", async () => {
+    const warnSpy = vi.spyOn(console, "warn").mockImplementation(() => {});
+    try {
+      const adapter = new WeixinIMAdapter(
+        {
+          accountId: "bot-account",
+          token: "bot-token",
+        },
+        createLogger("test"),
+      );
+      const onOutput = vi.fn(async (_event: ClientOutputEvent) => {});
+
+      await adapter.start(onOutput);
+      await fakeClientState.onMessage?.({
+        chatId: "wxid_user_1",
+        chatType: "dm",
+        messageId: "msg-queue-here-no-bridge",
+        text: "/queue-here build",
+        mentionedBot: false,
+      });
+
+      expect(onOutput).not.toHaveBeenCalled();
+      expect(fakeClientState.sendText).not.toHaveBeenCalled();
+      expect(fakeClientState.stopTyping).toHaveBeenCalledWith("wxid_user_1");
+      expect(warnSpy.mock.calls.some((call) =>
+        call.some((arg) => typeof arg === "string" && arg.includes("onQueueHere is not injected")),
+      )).toBe(true);
+    } finally {
+      warnSpy.mockRestore();
+    }
+  });
+
   it("does not let typing refresh failures block or crash inbound message handling", async () => {
     const adapter = new WeixinIMAdapter(
       {

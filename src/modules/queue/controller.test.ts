@@ -8,8 +8,10 @@ import type { Logger } from "../../core/logger";
 import {
   bindQueue,
   deleteQueueTask,
+  failQueueTask,
   insertQueueTask,
   listQueueTasks,
+  retryQueueTask,
   setQueueEnabled,
   setQueueTaskState,
 } from "./queue-file";
@@ -261,6 +263,53 @@ describe("fire (D2)", () => {
       text: buildTaskPrompt("", "task a"),
     });
   });
+
+  it("carries the task-level model override into session.new when only the task pins one (T03)", async () => {
+    const h = await createHarness();
+    const id = await seedQueue(h.root, "q", { target: TARGET }, ["task a"]);
+    // Rewrite the task file with a task-level model line (what
+    // `queue insert --model` produces).
+    const taskPath = path.join(h.root, "q.tasks", `${id}.md`);
+    await writeFile(
+      taskPath,
+      (await readFile(taskPath, "utf8")).replace(
+        "---\n",
+        "---\nmodel: azure-openai-responses/gpt-5.6-terra\n",
+      ),
+      "utf8",
+    );
+    await h.controller.start();
+    await waitFor(() => expect(h.dispatched).toHaveLength(2));
+
+    expect(h.dispatched[0]).toMatchObject({
+      type: "command.session.new",
+      clientSessionId: `queue:q:${id}`,
+      model: "azure-openai-responses/gpt-5.6-terra",
+    });
+  });
+
+  it("task-level model beats the queue definition's model when both are pinned (T03)", async () => {
+    const h = await createHarness();
+    const id = await seedQueue(
+      h.root,
+      "q",
+      { target: TARGET, model: "queue-model" },
+      ["task a"],
+    );
+    const taskPath = path.join(h.root, "q.tasks", `${id}.md`);
+    await writeFile(
+      taskPath,
+      (await readFile(taskPath, "utf8")).replace("---\n", "---\nmodel: task-model\n"),
+      "utf8",
+    );
+    await h.controller.start();
+    await waitFor(() => expect(h.dispatched).toHaveLength(2));
+
+    expect(h.dispatched[0]).toMatchObject({
+      type: "command.session.new",
+      model: "task-model",
+    });
+  });
 });
 
 describe("working directory (task > queue > bridge cwd)", () => {
@@ -320,7 +369,8 @@ describe("working directory (task > queue > bridge cwd)", () => {
     await h.controller.start();
     await waitFor(() => expect(h.delivered).toHaveLength(1));
 
-    // Nothing was dispatched, the task file is gone (fail-and-drop), and the
+    // Nothing was dispatched, the task file is gone (pre-session
+    // configuration error — the one remaining fail-and-drop path), and the
     // target got the fire error with the validation detail.
     expect(h.dispatched).toHaveLength(0);
     expect(h.delivered[0]).toMatchObject({ type: "assistant.message", clientSessionId: TARGET });
@@ -477,8 +527,8 @@ describe("completion (D2)", () => {
   });
 });
 
-describe("fail-and-drop (D2, decided)", () => {
-  it("fails the task when session.new dispatch reports { ok: false }: no user.message, notice + file deleted", async () => {
+describe("runtime failure dead-letter (spec D2/T02)", () => {
+  it("dead-letters the task when session.new dispatch reports { ok: false }: no user.message, notice + state failed, no agentSessionId", async () => {
     const h = await createHarness();
     const [id] = await seedQueue(h.root, "q", { target: TARGET }, ["a"]);
     h.dispatchClientEvent.mockImplementation(async (event: ClientOutputEvent) => {
@@ -494,41 +544,64 @@ describe("fail-and-drop (D2, decided)", () => {
     // Only session.new was dispatched — there is no path to auto-create a
     // model-less session.
     expect(h.dispatched).toHaveLength(1);
+    // No agent session was created: the notice carries no session-id line.
     expect(h.delivered[0]).toEqual({
       type: "assistant.message",
       clientSessionId: TARGET,
       text: `boom: model not available\n\n${failedSuffix(h, "q", `queue:q:${id}`)}`,
     });
-    await waitFor(async () => expect(await listQueueTasks("q", h.root)).toHaveLength(0));
+    // The task file is KEPT and dead-lettered (spec D2/T02): state failed,
+    // the failure reason and an ISO failedAt — but no agentSessionId.
+    await waitFor(async () => expect(await listQueueTasks("q", h.root)).toHaveLength(1));
+    const [task] = await listQueueTasks("q", h.root);
+    expect(task).toMatchObject({ id, state: "failed", reason: "boom: model not available" });
+    expect(task!.failedAt).toBeDefined();
+    expect(Number.isNaN(Date.parse(task!.failedAt!))).toBe(false);
+    expect(task!.agentSessionId).toBeUndefined();
+    const content = await readFile(path.join(h.root, "q.tasks", `${id}.md`), "utf8");
+    expect(content).toContain("state: failed");
+    expect(content).toContain("reason: boom: model not available");
+    expect(content).not.toContain("agentSessionId:");
 
     // The run has ended: a late completion is an orphan.
     h.controller.handleOutput({ type: "assistant.message", clientSessionId: `queue:q:${id}`, text: "late" });
     expect(h.delivered).toHaveLength(1);
   });
 
-  it("fails the task when user.message dispatch reports { ok: false } with the same handling", async () => {
+  it("dead-letters the task when user.message dispatch reports { ok: false }, notice + file carrying the agent session id", async () => {
     const h = await createHarness();
     const [id] = await seedQueue(h.root, "q", { target: TARGET }, ["a"]);
+    // session.new succeeds (an agent session exists), user.message fails.
     h.dispatchClientEvent.mockImplementation(async (event: ClientOutputEvent) => {
       h.dispatched.push(event);
       if (event.type === "user.message") {
         return { ok: false, reason: "boom: prompt rejected" } as const;
       }
-      return { ok: true } as const;
+      return { ok: true, agentSessionId: "pi-coding-agent:7777-8888" } as const;
     });
     await h.controller.start();
 
     await waitFor(() => expect(h.delivered).toHaveLength(1));
     expect(h.dispatched).toHaveLength(2);
+    // The notice includes the agent session id (spec D2: the trace points at
+    // the session that actually exists on the agent side).
     expect(h.delivered[0]).toEqual({
       type: "assistant.message",
       clientSessionId: TARGET,
-      text: `boom: prompt rejected\n\n${failedSuffix(h, "q", `queue:q:${id}`)}`,
+      text: `boom: prompt rejected\nAgent session: pi-coding-agent:7777-8888\n\n${failedSuffix(h, "q", `queue:q:${id}`)}`,
     });
-    await waitFor(async () => expect(await listQueueTasks("q", h.root)).toHaveLength(0));
+    await waitFor(async () => expect(await listQueueTasks("q", h.root)).toHaveLength(1));
+    const [task] = await listQueueTasks("q", h.root);
+    expect(task).toMatchObject({
+      id,
+      state: "failed",
+      reason: "boom: prompt rejected",
+      agentSessionId: "pi-coding-agent:7777-8888",
+    });
+    expect(task!.failedAt).toBeDefined();
   });
 
-  it("delivers a failure notice on a terminal error event and drops the task", async () => {
+  it("dead-letters the task on a terminal error event: notice + kept failed file", async () => {
     const h = await createHarness();
     const [id] = await seedQueue(h.root, "q", { target: TARGET }, ["a"]);
     await h.controller.start();
@@ -546,29 +619,51 @@ describe("fail-and-drop (D2, decided)", () => {
       clientSessionId: TARGET,
       text: `boom\n\n${failedSuffix(h, "q", `queue:q:${id}`)}`,
     });
-    await waitFor(async () => expect(await listQueueTasks("q", h.root)).toHaveLength(0));
     // The partial transcript is NOT inlined.
     expect(h.delivered[0]!.text).not.toContain("partial work");
+    // The task file is kept, dead-lettered.
+    await waitFor(async () => expect(await listQueueTasks("q", h.root)).toHaveLength(1));
+    expect((await listQueueTasks("q", h.root))[0]).toMatchObject({
+      id,
+      state: "failed",
+      reason: "boom",
+    });
 
     // The run has ended: a second error is an orphan.
     h.controller.handleOutput({ type: "error", clientSessionId: `queue:q:${id}`, kind: "agent.run.failed" });
     expect(h.delivered).toHaveLength(1);
   });
 
-  it("times out a long-running task: release dispatch, failure notice, task dropped", async () => {
+  it("dead-letters a timed-out task (with its agent session id): release dispatch, notice, file kept", async () => {
     const h = await createHarness({ runTimeoutMs: 50 });
     const [id] = await seedQueue(h.root, "q", { target: TARGET }, ["a"]);
+    h.dispatchClientEvent.mockImplementation(async (event: ClientOutputEvent) => {
+      h.dispatched.push(event);
+      if (event.type === "command.session.new") {
+        return { ok: true, agentSessionId: "pi-coding-agent:9999-0000" } as const;
+      }
+      return { ok: true } as const;
+    });
     await h.controller.start();
     await waitFor(() => expect(h.dispatched).toHaveLength(2));
 
     await waitFor(() => expect(h.delivered).toHaveLength(1));
     expect(h.dispatched[2]).toEqual({ type: "command.session.release", clientSessionId: `queue:q:${id}` });
+    // The timeout notice carries the wall-clock reason, the agent session id
+    // and the kept-transcript one-liner — exactly ONE delivery.
     expect(h.delivered[0]).toEqual({
       type: "assistant.message",
       clientSessionId: TARGET,
-      text: timedOutSuffix(h, "q", `queue:q:${id}`),
+      text: `timed out after 50ms\nAgent session: pi-coding-agent:9999-0000\n\n${failedSuffix(h, "q", `queue:q:${id}`)}`,
     });
-    await waitFor(async () => expect(await listQueueTasks("q", h.root)).toHaveLength(0));
+    // The task file is kept, dead-lettered with the trace fields.
+    await waitFor(async () => expect(await listQueueTasks("q", h.root)).toHaveLength(1));
+    expect((await listQueueTasks("q", h.root))[0]).toMatchObject({
+      id,
+      state: "failed",
+      reason: "timed out after 50ms",
+      agentSessionId: "pi-coding-agent:9999-0000",
+    });
   });
 });
 
@@ -633,6 +728,66 @@ describe("unbound and foreign queues (D2)", () => {
     // Not consumed, and not reset to pending either: foreign queues are out
     // of scope for this controller (including the at-least-once restart).
     expect(tasks[0]!.state).toBe("running");
+  });
+
+  it("never consumes a failed (dead-lettered) task; it stays until retried (spec D2/T02)", async () => {
+    const h = await createHarness();
+    const [id] = await seedQueue(h.root, "q", { target: TARGET }, ["a"]);
+    await failQueueTask("q", id, { reason: "first run died" }, h.root);
+    await h.controller.start();
+
+    // Several ticks pass: the failed file is never picked up (no dispatch,
+    // no delivery, state unchanged).
+    await sleep(80);
+    expect(h.dispatched).toEqual([]);
+    expect(h.delivered).toEqual([]);
+    const tasks = await listQueueTasks("q", h.root);
+    expect(tasks).toHaveLength(1);
+    expect(tasks[0]).toMatchObject({ id, state: "failed", reason: "first run died" });
+  });
+
+  it("restart reset re-enqueues running but leaves failed tasks untouched (spec D2/T02)", async () => {
+    const h = await createHarness();
+    const [failedId, runningId] = await seedQueue(h.root, "q", { target: TARGET }, ["a", "b"]);
+    await failQueueTask("q", failedId, { reason: "dead" }, h.root);
+    await setQueueTaskState("q", runningId, "running", h.root);
+    await h.controller.start();
+
+    // The running task is reset to pending and fired; the failed one is not
+    // touched (neither consumed nor reset) and its trace fields survive.
+    await waitFor(() => expect(h.dispatched).toHaveLength(2));
+    const tasks = await listQueueTasks("q", h.root);
+    expect(tasks.find((t) => t.id === failedId)).toMatchObject({
+      state: "failed",
+      reason: "dead",
+    });
+    expect(tasks.find((t) => t.id === runningId)!.state).toBe("running");
+  });
+
+  it("a retried task is consumed again by the next tick and a non-failed task is rejected by retryQueueTask", async () => {
+    const h = await createHarness();
+    const [id] = await seedQueue(h.root, "q", { target: TARGET }, ["a"]);
+    h.dispatchClientEvent.mockImplementationOnce(async (event: ClientOutputEvent) => {
+      h.dispatched.push(event);
+      if (event.type === "command.session.new") {
+        return { ok: false, reason: "boom: model not available" } as const;
+      }
+      return { ok: true } as const;
+    });
+    await h.controller.start();
+    await waitFor(async () => expect((await listQueueTasks("q", h.root))[0]?.state).toBe("failed"));
+
+    // retry flips it back to pending; the next tick consumes it again.
+    expect(await retryQueueTask("q", id, h.root)).toEqual({ ok: true });
+    await waitFor(() => expect(h.dispatched).toHaveLength(1));
+
+    // Retrying a task that is not failed is an error result (the just-fired
+    // task is running now).
+    await waitFor(async () => expect((await listQueueTasks("q", h.root))[0]?.state).toBe("running"));
+    await expect(retryQueueTask("q", id, h.root)).resolves.toMatchObject({
+      ok: false,
+      reason: `task "${id}" is not failed (state: running) — only failed tasks can be retried`,
+    });
   });
 
   it("skips channel-less queues: owned by no controller, never consumed (T1)", async () => {
@@ -926,7 +1081,8 @@ describe("stale-fire guard (stop → start fast re-run of the same taskId)", () 
     expect(await history(h)).toEqual([]);
     // ...nothing delivered to the target chat...
     expect(h.delivered).toEqual([]);
-    // ...and the task file was NOT deleted by the stale fire's fail-and-drop.
+    // ...and the stale fire's failure path did not touch the file (dead-letter
+    // or delete).
     const tasks = await listQueueTasks("q", h.root);
     expect(tasks).toHaveLength(1);
 
@@ -1162,7 +1318,9 @@ describe("failure/timeout ordering (T2: reason only, no inlined transcript)", ()
     });
     // The partial transcript is NOT inlined.
     expect(h.delivered[0]!.text).not.toContain("partial work");
-    await waitFor(async () => expect(await listQueueTasks("q", h.root)).toHaveLength(0));
+    // Dead-lettered, not deleted (spec D2/T02).
+    await waitFor(async () => expect(await listQueueTasks("q", h.root)).toHaveLength(1));
+    expect((await listQueueTasks("q", h.root))[0]).toMatchObject({ state: "failed", reason: "boom" });
   });
 
   it("times out with accumulated partial content delivered alongside the timeout notice", async () => {
@@ -1180,11 +1338,16 @@ describe("failure/timeout ordering (T2: reason only, no inlined transcript)", ()
     expect(h.delivered[0]).toEqual({
       type: "assistant.message",
       clientSessionId: TARGET,
-      text: timedOutSuffix(h, "q", `queue:q:${ids[0]}`),
+      text: `timed out after 80ms\n\n${failedSuffix(h, "q", `queue:q:${ids[0]}`)}`,
     });
     // The partial transcript is NOT inlined.
     expect(h.delivered[0]!.text).not.toContain("partial work");
-    await waitFor(async () => expect(await listQueueTasks("q", h.root)).toHaveLength(0));
+    // Dead-lettered, not deleted (spec D2/T02).
+    await waitFor(async () => expect(await listQueueTasks("q", h.root)).toHaveLength(1));
+    expect((await listQueueTasks("q", h.root))[0]).toMatchObject({
+      state: "failed",
+      reason: "timed out after 80ms",
+    });
   });
 });
 
@@ -1202,6 +1365,53 @@ describe("silence probe (T4, layer 2)", () => {
 
     // After ~1 s of silence the probe dispatches a probing user.message
     // (silentMinutes=1 for a sub-minute window).
+    await waitFor(() =>
+      expect(
+        h.dispatched.some((e) => e.type === "user.message" && e.text === buildProbeMessage(1)),
+      ).toBe(true),
+    );
+  });
+
+  it("opens the probe window from a task-level silence when only the task pins one (T03)", async () => {
+    // No definition `silence:` (the 30m default would never fire inside the
+    // test window); the task pins 1s.
+    const h = await createHarness();
+    const id = await seedQueue(h.root, "q", { workers: 1, target: TARGET }, ["a"]);
+    const taskPath = path.join(h.root, "q.tasks", `${id}.md`);
+    await writeFile(
+      taskPath,
+      (await readFile(taskPath, "utf8")).replace("---\n", "---\nsilence: 1s\n"),
+      "utf8",
+    );
+    await h.controller.start();
+    await waitFor(() => expect(h.dispatched).toHaveLength(2));
+
+    await waitFor(() =>
+      expect(
+        h.dispatched.some((e) => e.type === "user.message" && e.text === buildProbeMessage(1)),
+      ).toBe(true),
+    );
+  });
+
+  it("task-level silence beats the queue definition's silence when both are set (T03)", async () => {
+    // The definition's 30m default window would never fire inside the test
+    // window; the task's 1s must win.
+    const h = await createHarness();
+    const id = await seedQueue(
+      h.root,
+      "q",
+      { workers: 1, target: TARGET, silence: "10m" },
+      ["a"],
+    );
+    const taskPath = path.join(h.root, "q.tasks", `${id}.md`);
+    await writeFile(
+      taskPath,
+      (await readFile(taskPath, "utf8")).replace("---\n", "---\nsilence: 1s\n"),
+      "utf8",
+    );
+    await h.controller.start();
+    await waitFor(() => expect(h.dispatched).toHaveLength(2));
+
     await waitFor(() =>
       expect(
         h.dispatched.some((e) => e.type === "user.message" && e.text === buildProbeMessage(1)),
@@ -1263,7 +1473,13 @@ describe("per-queue timeout (definition `timeout:` front matter)", () => {
       type: "command.session.release",
       clientSessionId: `queue:q:${id}`,
     });
-    await waitFor(async () => expect(await listQueueTasks("q", h.root)).toHaveLength(0));
+    // The timed-out task is dead-lettered (kept), not deleted (spec D2/T02).
+    await waitFor(async () => expect(await listQueueTasks("q", h.root)).toHaveLength(1));
+    expect((await listQueueTasks("q", h.root))[0]).toMatchObject({
+      id,
+      state: "failed",
+      reason: "timed out after 1000ms",
+    });
     // The history reason carries the queue's timeout, not the fallback.
     await waitFor(async () => expect(await history(h)).toHaveLength(1));
     expect((await history(h))[0]).toMatchObject({
@@ -1286,6 +1502,55 @@ describe("per-queue timeout (definition `timeout:` front matter)", () => {
       runId: `queue:q:${id}`,
       outcome: "timeout",
       reason: "timed out after 50ms",
+    });
+  });
+
+  it("uses the task-level timeout when only the task pins one, overriding the controller fallback (T03)", async () => {
+    // Controller fallback is 5 s (harness default); the task pins 1s.
+    const h = await createHarness();
+    const [id] = await seedQueue(h.root, "q", { target: TARGET }, ["a"]);
+    const taskPath = path.join(h.root, "q.tasks", `${id}.md`);
+    await writeFile(
+      taskPath,
+      (await readFile(taskPath, "utf8")).replace("---\n", "---\ntimeout: 1s\n"),
+      "utf8",
+    );
+    await h.controller.start();
+    await waitFor(() => expect(h.dispatched).toHaveLength(2));
+
+    await waitFor(async () => expect(await history(h)).toHaveLength(1));
+    expect((await history(h))[0]).toMatchObject({
+      runId: `queue:q:${id}`,
+      outcome: "timeout",
+      reason: "timed out after 1000ms",
+    });
+    // The dead-letter write lands after the history line in the timeout chain,
+    // so this check polls instead of racing the chain (pre-existing flake).
+    await waitFor(async () =>
+      expect((await listQueueTasks("q", h.root))[0]).toMatchObject({
+        state: "failed",
+        reason: "timed out after 1000ms",
+      }),
+    );
+  });
+
+  it("task-level timeout beats the queue definition's timeout when both are set (T03)", async () => {
+    // Queue pins 60 s, task pins 1s — the task's value must win.
+    const h = await createHarness();
+    const [id] = await seedQueue(h.root, "q", { target: TARGET, timeout: "60s" }, ["a"]);
+    const taskPath = path.join(h.root, "q.tasks", `${id}.md`);
+    await writeFile(
+      taskPath,
+      (await readFile(taskPath, "utf8")).replace("---\n", "---\ntimeout: 1s\n"),
+      "utf8",
+    );
+    await h.controller.start();
+    await waitFor(() => expect(h.dispatched).toHaveLength(2));
+
+    await waitFor(async () => expect(await history(h)).toHaveLength(1));
+    expect((await history(h))[0]).toMatchObject({
+      outcome: "timeout",
+      reason: "timed out after 1000ms",
     });
   });
 
@@ -1312,16 +1577,24 @@ describe("per-queue timeout (definition `timeout:` front matter)", () => {
     );
 
     // Second task fires under the reloaded definition and times out at 1 s.
-    // The id is taken from the dispatched session.new (race-free: listing
-    // task files could miss a task whose timeout already fired and file was
-    // deleted).
+    // The id is taken from the dispatched session.new (race-free: the task
+    // file only flips to `failed` — it stays listed).
     await waitFor(() =>
       expect(h.dispatched.filter((e) => e.type === "command.session.new")).toHaveLength(2),
     );
     const secondFire = h.dispatched.filter((e) => e.type === "command.session.new")[1]!;
     const secondId = secondFire.clientSessionId.slice("queue:q:".length);
     await waitFor(() => expect(h.delivered).toHaveLength(2));
-    await waitFor(async () => expect(await listQueueTasks("q", h.root)).toHaveLength(0));
+    // The timed-out task is dead-lettered (kept), not deleted (spec D2/T02):
+    // the first (completed) task's file is gone, the failed one stays listed.
+    await waitFor(async () =>
+      expect((await listQueueTasks("q", h.root)).find((t) => t.id === secondId)).toMatchObject({
+        id: secondId,
+        state: "failed",
+        reason: "timed out after 1000ms",
+      }),
+    );
+    expect(await listQueueTasks("q", h.root)).toHaveLength(1);
     await waitFor(async () => expect(await history(h)).toHaveLength(2));
     expect((await history(h))[1]).toMatchObject({
       runId: `queue:q:${secondId}`,
@@ -1560,10 +1833,10 @@ describe("stop() mid-run (T4)", () => {
 });
 
 describe("timeout cleanup chain hardening (timeout teardown spec D3)", () => {
-  it("deletes the task file and delivers the notice while the release dispatch hangs forever", async () => {
+  it("dead-letters the task file and delivers the notice while the release dispatch hangs forever", async () => {
     // The incident shape: a dispatch that never settles must not hold the
-    // rest of the timeout chain hostage. Local cleanup (history line, task
-    // file) and the notice must all complete.
+    // rest of the timeout chain hostage. Local cleanup (history line,
+    // dead-letter write) and the notice must all complete.
     const releaseBlocked = new Promise<IngressResult>(() => {}); // never settles
     const h = await createHarness({ runTimeoutMs: 80 });
     h.dispatchClientEvent.mockImplementation(async (event: ClientOutputEvent) => {
@@ -1578,14 +1851,20 @@ describe("timeout cleanup chain hardening (timeout teardown spec D3)", () => {
     await waitFor(() => expect(h.dispatched).toHaveLength(2));
 
     // The timed-out chain finished WITHOUT the hung release being awaited:
-    // the task file is deleted, history written, notice delivered, no error
-    // logged (a floating rejection would surface as logger.error).
-    await waitFor(async () => expect(await listQueueTasks("q", h.root)).toHaveLength(0));
+    // history written, the task file dead-lettered, notice delivered, no
+    // error logged (a floating rejection would surface as logger.error).
+    await waitFor(async () =>
+      expect((await listQueueTasks("q", h.root))[0]).toMatchObject({
+        id,
+        state: "failed",
+        reason: "timed out after 80ms",
+      }),
+    );
     await waitFor(() => expect(h.delivered).toHaveLength(1));
     expect(h.delivered[0]).toEqual({
       type: "assistant.message",
       clientSessionId: TARGET,
-      text: timedOutSuffix(h, "q", `queue:q:${id}`),
+      text: `timed out after 80ms\n\n${failedSuffix(h, "q", `queue:q:${id}`)}`,
     });
     expect(h.dispatched.filter((e) => e.type === "command.session.release")).toHaveLength(1);
     expect(await history(h)).toEqual([
@@ -1595,14 +1874,14 @@ describe("timeout cleanup chain hardening (timeout teardown spec D3)", () => {
   });
 
   it("keeps the timeout chain alive when the local cleanup throws", async () => {
-    // History append succeeds but the task-file delete fails (#deleteTask
+    // History append succeeds but the dead-letter write fails (#failRun
     // catches its own fs error and logs it): the chain must proceed to the
     // notice + fire-and-forget release, and the failure must stay a logged
-    // one-liner — never an unhandled rejection. The surviving file becomes a
-    // zombie that the D4 reconciliation heals on a later tick.
+    // one-liner — never an unhandled rejection. The surviving `running` file
+    // becomes a zombie that the D4 reconciliation heals on a later tick.
     const h = await createHarness({ runTimeoutMs: 80 });
-    const deleteSpy = vi
-      .spyOn(queueFileModule, "deleteQueueTask")
+    const failSpy = vi
+      .spyOn(queueFileModule, "failQueueTask")
       .mockRejectedValue(new Error("disk exploded"));
     try {
       const [id] = await seedQueue(h.root, "q", { target: TARGET }, ["a"]);
@@ -1613,45 +1892,47 @@ describe("timeout cleanup chain hardening (timeout teardown spec D3)", () => {
       expect(h.delivered[0]).toEqual({
         type: "assistant.message",
         clientSessionId: TARGET,
-        text: timedOutSuffix(h, "q", `queue:q:${id}`),
+        text: `timed out after 80ms\n\n${failedSuffix(h, "q", `queue:q:${id}`)}`,
       });
       expect(h.dispatched.filter((e) => e.type === "command.session.release")).toHaveLength(1);
       expect(await history(h)).toEqual([
         expect.objectContaining({ runId: `queue:q:${id}`, outcome: "timeout" }),
       ]);
       expect(h.logger.error).toHaveBeenCalledWith(
-        `[queue] failed to delete task "${id}" of queue "q":`,
+        `[queue] failed to dead-letter task "${id}" of queue "q":`,
         expect.any(Error),
       );
     } finally {
-      deleteSpy.mockRestore();
+      failSpy.mockRestore();
     }
   });
 });
 
 describe("zombie reconciliation (timeout teardown spec D4)", () => {
-  it("heals a task file stranded running by a failed cleanup delete once the tombstone ages out", async () => {
-    // The incident shape, self-healed: the timeout chain wrote history and
-    // delivered the notice, but its task-file DELETE failed (#deleteTask
-    // catches internally — mocked here as "disk exploded"). The file stays
-    // `running` with no live run; within the grace window the reconciliation
-    // spares it (fresh tombstone), and once the tombstone ages past 2×tickMs
-    // a tick deletes it with a warn — no bridge restart needed.
+  it("keeps a task file whose dead-letter write failed by the timeout chain, instead of zombie-deleting it", async () => {
+    // The incident shape, reinterpreted under the dead-letter semantics
+    // (spec D2/T02): the timeout chain wrote history and delivered the
+    // notice, but its failQueueTask write failed (mocked here as "disk
+    // exploded"). The file stays `running` with no live run — but unlike the
+    // old delete-based heal, the reconciliation now SPARES it: deleting a
+    // file that belongs to a dead-letter chain would destroy exactly the
+    // trace the terminal state exists to keep. It is left for the next
+    // start's at-least-once reset (or manual/AI cleanup) instead.
     const h = await createHarness({ runTimeoutMs: 80 });
-    const deleteSpy = vi
-      .spyOn(queueFileModule, "deleteQueueTask")
+    const failSpy = vi
+      .spyOn(queueFileModule, "failQueueTask")
       .mockRejectedValue(new Error("disk exploded"));
     const [id] = await seedQueue(h.root, "q", { target: TARGET }, ["a"]);
     await h.controller.start();
     await waitFor(() => expect(h.dispatched).toHaveLength(2));
     await waitFor(() => expect(h.delivered).toHaveLength(1)); // chain completed
-    deleteSpy.mockRestore(); // disk recovers for everyone else
+    failSpy.mockRestore(); // disk recovers for everyone else
 
-    // Fresh tombstone: still spared. Past 2×tickMs: healed.
+    // Past the grace window: still NOT zombie-deleted.
     await sleep(60);
-    await waitFor(async () => expect(await listQueueTasks("q", h.root)).toHaveLength(0));
-    expect(h.logger.warn).toHaveBeenCalledWith(
-      `[queue] deleted zombie running task "${id}" of queue "q" (no active run for it)`,
+    await waitFor(async () => expect(await listQueueTasks("q", h.root)).toHaveLength(1));
+    expect(h.logger.warn).not.toHaveBeenCalledWith(
+      expect.stringContaining(`deleted zombie running task "${id}"`),
     );
   });
 
@@ -1699,10 +1980,14 @@ describe("zombie reconciliation (timeout teardown spec D4)", () => {
     );
   });
 
-  it("deletes a zombie whose cleanup chain died and the tombstone has aged past the grace window", async () => {
+  it("spares a DONE chain's file whose cleanup died mid-delivery, even past the grace window", async () => {
     // Same suspended-chain setup, but the chain NEVER resumes: registry
-    // cleared, stale tombstone, leftover `running` file — exactly the incident
-    // shape. Within ~2×tickMs a tick reconciles it away without a restart.
+    // cleared, stale tombstone, leftover `running` file. Under the
+    // dead-letter semantics (spec D2/T02) the reconciliation only ever
+    // DELETES files from chains that are KNOWN to intend deletion — i.e.
+    // after failQueueTask already succeeded (or the file is already
+    // `failed`). A `running` file is never removed by the heal: it is
+    // left for the next start's at-least-once reset.
     const h = await createHarness({ tickMs: 150, runTimeoutMs: 60_000 });
     const [id] = await seedQueue(h.root, "q", { target: TARGET }, ["a"]);
     const deliverStarted = new Promise<void>((resolve) => {
@@ -1721,12 +2006,13 @@ describe("zombie reconciliation (timeout teardown spec D4)", () => {
     });
     await deliverStarted;
 
-    // Grace = 2×150ms: the first tick spares the file, a later one heals it.
+    // Grace = 2×150ms: the first tick spares the file (fresh tombstone), and
+    // past the window it is STILL spared — a `running` file is never deleted
+    // by the heal (the file may hold a run whose delivery was interrupted).
     await sleep(160);
-    expect((await listQueueTasks("q", h.root)).map((t) => t.id)).toEqual([id]);
-    await waitFor(async () => expect(await listQueueTasks("q", h.root)).toHaveLength(0));
-    expect(h.logger.warn).toHaveBeenCalledWith(
-      `[queue] deleted zombie running task "${id}" of queue "q" (no active run for it)`,
+    await waitFor(async () => expect(await listQueueTasks("q", h.root)).toHaveLength(1));
+    expect(h.logger.warn).not.toHaveBeenCalledWith(
+      expect.stringContaining(`deleted zombie running task "${id}"`),
     );
   });
 
@@ -1769,5 +2055,62 @@ describe("zombie reconciliation (timeout teardown spec D4)", () => {
     expect(h.logger.warn).not.toHaveBeenCalledWith(
       expect.stringContaining("deleted zombie running task"),
     );
+  });
+});
+
+describe("claimTarget (/queue-here adapter-local binding, T05)", () => {
+  it("binds a channel-less queue by writing BOTH channel and target in one atomic write", async () => {
+    const h = await createHarness();
+    // `queue add` writes no `channel` (T1): the file only carries workers etc.
+    await seedQueue(h.root, "q", { channel: undefined }, []);
+    await h.controller.start();
+
+    await expect(h.controller.claimTarget("q", "feishu:dm:oc_newchat")).resolves.toEqual({ ok: true });
+
+    const content = await readFile(path.join(h.root, "q.md"), "utf8");
+    expect(content).toContain("channel: test");
+    expect(content).toContain("target: feishu:dm:oc_newchat");
+    // Nothing was dispatched or delivered: a bind is a pure file write the
+    // controller picks up on its next tick.
+    expect(h.dispatched).toEqual([]);
+    expect(h.delivered).toEqual([]);
+  });
+
+  it("refuses to rebind a queue that already has a target and leaves the file untouched", async () => {
+    const h = await createHarness();
+    await seedQueue(h.root, "q", { target: "wecom:dm:oc_oldowner" }, []);
+    await h.controller.start();
+
+    await expect(h.controller.claimTarget("q", "feishu:dm:oc_newchat")).resolves.toEqual({
+      ok: false,
+      reason: "queue already bound",
+    });
+
+    // The existing binding is untouched (rebinding is an AI file edit).
+    const content = await readFile(path.join(h.root, "q.md"), "utf8");
+    expect(content).toContain("target: wecom:dm:oc_oldowner");
+    expect(content).not.toContain("oc_newchat");
+  });
+
+  it("refuses a queue that does not exist", async () => {
+    const h = await createHarness();
+    await h.controller.start();
+
+    await expect(h.controller.claimTarget("missing", "feishu:dm:oc_newchat")).resolves.toEqual({
+      ok: false,
+      reason: "queue not found",
+    });
+  });
+
+  it("overwrites a stale channel line at bind time (no ownership check at claim)", async () => {
+    const h = await createHarness();
+    await seedQueue(h.root, "q", { channel: "legacy-channel" }, []);
+    await h.controller.start();
+
+    await expect(h.controller.claimTarget("q", "feishu:dm:oc_newchat")).resolves.toEqual({ ok: true });
+
+    const content = await readFile(path.join(h.root, "q.md"), "utf8");
+    expect(content).toContain("channel: test");
+    expect(content).toContain("target: feishu:dm:oc_newchat");
   });
 });

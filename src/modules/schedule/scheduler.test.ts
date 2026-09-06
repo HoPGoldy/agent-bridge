@@ -13,7 +13,7 @@ import {
 } from "../run-completion";
 import { readRunHistory, type RunHistoryRecord } from "../run-completion/history";
 import * as historyModule from "../run-completion/history";
-import { DEFAULT_TIMEOUT_MS, type LoadedTask, type ScheduleTask } from "./task-file";
+import { DEFAULT_SILENCE_MS, DEFAULT_TIMEOUT_MS, type LoadedTask, type ScheduleTask } from "./task-file";
 import {
   Scheduler,
   parseSyntheticSessionId,
@@ -59,7 +59,7 @@ function makeTask(overrides: Partial<ScheduleTask> & { name: string }): Schedule
     schedule: overrides.schedule ?? { type: "every", intervalMs: 30 * 60_000 },
     directory: overrides.directory,
     timeoutMs: overrides.timeoutMs ?? DEFAULT_TIMEOUT_MS,
-    silenceMs: overrides.silenceMs ?? 10 * 60_000,
+    silenceMs: overrides.silenceMs ?? DEFAULT_SILENCE_MS,
     enabled: overrides.enabled ?? true,
     // T2: harness tasks belong to the scheduler's channel ("test") unless
     // the test overrides `channel` (a deliberate `undefined` means an unbound

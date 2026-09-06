@@ -110,6 +110,34 @@ describe("i18n", () => {
     expect(zh("cli.noQueues")).toBe("尚未创建任何队列。请使用 `agent-bridge queue add` 创建。");
     expect(en("cli.queueNotFound", { name: "inbox" })).toBe('Queue "inbox" not found.');
     expect(zh("cli.queueNotFound", { name: "inbox" })).toBe('未找到队列 "inbox"。');
+    expect(en("cli.queueRetried", { name: "inbox", taskId: "1-2ab3" })).toBe(
+      'Task 1-2ab3 of queue "inbox" re-queued (state: pending) — it will be consumed on the next tick.',
+    );
+    expect(zh("cli.queueRetried", { name: "inbox", taskId: "1-2ab3" })).toBe(
+      '已将队列 "inbox" 的任务 1-2ab3 重新入队（state: pending），将由下个 tick 自然消费。',
+    );
+    expect(en("cli.queueRetryTaskNotFound", { name: "inbox", taskId: "1-2ab3" })).toBe(
+      'Task "1-2ab3" not found in queue "inbox".',
+    );
+    expect(zh("cli.queueRetryTaskNotFound", { name: "inbox", taskId: "1-2ab3" })).toBe(
+      '队列 "inbox" 中未找到任务 "1-2ab3"。',
+    );
+    expect(
+      en("cli.queueRetryNotFailed", { name: "inbox", taskId: "1-2ab3", state: "pending" }),
+    ).toBe(
+      'Task "1-2ab3" of queue "inbox" is not failed (state: pending) — only failed tasks can be retried.',
+    );
+    expect(
+      zh("cli.queueRetryNotFailed", { name: "inbox", taskId: "1-2ab3", state: "pending" }),
+    ).toBe(
+      '队列 "inbox" 的任务 "1-2ab3" 未处于 failed 状态（当前状态：pending）——只有 failed 任务可以重试。',
+    );
+    expect(en("queue.taskFailedAgentSession", { sessionId: "pi:1" })).toBe(
+      "Agent session: pi:1",
+    );
+    expect(zh("queue.taskFailedAgentSession", { sessionId: "pi:1" })).toBe(
+      "Agent 会话：pi:1",
+    );
     expect(en("client.queueHereBound", { name: "build" })).toBe(
       'Queue "build" is now bound to this chat.',
     );

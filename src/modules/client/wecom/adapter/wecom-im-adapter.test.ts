@@ -936,6 +936,144 @@ describe("WecomIMAdapter", () => {
     );
   });
 
+  it("binds this chat as a queue's target locally on /queue-here without polluting the core", async () => {
+    const onQueueHere = vi.fn(async () => ({ ok: true }));
+    const adapter = new WecomIMAdapter(
+      {
+        botId: "bot-id",
+        secret: "secret",
+        requireMentionInGroup: true,
+      },
+      createLogger("test"),
+      undefined,
+      undefined,
+      undefined,
+      undefined,
+      onQueueHere,
+    );
+    const onOutput = vi.fn(async (_event: ClientOutputEvent) => {});
+
+    await adapter.start(onOutput);
+    await fakeClientState.onMessage?.({
+      chatId: "user_1",
+      chatType: "dm",
+      messageId: "msg-queue-here",
+      text: "/queue-here build",
+      mentionedBot: false,
+    });
+
+    expect(onQueueHere).toHaveBeenCalledWith("build", "wecom:dm:user_1");
+    expect(onOutput).not.toHaveBeenCalled();
+    expect(fakeClientState.sendText).toHaveBeenCalledWith(
+      "user_1",
+      expect.stringContaining('Queue "build"'),
+      "msg-queue-here",
+    );
+    expect(fakeClientState.sendText.mock.calls[0]?.[1]).toContain("is now bound to this chat");
+  });
+
+  it("replies with a localized error for an unknown /queue-here queue", async () => {
+    const onQueueHere = vi.fn(async () => ({ ok: false, reason: "queue not found" }));
+    const adapter = new WecomIMAdapter(
+      {
+        botId: "bot-id",
+        secret: "secret",
+        requireMentionInGroup: true,
+      },
+      createLogger("test"),
+      undefined,
+      undefined,
+      undefined,
+      undefined,
+      onQueueHere,
+    );
+    const onOutput = vi.fn(async (_event: ClientOutputEvent) => {});
+
+    await adapter.start(onOutput);
+    await fakeClientState.onMessage?.({
+      chatId: "user_1",
+      chatType: "dm",
+      messageId: "msg-queue-here-missing",
+      text: "/queue-here missing",
+      mentionedBot: false,
+    });
+
+    expect(onQueueHere).toHaveBeenCalledWith("missing", "wecom:dm:user_1");
+    expect(onOutput).not.toHaveBeenCalled();
+    expect(fakeClientState.sendText).toHaveBeenCalledWith(
+      "user_1",
+      expect.stringContaining('Queue "missing" was not found.'),
+      "msg-queue-here-missing",
+    );
+  });
+
+  it("shows a usage reply for a malformed /queue-here without calling onQueueHere", async () => {
+    const onQueueHere = vi.fn(async () => ({ ok: true }));
+    const adapter = new WecomIMAdapter(
+      {
+        botId: "bot-id",
+        secret: "secret",
+        requireMentionInGroup: true,
+      },
+      createLogger("test"),
+      undefined,
+      undefined,
+      undefined,
+      undefined,
+      onQueueHere,
+    );
+    const onOutput = vi.fn(async (_event: ClientOutputEvent) => {});
+
+    await adapter.start(onOutput);
+    await fakeClientState.onMessage?.({
+      chatId: "user_1",
+      chatType: "dm",
+      messageId: "msg-queue-here-bad",
+      text: "/queue-here",
+      mentionedBot: false,
+    });
+
+    expect(onQueueHere).not.toHaveBeenCalled();
+    expect(onOutput).not.toHaveBeenCalled();
+    expect(fakeClientState.sendText).toHaveBeenCalledWith(
+      "user_1",
+      expect.stringContaining("Usage: `/queue-here <queue-name>`"),
+      "msg-queue-here-bad",
+    );
+  });
+
+  it("degrades gracefully when onQueueHere is absent: logs and replies nothing", async () => {
+    const warnSpy = vi.spyOn(console, "warn").mockImplementation(() => {});
+    try {
+      const adapter = new WecomIMAdapter(
+        {
+          botId: "bot-id",
+          secret: "secret",
+          requireMentionInGroup: true,
+        },
+        createLogger("test"),
+      );
+      const onOutput = vi.fn(async (_event: ClientOutputEvent) => {});
+
+      await adapter.start(onOutput);
+      await fakeClientState.onMessage?.({
+        chatId: "user_1",
+        chatType: "dm",
+        messageId: "msg-queue-here-no-bridge",
+        text: "/queue-here build",
+        mentionedBot: false,
+      });
+
+      expect(onOutput).not.toHaveBeenCalled();
+      expect(fakeClientState.sendText).not.toHaveBeenCalled();
+      expect(warnSpy.mock.calls.some((call) =>
+        call.some((arg) => typeof arg === "string" && arg.includes("onQueueHere is not injected")),
+      )).toBe(true);
+    } finally {
+      warnSpy.mockRestore();
+    }
+  });
+
   it("degrades gracefully when onScheduleHere is absent: logs and replies nothing", async () => {
     const warnSpy = vi.spyOn(console, "warn").mockImplementation(() => {});
     try {

@@ -60,7 +60,7 @@ export const weixinClientModule: ClientModule<WeixinClientConfig, ImClientSessio
     }
   },
   createConfigCollector: createWeixinConfigCollector,
-  createClientAdapter({ config, common, sessionState, onScheduleRun, onScheduleHere }) {
-    return new WeixinIMAdapter(config, undefined, common, sessionState, onScheduleRun, onScheduleHere);
+  createClientAdapter({ config, common, sessionState, onScheduleRun, onScheduleHere, onQueueHere }) {
+    return new WeixinIMAdapter(config, undefined, common, sessionState, onScheduleRun, onScheduleHere, onQueueHere);
   },
 };

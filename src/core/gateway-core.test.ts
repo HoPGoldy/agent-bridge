@@ -1,6 +1,4 @@
-import { mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
-import os from "node:os";
-import path from "node:path";
+import { rm } from "node:fs/promises";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { GatewayCore } from "./gateway-core";
 import { emptyChannelState } from "../config/channel-state";
@@ -37,28 +35,6 @@ async function waitFor(assertion: () => void | Promise<void>, timeoutMs = 1000):
   await assertion();
 }
 
-/** Creates a temporary queue-definitions root for `/queue-here` tests (spec D1). */
-async function makeTempQueuesDir(tempDirs: string[]): Promise<string> {
-  const dir = await mkdtemp(path.join(os.tmpdir(), "agent-bridge-queues-"));
-  tempDirs.push(dir);
-  return dir;
-}
-
-/** Seeds a queue definition file: `queues/<name>.md` with an optional `channel` and optional extra fields. */
-async function writeQueueDefinitionFile(
-  queuesRoot: string,
-  name: string,
-  channel?: string,
-  extra: Record<string, string> = {},
-): Promise<void> {
-  const frontMatter = [
-    "---",
-    ...(channel !== undefined ? [`channel: ${channel}`] : []),
-    ...Object.entries(extra).map(([key, value]) => `${key}: ${value}`),
-    "---",
-  ];
-  await writeFile(path.join(queuesRoot, `${name}.md`), `${frontMatter.join("\n")}\n`);
-}
 
 class FakeIMAdapter implements IMAdapter {
   #onOutput: ((event: ClientOutputEvent) => Promise<void> | void) | null = null;
@@ -3702,10 +3678,7 @@ describe("GatewayCore", () => {
     }
   });
 
-  it("binds a channel-less queue on /queue-here by writing BOTH channel and target", async () => {
-    const queuesRoot = await makeTempQueuesDir(tempDirs);
-    // `queue add` writes no `channel` (T1): the file only carries workers etc.
-    await writeQueueDefinitionFile(queuesRoot, "build");
+  it("passes a bare-text /queue-here straight through to the agent session (adapter-local command, T05)", async () => {
     const imAdapter = new FakeIMAdapter();
     const createdAdapters: FakeAgentAdapter[] = [];
 
@@ -3715,84 +3688,14 @@ describe("GatewayCore", () => {
       agentConfig: {},
       agentIdleTimeoutMs: 60_000,
       common: { channelName: "feishu-dev", language: "en-US" },
-      queuesRoot,
     });
     running.push(core);
     await core.start();
 
-    await imAdapter.emit({
-      type: "user.message",
-      clientSessionId: "chat:build-results",
-      text: "/queue-here build",
-    });
-
-    await waitFor(() => {
-      expect(imAdapter.outputs).toContainEqual({
-        type: "assistant.message",
-        clientSessionId: "chat:build-results",
-        text: 'Queue "build" is now bound to this chat.',
-      });
-    });
-    // The binding is a plain file write (spec D4): BOTH the current
-    // channel's config name and the sending chat's clientSessionId land in
-    // the front matter in one atomic write (`bindQueue`). The controller
-    // picks the binding up on its next tick reload.
-    const content = await readFile(path.join(queuesRoot, "build.md"), "utf8");
-    expect(content).toContain("channel: feishu-dev");
-    expect(content).toContain("target: chat:build-results");
-    // A pure command message never touches the agent session.
-    expect(createdAdapters).toHaveLength(0);
-  });
-
-  it("replies with a localized error when the queue does not exist", async () => {
-    const queuesRoot = await makeTempQueuesDir(tempDirs);
-    const imAdapter = new FakeIMAdapter();
-
-    const core = new GatewayCore({
-      imAdapter,
-      agentModule: makeFakeModule(),
-      agentConfig: {},
-      agentIdleTimeoutMs: 60_000,
-      common: { channelName: "feishu-dev", language: "en-US" },
-      queuesRoot,
-    });
-    running.push(core);
-    await core.start();
-
-    await imAdapter.emit({
-      type: "user.message",
-      clientSessionId: "client-1",
-      text: "/queue-here missing",
-    });
-
-    await waitFor(() => {
-      expect(imAdapter.outputs).toContainEqual({
-        type: "assistant.message",
-        clientSessionId: "client-1",
-        text: "Queue \"missing\" was not found.",
-      });
-    });
-  });
-
-  it("rebinds a queue with a stale channel line to the current channel (no ownership check anymore)", async () => {
-    const queuesRoot = await makeTempQueuesDir(tempDirs);
-    // A legacy file may still carry a `channel`; `/queue-here` always
-    // overwrites it with the current channel at bind time (T1) — the
-    // "belongs to another channel" refusal is gone.
-    await writeQueueDefinitionFile(queuesRoot, "build", "feishu-dev");
-    const imAdapter = new FakeIMAdapter();
-
-    const core = new GatewayCore({
-      imAdapter,
-      agentModule: makeFakeModule(),
-      agentConfig: {},
-      agentIdleTimeoutMs: 60_000,
-      common: { channelName: "wecom-dev", language: "zh-CN" },
-      queuesRoot,
-    });
-    running.push(core);
-    await core.start();
-
+    // The IM adapters parse `/queue-here` locally (spec D4/T05): such text
+    // arriving at the core is not a command anymore — it flows to the agent
+    // session like any other chat message (same for a malformed one; nothing
+    // recognizes it here, and the synthetic-session guard is untouched).
     await imAdapter.emit({
       type: "user.message",
       clientSessionId: "client-1",
@@ -3800,85 +3703,11 @@ describe("GatewayCore", () => {
     });
 
     await waitFor(() => {
-      expect(imAdapter.outputs).toContainEqual({
-        type: "assistant.message",
-        clientSessionId: "client-1",
-        text: '队列 "build" 已绑定到本会话。',
-      });
+      expect(createdAdapters).toHaveLength(1);
+      expect(createdAdapters[0]!.inputs).toEqual([
+        { type: "user.message", text: "/queue-here build" },
+      ]);
     });
-    // Both the channel and the target were written (localized to the chat's
-    // own language, zh-CN here).
-    const content = await readFile(path.join(queuesRoot, "build.md"), "utf8");
-    expect(content).toContain("channel: wecom-dev");
-    expect(content).toContain("target: client-1");
-  });
-
-  it("refuses to rebind a queue that already has a target", async () => {
-    const queuesRoot = await makeTempQueuesDir(tempDirs);
-    await writeQueueDefinitionFile(queuesRoot, "build", undefined, {
-      target: "chat:old-owner",
-    });
-    const imAdapter = new FakeIMAdapter();
-
-    const core = new GatewayCore({
-      imAdapter,
-      agentModule: makeFakeModule(),
-      agentConfig: {},
-      agentIdleTimeoutMs: 60_000,
-      common: { channelName: "feishu-dev", language: "en-US" },
-      queuesRoot,
-    });
-    running.push(core);
-    await core.start();
-
-    await imAdapter.emit({
-      type: "user.message",
-      clientSessionId: "client-1",
-      text: "/queue-here build",
-    });
-
-    await waitFor(() => {
-      expect(imAdapter.outputs).toContainEqual({
-        type: "assistant.message",
-        clientSessionId: "client-1",
-        text: expect.stringContaining('Queue "build" is already bound'),
-      });
-    });
-    // The existing binding is untouched (rebinding is an AI file edit).
-    const content = await readFile(path.join(queuesRoot, "build.md"), "utf8");
-    expect(content).toContain("target: chat:old-owner");
-  });
-
-  it("shows a usage reply for a malformed /queue-here without touching the agent session", async () => {
-    const queuesRoot = await makeTempQueuesDir(tempDirs);
-    const imAdapter = new FakeIMAdapter();
-    const createdAdapters: FakeAgentAdapter[] = [];
-
-    const core = new GatewayCore({
-      imAdapter,
-      agentModule: makeFakeModule({ createdAdapters }),
-      agentConfig: {},
-      agentIdleTimeoutMs: 60_000,
-      common: { channelName: "feishu-dev", language: "en-US" },
-      queuesRoot,
-    });
-    running.push(core);
-    await core.start();
-
-    await imAdapter.emit({
-      type: "user.message",
-      clientSessionId: "client-1",
-      text: "/queue-here",
-    });
-
-    await waitFor(() => {
-      expect(imAdapter.outputs).toContainEqual({
-        type: "assistant.message",
-        clientSessionId: "client-1",
-        text: "Usage: `/queue-here <queue-name>` (queue names match `[a-z0-9-]+`).",
-      });
-    });
-    expect(createdAdapters).toHaveLength(0);
   });
 
   it("adopts a provider session on /resume: passes the raw id to create and replies with the working directory", async () => {

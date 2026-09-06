@@ -19,10 +19,16 @@
  */
 
 import type { Dirent } from "node:fs";
-import { readFile, readdir, rename, unlink, writeFile } from "node:fs/promises";
-import { randomUUID } from "node:crypto";
+import { readFile, readdir } from "node:fs/promises";
 import path from "node:path";
 import { SCHEDULES_DIR } from "../../config/channel-state";
+import {
+  applyFrontMatterField,
+  nonEmptyString,
+  parseFrontMatter,
+  splitFrontMatter,
+  writeFileAtomic,
+} from "../shared/front-matter";
 import { parseSchedule, parseTimeout, type Schedule } from "./grammar";
 
 /**
@@ -32,8 +38,12 @@ import { parseSchedule, parseTimeout, type Schedule } from "./grammar";
  */
 export const DEFAULT_TIMEOUT_MS = 5 * 60 * 60_000;
 
-/** Default silence window before a probe is sent: `10m` (2026-08-19 grill, layer 2). */
-export const DEFAULT_SILENCE_MS = 10 * 60_000;
+/**
+ * Default silence window before a probe is sent: `30m` (2026-09-06
+ * unification grill) — the previous 10m default probed slow runs (long
+ * builds, slow models, long tool calls) too early.
+ */
+export const DEFAULT_SILENCE_MS = 30 * 60_000;
 
 /** Task names are the `.md` file names without the extension (spec D3). */
 const TASK_NAME_RE = /^[a-z0-9-]+$/;
@@ -63,7 +73,7 @@ export interface ScheduleTask {
   timeoutMs: number;
   /**
    * Silence window before a probe message is sent into the run session
-   * (2026-08-19 grill, layer 2); parsed from `silence:` front matter with
+   * (2026-09-06 unification grill); parsed from `silence:` front matter with
    * the same duration syntax as `timeout:`, defaults to
    * {@link DEFAULT_SILENCE_MS}.
    */
@@ -235,63 +245,6 @@ export async function loadAllTasks(
   return results;
 }
 
-/**
- * Splits raw file content into front matter (lines between the two `---`
- * delimiters) and body (everything after the closing `---`, untrimmed). A file
- * that does not start with `---` has no front matter: the whole content is the
- * body. An unterminated `---` block consumes the rest of the file as front
- * matter, leaving an empty body.
- */
-function splitFrontMatter(content: string): { frontMatter: string; body: string } {
-  const lines = content.split(/\r?\n/);
-  if (lines[0]?.trim() !== "---") {
-    return { frontMatter: "", body: content };
-  }
-  for (let i = 1; i < lines.length; i++) {
-    if (lines[i].trim() === "---") {
-      return { frontMatter: lines.slice(1, i).join("\n"), body: lines.slice(i + 1).join("\n") };
-    }
-  }
-  return { frontMatter: lines.slice(1).join("\n"), body: "" };
-}
-
-/** Parses the front-matter block into raw `key -> value` fields. */
-function parseFrontMatter(raw: string): { fields: Record<string, string>; warnings: string[] } {
-  const fields: Record<string, string> = {};
-  const warnings: string[] = [];
-  for (const rawLine of raw.split(/\r?\n/)) {
-    const line = rawLine.trim();
-    if (line === "" || line.startsWith("#")) continue;
-    const colon = line.indexOf(":");
-    if (colon === -1) {
-      warnings.push(`ignoring malformed front matter line "${line}" — expected "key: value"`);
-      continue;
-    }
-    const key = line.slice(0, colon).trim();
-    const value = stripQuotes(line.slice(colon + 1).trim());
-    fields[key] = value;
-  }
-  return { fields, warnings };
-}
-
-/** Strips a matching pair of surrounding single or double quotes from a value. */
-function stripQuotes(value: string): string {
-  if (value.length >= 2) {
-    const first = value[0];
-    const last = value[value.length - 1];
-    if ((first === '"' && last === '"') || (first === "'" && last === "'")) {
-      return value.slice(1, -1);
-    }
-  }
-  return value;
-}
-
-/** Returns the trimmed value, or `undefined` when empty/whitespace-only. */
-function nonEmptyString(value: string | undefined): string | undefined {
-  const trimmed = value?.trim() ?? "";
-  return trimmed === "" ? undefined : trimmed;
-}
-
 /** Outcome of binding a task to a channel + delivery target (`/schedule-here`, spec D7). */
 export type BindTaskResult = { ok: true } | { ok: false; reason: string };
 
@@ -336,50 +289,6 @@ export async function setTaskEnabled(
     return { ok: false, reason: `failed to write task file: ${(error as Error).message}` };
   }
   return { ok: true };
-}
-
-/**
- * Returns `content` with the front-matter field `key` set to `value`
- * (surgical single-line rewrite, same rules as {@link bindTask}'s binding
- * lines; used by {@link setTaskEnabled}).
- */
-function applyFrontMatterField(content: string, key: string, value: string): string {
-  const eol = content.includes("\r\n") ? "\r\n" : "\n";
-  const lines = content.split(eol);
-  const line = `${key}: ${value}`;
-
-  if (lines[0]?.trim() === "---") {
-    let closeIndex = -1;
-    for (let i = 1; i < lines.length; i++) {
-      if (lines[i].trim() === "---") {
-        closeIndex = i;
-        break;
-      }
-    }
-    if (closeIndex === -1) {
-      // Unterminated block: the parser treats the rest of the file as front
-      // matter, so appending the line keeps the file's semantics unchanged.
-      lines.push(line);
-      return lines.join(eol);
-    }
-    let replaced = false;
-    for (let i = 1; i < closeIndex; i++) {
-      const colon = lines[i].indexOf(":");
-      const fieldKey = colon === -1 ? lines[i].trim() : lines[i].slice(0, colon).trim();
-      if (fieldKey === key) {
-        lines[i] = line;
-        replaced = true;
-        break;
-      }
-    }
-    if (!replaced) {
-      lines.splice(closeIndex, 0, line);
-    }
-    return lines.join(eol);
-  }
-
-  // No front matter: prepend a minimal block containing only the field.
-  return `---${eol}${line}${eol}---${eol}${content}`;
 }
 
 /**
@@ -486,18 +395,3 @@ function applyBinding(content: string, binding: { target: string; channel: strin
   return `---${eol}${entries.map(([key, value]) => `${key}: ${value}`).join(eol)}${eol}---${eol}${content}`;
 }
 
-/** Same-directory temp file + rename commit, mirroring the channel-state store. */
-async function writeFileAtomic(filePath: string, content: string): Promise<void> {
-  const dir = path.dirname(filePath);
-  const tempPath = path.join(
-    dir,
-    `.${path.basename(filePath)}.${process.pid}.${randomUUID()}.tmp`,
-  );
-  try {
-    await writeFile(tempPath, content, "utf8");
-    await rename(tempPath, filePath);
-  } catch (error) {
-    await unlink(tempPath).catch(() => undefined);
-    throw error;
-  }
-}
