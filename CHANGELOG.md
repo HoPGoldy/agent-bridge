@@ -2,6 +2,13 @@
 
 All notable changes to this project will be documented in this file. See [commit-and-tag-version](https://github.com/absolute-version/commit-and-tag-version) for commit guidelines.
 
+## [0.8.9](https://github.com/HoPGoldy/agent-bridge/compare/v0.8.8...v0.8.9) (2026-09-07)
+
+
+### Features
+
+* **queue,schedule:** unify design and usage of queues and scheduled tasks ([ff37d57](https://github.com/HoPGoldy/agent-bridge/commit/ff37d579e11e326bec876c6c4f4ed5b9e7a69e65))
+
 ## [0.8.8](https://github.com/HoPGoldy/agent-bridge/compare/v0.8.7...v0.8.8) (2026-09-06)
 
 
